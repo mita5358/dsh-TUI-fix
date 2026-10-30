@@ -29,6 +29,7 @@ import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import type { CommandRuntime } from '@deepseek-ai/dsh-commands'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type { DshNative } from '../../agent/capabilities.js'
+import type { AgentEvent } from '../../agent/events.js'
 import type { AgentSession } from '../../agent/session.js'
 import { channelCapabilities } from '../../channel/capabilities.js'
 import { isCommandCompletionToken, LOCAL_COMMANDS, type LocalCommand } from '../../commands.js'
@@ -36,6 +37,7 @@ import { touchSession } from '../../sessionHistory.js'
 import { snapshotLiveSessionEvents } from '../compat/liveSession.js'
 import { DEFAULT_SESSION_MODES, resolveSessionModes } from '../../sessionModes.js'
 import { installedMeetsVersion } from '../contract.js'
+import { planChunks, placeholderRows, type HistoryChunk } from '../backend/history-chunks.js'
 import { createDshSession } from '../backend/session.js'
 import { createDshTranslator, dshPricingWindow } from '../backend/translate.js'
 import { concreteService } from '../host-access.js'
@@ -84,6 +86,9 @@ import { createSubagentProjection, type SubagentsServiceView } from './subagent-
 import { readChildTranscriptPage } from './subagent-transcript.js'
 import { DSH_BACKEND_LABEL, type ChannelLaunchOptions } from './state.js'
 import { sessionWorkingDirectory } from '../../channel/working-directory.js'
+import { projectHistorySlice } from '../../channel/history-restore.js'
+import { markChannelReadDirty } from '../../adapter/channel/read-view.js'
+import type { ChatRow } from '../../adapter/ports/channel-view.js'
 import { ensureUpstreamRetry } from './upstream-retry.js'
 import { foldBack } from './transcript.js'
 import type { BackgroundResult, ResumeResult } from './types.js'
@@ -369,8 +374,62 @@ export function attachDshExtensions(
   // log, not the AgentEvent fold the core would otherwise mount.
   state.trajectoryBackendLabel = () => t('trajectory-backend-dsh')
 
-  // The DSH log restores folded rows; the projector prices by the DeepSeek
-  // rate window and feeds the job registry. Installed before the seed replay.
+  // The bound session's translated record, cut into chunks by the seed replay
+  // (see `replaySessionSeed`): the newest chunk is projected for the first
+  // paint, every older one is represented by its digest row plus its prompt
+  // rows until "load earlier" projects it in place.
+  let seedChunks: readonly HistoryChunk[] | undefined
+  let seedEntries: readonly AgentEvent[] = []
+  const loadedChunks = new Set<number>()
+  const placeholderCounts = new Map<number, number>()
+
+  /** Compact text weight for the report line: `890k`, `1.0M`. */
+  const compactChars = (chars: number): string =>
+    chars >= 1_000_000 ? `${(chars / 1_000_000).toFixed(1)}M` : `${Math.round(chars / 1000)}k`
+
+  // One chunk's report line: which rounds it holds, how much work and text sit
+  // behind them. Text only — a collapsed chunk renders no cards, no terminal
+  // output, no commands, and its newline-free text stays one row.
+  const chunkDigest = (chunk: HistoryChunk, loaded: boolean): string =>
+    `${loaded ? '▾' : '⏸'} ${t('chunk-digest', {
+      from: chunk.fromRound,
+      to: chunk.toRound,
+      events: chunk.events,
+      tools: chunk.toolCalls,
+      chars: compactChars(chunk.chars),
+    })}`
+
+  /** One planned chunk as fresh rows: its digest line, then its real rows. */
+  const chunkRows = (chunk: HistoryChunk): ChatRow[] => {
+    const rows = projectHistorySlice(seedEntries.slice(chunk.start, chunk.end), state.thinkingFold)
+    return [
+      { id: chunk.idBase, kind: 'notice', text: chunkDigest(chunk, true), restored: true },
+      ...rows.map((row, index) => ({ ...row, id: chunk.idBase + 1 + index, restored: true })),
+    ]
+  }
+
+  /**
+   * Load the next older chunk in place, replacing its placeholder rows —
+   * "load earlier" for a chunked seed. Returns the rows that materialized so
+   * the caller can tell "nothing older left" (0) from a page-in.
+   */
+  const loadOlderChunk = (): number => {
+    if (seedChunks === undefined) return 0
+    for (let index = seedChunks.length - 1; index >= 0; index -= 1) {
+      const chunk = seedChunks[index]!
+      if (loadedChunks.has(chunk.index)) continue
+      const at = state.rows.findIndex(row => row.id === chunk.idBase)
+      if (at < 0) return 0
+      const rows = chunkRows(chunk)
+      state.rows.splice(at, placeholderCounts.get(chunk.index) ?? 1, ...rows)
+      loadedChunks.add(chunk.index)
+      placeholderCounts.delete(chunk.index)
+      markChannelReadDirty(state.rows)
+      return rows.length
+    }
+    return 0
+  }
+
   const dshLocal = createLocalActions({
     ctx,
     owner,
@@ -382,13 +441,21 @@ export function attachDshExtensions(
       result: (name, rawArgs, data) => dshNative().presentResultView(name, rawArgs, data),
     },
     foldBack,
+    // Every adoption replaces the chunk plan (`replaySessionSeed` below); an
+    // unbound or never-seeded session has nothing older to page in.
+    loadOlderChunk,
   })
+  // The DSH log restores folded rows; the projector prices by the DeepSeek rate
+  // window and feeds the job registry. Installed before the seed replay.
   core.extend({
     // Stale detection follows the agent: session wrappers are recreated per
     // adoption, and switching A to B and back to A is the same conversation.
     conversationKey: session => session.capabilities.native.dsh?.agent ?? session,
     flushDeferred: () => subagentProjection.flush(),
     loadOlder: dshLocal.loadOlder,
+    // Unloaded chunks sit in the transcript as digest rows, so no folded row
+    // announces them: ask the chunk plan instead (the load-earlier divider).
+    hasOlderHistory: () => seedChunks !== undefined && seedChunks.some(chunk => !loadedChunks.has(chunk.index)),
     // Subagents and jobs come from the DSH host services (projections above).
     ownsActivity: true,
     // The DSH raw history is the trajectory source (state.traceEvents /
@@ -537,7 +604,44 @@ export function attachDshExtensions(
   // synchronous binding transaction, which the async `history()` cannot
   // serve); callers have already bound the session the seed belongs to.
   const replaySessionSeed = (events: readonly SessionEvent[]): void => {
-    projector.apply(dshNative().translateReplay(events), { replay: true })
+    // Paint the newest chunk only: one projection pass over a long record's
+    // whole history is what makes opening it slow (measured on an 89k-event
+    // record: 1,766 ms for 27,907 rows). Dropping the rows does not help — the
+    // cost is the per-event fold over ~335 MB of message and tool text — so
+    // the pass itself is what has to shrink. The record is cut into turn-
+    // aligned chunks (history-chunks.ts); every older chunk keeps a digest row
+    // and its prompt rows, and "load earlier" projects it in place.
+    const entries = dshNative().translateReplay(events)
+    seedEntries = entries
+    seedChunks = planChunks(entries)
+    loadedChunks.clear()
+    placeholderCounts.clear()
+    const newest = seedChunks[seedChunks.length - 1]
+    if (newest === undefined) {
+      subagentProjection.bootstrapFromLog(events)
+      return
+    }
+    // `/tokens` and the status-line cost report the whole session, so the
+    // older chunks' readings must still be folded. Only their weights are
+    // kept: request headers and model changes say which model each request is
+    // priced at, and assistant messages carry the usage (`usage` events do not
+    // exist on the durable wire). A row-less pass over 12.7k of them costs
+    // ~120 ms on the titan record; the tail then paints over it.
+    projector.apply(
+      entries.slice(0, newest.start).filter(event =>
+        event.type === 'request.header' || event.type === 'session.ready' || event.type === 'model.changed' ||
+        (event.type === 'assistant.message' && event.usage !== undefined)),
+      { replay: true },
+    )
+    state.rows.length = 0
+    for (const chunk of seedChunks) {
+      if (chunk.index === newest.index) continue
+      const rows = placeholderRows(chunk, entries, collapsed => chunkDigest(collapsed, false))
+      placeholderCounts.set(chunk.index, rows.length)
+      state.rows.push(...rows)
+    }
+    projector.apply(entries.slice(newest.start, newest.end), { replay: true })
+    loadedChunks.add(newest.index)
     subagentProjection.bootstrapFromLog(events)
   }
   replaySessionSeed(initialNative.rawHistory())

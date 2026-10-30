@@ -91,7 +91,12 @@ export interface ChannelExtension {
    *  `transcript` capability does (folding only the rows it can restore),
    *  and without either nothing folds. */
   loadOlder?(): number
-  /** The extension projects subagents and background jobs itself (DSH, from
+  /** Whether older rows exist beyond what the transcript shows. Supplies the
+   *  `olderHistory` flag the load-earlier affordance keys off, for an
+   *  extension whose `loadOlder` restores history no `folded` row marks
+   *  (DSH: history chunks not yet expanded). */
+  hasOlderHistory?(): boolean
+  /** The extension projects subagents and
    *  its host services): the core's event-driven activity projection stays
    *  inert and its controls are the extension's. */
   readonly ownsActivity?: boolean
@@ -502,6 +507,7 @@ export function createCoreChannel(
     costReport: undefined,
     rateLimit: undefined,
     get olderHistory(): boolean {
+      if (extension.hasOlderHistory?.() === true) return true
       return extension.loadOlder === undefined && !viewCleared() && (binding.session.capabilities.transcript?.hasOlder() ?? false)
     },
     backendInit: () => {

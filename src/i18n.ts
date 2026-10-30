@@ -204,6 +204,7 @@ const dict = {
   // ── backends: capability-gated actions and commands ─────────────────
   'session-cleared': { zh: '会话已清屏', en: 'Session cleared' },
   'conversation-reset': { zh: '对话已重置，之前的上下文已清空', en: 'The conversation was reset; the earlier context is gone' },
+  'chunk-digest': { zh: '第 {{from}}–{{to}} 轮 · {{events}} 条事件 · {{tools}} 次工具调用 · {{chars}} 字', en: 'turns {{from}}–{{to}} · {{events}} events · {{tools}} tool calls · {{chars}}' },
   'conversation-reset-clear': { zh: '对话已清空，接下来从新的上下文开始', en: 'Conversation cleared; continuing with a fresh context' },
   'conversation-reset-plan': { zh: '退出计划模式时清空了上下文，接下来带着计划从新的上下文开始', en: 'Context cleared on leaving plan mode; continuing from a fresh context with the plan' },
   'conversation-reset-fresh': { zh: '已开新会话来执行计划', en: 'Started a fresh session to carry out the plan' },

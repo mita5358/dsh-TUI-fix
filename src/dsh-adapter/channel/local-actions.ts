@@ -7,8 +7,9 @@ export { setActivityFrames } from './core/local-actions.js'
 
 /**
  * The DSH halves of the local actions (the backend-neutral ones live in
- * core/local-actions.ts): restoring folded rows from the DSH session log,
- * and the live subagent roster query.
+ * core/local-actions.ts): restoring folded rows from the DSH session log and
+ * the live subagent roster query; older history pages in through the chunk
+ * loader the extension owns.
  */
 export function createLocalActions(deps: {
   ctx: { get(name: string): unknown }
@@ -21,14 +22,24 @@ export function createLocalActions(deps: {
   state: ChannelState
   presenters: ToolViewPresenter
   foldBack: typeof FoldBack
+  /** Project the next older history chunk in place and return the rows it
+   *  materialized, `0` when the record is exhausted. The bound session's own
+   *  chunk plan (history-chunks.ts): opening paints the newest chunk, and each
+   *  "load earlier" press replaces one collapsed chunk's rows with real ones. */
+  loadOlderChunk: () => number
 }) {
   const { ctx, owner, binding, state, foldBack } = deps
   const current = (capture: unknown): boolean => owner.current() && binding.isCurrent(capture)
   return {
     /** The history slicer behind "load earlier": restores folded rows from
-     *  the durable DSH log (the core emits when anything came back). */
+     *  the durable DSH log, then pages in the next older history chunk (the
+     *  core emits when anything came back). Folded rows win: they are the
+     *  rows already on screen, and a page whose text has to be folded again
+     *  straight away would cost more than it shows. */
     loadOlder(): number {
-      return foldBack(state.rows, snapshotLiveSessionEvents(binding.agent.session), deps.presenters)
+      const restored = foldBack(state.rows, snapshotLiveSessionEvents(binding.agent.session), deps.presenters)
+      if (restored > 0) return restored
+      return deps.loadOlderChunk()
     },
     async listSubagents(): Promise<string[]> {
       const service = ctx.get('subagents') as {
