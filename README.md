@@ -61,7 +61,7 @@ Resuming a DSH session preserves its recorded reasoning effort (or its live sele
 - **Account sign-in** — the standard profile offers pi-ai OAuth for ChatGPT/Codex, Claude, and Grok (plus OpenAI direct and Meta Muse when available), and Host-owned DeepSeek browser sign-in as `deepseek-account` on DSH 0.2.0-rc.1+. Use `/provider` or `/auth` without another plugin.
   A profile-only update from a global TUI patch that already mounts `dsh-tui-auth` can still start the official loopback callback listener on demand; fixed-port SSH forwarding still requires the global package to be aligned.
 - **Extensions** — browser interaction, computer use and more.
-- **Built for long sessions** — event-driven projection, virtualization, bounded caches.
+- **Built for long sessions** — event-driven projection, virtualization, bounded caches. Opening a DSH session with tens of thousands of rows projects only its newest chunk; older history folds into one text-only report line per chunk plus one prompt line per turn, and clicking a folded turn on the timeline projects just that chunk.
 
 Keys and commands: [Interaction and commands](docs/interaction.en.md). Everything else: [documentation index](docs/README.md).
 
@@ -747,6 +747,15 @@ API reports a migration-specific prerequisite. Session-tree reads validate packe
 rows and check their entire member count against the remaining scan budget before
 expanding events. Oversized rows report truncation; malformed rows report failure.
 The logical budget does not eliminate physical JSON/frame parsing or validation.
+Resuming a DSH session still pays the host's full restore (frame decode, JSON
+parse, v4 validation) — that cost is linear in record size and lives outside this
+package. What this package controls is projection: the first screen projects only
+the newest chunk (the last 10 turns, under 200k characters), older chunks are cut
+every 50 turns / 1M characters and projected when loaded, so first-screen work
+stops growing with the record. On a 139 MB / 93k-event record the interactive
+first screen went from 16.7–17.3 s to ~13.0 s: ~7.5 s host restore, ~4.1 s process
+start and plugin load, ~1.0 s projection. Set `DSH_TUI_BOOT_TRACE=<file>` to log
+those phase marks as JSON lines when reporting a slow open.
 Development `@deepseek-ai/*` release-age exceptions list only exact package versions in the current
 lockfile (including the legacy SQLite island); all other versions retain the
 24-hour delay. Regenerate with `node scripts/verify-release-age-cohort.mjs --write`

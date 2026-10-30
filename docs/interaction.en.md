@@ -721,7 +721,9 @@ In inline mode, the terminal emulator owns native scrollback and selection.
 - **Single-click a help-menu command row** — Fill `/name ` into the prompt and close the
   help (the Tab completion's mouse equivalent).
 - **Click a timeline-rail tick** — Jump to that turn — the rail covers every turn (folded
-  ones included); a folded tick reveals its turn first, then scrolls it into place.
+  ones included); a folded tick reveals its turn first, then scrolls it into place. On a
+  long DSH session, where older history is collapsed into per-chunk report lines, a tick
+  inside a collapsed chunk projects only that chunk (not the whole history) before the jump.
 - **Keyboard selection extension** — With a selection, `Shift+←/→/↑/↓/Home/End` extends /
   shrinks it (wraps across lines).
 
