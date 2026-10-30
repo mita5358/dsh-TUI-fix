@@ -41,7 +41,7 @@ declare module '../../agent/capabilities.js' {
      * translator. The channel's adoption transactions replay inside a
      * synchronous tail, which the async `history()` cannot serve.
      */
-    translateReplay(events: readonly SessionEvent[]): readonly AgentEvent[]
+    translateReplay(events: readonly SessionEvent[], options?: { present?: boolean }): readonly AgentEvent[]
     /** Forget the translator's per-session state (paired with a projector reset). */
     resetTranslation(): void
     /** The dsh-tools presenters, scoped to this session's agent. */
@@ -173,7 +173,7 @@ export function createDshSession(ctx: Context, target: DshSessionTarget, options
       }
     },
     rawHistory: (): readonly SessionEvent[] => snapshotLiveSessionEvents(agent.session),
-    translateReplay: (events: readonly SessionEvent[]): readonly AgentEvent[] => translator.translateReplay(events),
+    translateReplay: (events: readonly SessionEvent[], options?: { present?: boolean }): readonly AgentEvent[] => translator.translateReplay(events, options),
     resetTranslation: (): void => translator.reset(),
     presentCallView: translator.presentCallView,
     presentResultView: translator.presentResultView,

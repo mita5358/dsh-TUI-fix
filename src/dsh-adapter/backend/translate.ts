@@ -241,6 +241,14 @@ export function createDshTranslator(deps: DshTranslatorDeps) {
    */
   const openCalls = new Map<string, { readonly name: string; readonly args: string; readonly card: boolean }>()
   /**
+   * Whether a settled result's card payload is presented while it translates.
+   * A replay seed whose older chunks the transcript will not project turns
+   * this off: `presentResultView` runs a card's presenter over the result text
+   * (~730 ms of a 1.8 s titan translate), and the deferred payload is derived
+   * from the raw event when that chunk finally materializes.
+   */
+  let presentResults = true
+  /**
    * `spawn_teammate` calls that have not written their member yet. The team
    * refuses a teammate (name taken or invalid, member limit, not the Lead,
    * service disposing, cancelled) before it appends `team/member`: no roster
@@ -381,7 +389,7 @@ export function createDshTranslator(deps: DshTranslatorDeps) {
       ...(isError && (call !== undefined || spawn !== undefined) ? { errorText: toolErrorText(event) } : {}),
       ...(card === undefined ? {} : { images: transcriptImagesOf(data.message.content, deps.attachments) }),
       ...(data.meta === undefined ? {} : { meta: data.meta }),
-      ...(card === undefined || isError ? {} : { presentation: presentResultView(card.name, card.args, data) as ToolResultPresentation | undefined }),
+      ...(card === undefined || isError || !presentResults ? {} : { presentation: presentResultView(card.name, card.args, data) as ToolResultPresentation | undefined }),
     }
     if (spawn !== undefined && isError) return [{ ...spawn, presentation: presentCallView(spawn.name, spawn.argsJson) as ToolCallPresentation | undefined }, result]
     if (card === undefined || isError) return [result]
@@ -584,15 +592,24 @@ export function createDshTranslator(deps: DshTranslatorDeps) {
    * Translate a durable replay seed (resume / rewind / model-switch fork).
    * Settled `assistant/chunk` runs are dropped first (`prepareReplayEvents`);
    * the frame fence restarts with the replacement session.
+   *
+   * `present: false` leaves every settled result's card payload unbuilt; the
+   * caller derives it from the raw `tool/result` event with
+   * `presentResultView` when it actually projects that part of the seed.
    */
-  const translateReplay = (events: readonly SessionEvent[]): readonly AgentEvent[] => {
+  const translateReplay = (events: readonly SessionEvent[], options: { present?: boolean } = {}): readonly AgentEvent[] => {
     lastStreamRevision = -1
     promptSeen = false
-    const out: AgentEvent[] = []
-    for (const event of prepareReplayEvents(events)) {
-      for (const translated of translateEvent(event)) out.push(translated)
+    presentResults = options.present !== false
+    try {
+      const out: AgentEvent[] = []
+      for (const event of prepareReplayEvents(events)) {
+        for (const translated of translateEvent(event)) out.push(translated)
+      }
+      return out
+    } finally {
+      presentResults = true
     }
-    return out
   }
 
   /** Forget the frame fence and every open call (paired with a projector reset). */

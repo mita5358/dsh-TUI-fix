@@ -30,6 +30,7 @@ import type { CommandRuntime } from '@deepseek-ai/dsh-commands'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type { DshNative } from '../../agent/capabilities.js'
 import type { AgentEvent } from '../../agent/events.js'
+import type { ToolResultPresentation } from '../../agent/presentation.js'
 import type { AgentSession } from '../../agent/session.js'
 import { channelCapabilities } from '../../channel/capabilities.js'
 import { isCommandCompletionToken, LOCAL_COMMANDS, type LocalCommand } from '../../commands.js'
@@ -39,6 +40,7 @@ import { DEFAULT_SESSION_MODES, resolveSessionModes } from '../../sessionModes.j
 import { installedMeetsVersion } from '../contract.js'
 import { markBoot } from '../../utils/bootTrace.js'
 import { chunkForRow, placeholderEvent, planChunks, placeholderRows, type HistoryChunk } from '../backend/history-chunks.js'
+import { isSubagentToolName } from './projection-helpers.js'
 import { createDshSession } from '../backend/session.js'
 import { createDshTranslator, dshPricingWindow } from '../backend/translate.js'
 import { concreteService } from '../host-access.js'
@@ -383,6 +385,15 @@ export function attachDshExtensions(
   let seedEntries: readonly AgentEvent[] = []
   const loadedChunks = new Set<number>()
   const placeholderCounts = new Map<number, number>()
+  /**
+   * Presenting a settled result's card costs real time on a long record
+   * (`presentResultView` over 16k results is ~730 ms of a 1.8 s titan
+   * translate), and an older chunk renders none of those cards until someone
+   * loads it. The seed then translates with `present: false` and each chunk
+   * derives the payload it shows from the result's raw durable event, once,
+   * when the chunk materializes.
+   */
+  let presentDeferredResults: (entries: readonly AgentEvent[]) => readonly AgentEvent[] = entries => entries
 
   /** Compact text weight for the report line: `890k`, `1.0M`. */
   const compactChars = (chars: number): string =>
@@ -402,7 +413,7 @@ export function attachDshExtensions(
 
   /** One planned chunk as fresh rows: its digest line, then its real rows. */
   const chunkRows = (chunk: HistoryChunk): ChatRow[] => {
-    const rows = projectHistorySlice(seedEntries.slice(chunk.start, chunk.end), state.thinkingFold)
+    const rows = projectHistorySlice(presentDeferredResults(seedEntries.slice(chunk.start, chunk.end)), state.thinkingFold)
     return [
       { id: chunk.idBase, kind: 'notice', text: chunkDigest(chunk, true), restored: true },
       ...rows.map((row, index) => ({ ...row, id: chunk.idBase + 1 + index, restored: true })),
@@ -653,12 +664,39 @@ export function attachDshExtensions(
     // aligned chunks (history-chunks.ts); every older chunk keeps a digest row
     // and its prompt rows, and "load earlier" projects it in place.
     markBoot('seed-enter')
-    const entries = dshNative().translateReplay(events)
+    const entries = dshNative().translateReplay(events, { present: false })
     markBoot('translate-done')
     seedEntries = entries
     seedChunks = planChunks(entries)
     loadedChunks.clear()
     placeholderCounts.clear()
+    // What a deferred card payload needs: the call's name and arguments (its
+    // presenter input) and the raw result event. Raw events outlive the seed
+    // in the caller anyway; these two indexes only hold references to them.
+    const cards = new Map<string, { readonly name: string; readonly args: string }>()
+    const rawResults = new Map<number, SessionEvent<'tool/result'>>()
+    for (const event of events) {
+      if (event.type === 'tool/call') {
+        const name = event.data.name
+        if (name !== 'ask_user_question' && !isSubagentToolName(name)) cards.set(event.data.callId, { name, args: event.data.arguments })
+      } else if (event.type === 'tool/result') rawResults.set(event.seq, event)
+    }
+    presentDeferredResults = (slice: readonly AgentEvent[]): readonly AgentEvent[] => {
+      let copy: AgentEvent[] | undefined
+      for (let index = 0; index < slice.length; index += 1) {
+        const entry = slice[index]!
+        if (entry.type !== 'tool.result' || entry.presentation !== undefined || entry.isError) continue
+        const call = cards.get(entry.callId)
+        if (call === undefined) continue
+        const raw = rawResults.get(entry.seq)
+        if (raw === undefined) continue
+        const presentation = dshNative().presentResultView(call.name, call.args, raw.data) as ToolResultPresentation | undefined
+        if (presentation === undefined) continue
+        copy ??= [...slice]
+        copy[index] = { ...entry, presentation }
+      }
+      return copy ?? slice
+    }
     const newest = seedChunks[seedChunks.length - 1]
     if (newest === undefined) {
       subagentProjection.bootstrapFromLog(events)
@@ -684,7 +722,7 @@ export function attachDshExtensions(
       state.rows.push(...rows)
     }
     markBoot('fold-done')
-    projector.apply(entries.slice(newest.start, newest.end), { replay: true })
+    projector.apply(presentDeferredResults(entries.slice(newest.start, newest.end)), { replay: true })
     markBoot('newest-done')
     loadedChunks.add(newest.index)
     subagentProjection.bootstrapFromLog(events)
