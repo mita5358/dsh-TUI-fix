@@ -37,6 +37,7 @@ import { touchSession } from '../../sessionHistory.js'
 import { snapshotLiveSessionEvents } from '../compat/liveSession.js'
 import { DEFAULT_SESSION_MODES, resolveSessionModes } from '../../sessionModes.js'
 import { installedMeetsVersion } from '../contract.js'
+import { markBoot } from '../../utils/bootTrace.js'
 import { chunkForRow, placeholderEvent, planChunks, placeholderRows, type HistoryChunk } from '../backend/history-chunks.js'
 import { createDshSession } from '../backend/session.js'
 import { createDshTranslator, dshPricingWindow } from '../backend/translate.js'
@@ -651,7 +652,9 @@ export function attachDshExtensions(
     // the pass itself is what has to shrink. The record is cut into turn-
     // aligned chunks (history-chunks.ts); every older chunk keeps a digest row
     // and its prompt rows, and "load earlier" projects it in place.
+    markBoot('seed-enter')
     const entries = dshNative().translateReplay(events)
+    markBoot('translate-done')
     seedEntries = entries
     seedChunks = planChunks(entries)
     loadedChunks.clear()
@@ -680,11 +683,16 @@ export function attachDshExtensions(
       placeholderCounts.set(chunk.index, rows.length)
       state.rows.push(...rows)
     }
+    markBoot('fold-done')
     projector.apply(entries.slice(newest.start, newest.end), { replay: true })
+    markBoot('newest-done')
     loadedChunks.add(newest.index)
     subagentProjection.bootstrapFromLog(events)
   }
-  replaySessionSeed(initialNative.rawHistory())
+  const initialEvents = initialNative.rawHistory()
+  markBoot('raw-history-done')
+  replaySessionSeed(initialEvents)
+  markBoot('seed-done')
   projector.settleStreaming()
   // Attached to an idle agent: any replayed turn/start belongs to a previous
   // session run, so the spinner must not come up on boot.
