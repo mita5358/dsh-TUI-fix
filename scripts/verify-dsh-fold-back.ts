@@ -1,0 +1,295 @@
+/**
+ * `foldBack` (the DSH backend's "load earlier") restores folded rows from the
+ * durable session log. It is a synchronous click handler budgeted at ≤50 ms
+ * (`docs/codex-backend-design.md` §10.7), but the loop ran one full linear
+ * scan of the restore window per folded row: a titan session that folded tens
+ * of thousands of rows past MAX_ROWS took seconds to answer one press.
+ *
+ * This pins the fix — one bounded pass builds `seq → tool/call` and the
+ * assistant/message cursor, every lookup is a map hit or a binary search —
+ * and proves it restores EXACTLY what the per-row scan did, including the
+ * cases that scan got wrong on purpose:
+ *
+ *  - a tool row whose call event is absent stays folded, and a non-call event
+ *    sharing its seq does NOT shadow a real call elsewhere in the window (the
+ *    scan skipped non-call events and kept looking; the index must too);
+ *  - a text row takes the FIRST assistant/message at or after its anchor, not
+ *    the nearest one before it (a row anchored mid-step still settles on the
+ *    step's message);
+ *  - a message repeated at several seqs resolves to the earliest, and a row
+ *    anchored past every message stays folded;
+ *  - seqs below the first folded row never answer, even when they match;
+ *  - the tool view re-derivation (`views`) still runs for restored call rows
+ *    and is skipped for a row whose result never arrived.
+ *
+ * Run: node --import tsx/esm scripts/verify-dsh-fold-back.ts
+ */
+import assert from 'node:assert/strict'
+
+const { foldBack } = await import('../src/dsh-adapter/channel/transcript.js')
+type SessionEvent = import('@deepseek-ai/dsh-session').SessionEvent
+type ChatRow = import('../src/dsh-adapter/channel/types.js').ChatRow
+type ToolViewPresenter = import('../src/dsh-adapter/channel/types.js').ToolViewPresenter
+
+let passed = 0
+function check(label: string, ok: boolean, detail?: unknown): void {
+  if (!ok) {
+    console.error(`\n  ✗ ${label}`, detail === undefined ? '' : detail)
+    process.exit(1)
+  }
+  passed += 1
+  console.log(`  ✓ ${label}`)
+}
+
+/** The previous implementation, kept verbatim as the oracle. */
+function foldBackOracle(rows: ChatRow[], events: readonly SessionEvent[], views?: ToolViewPresenter): number {
+  const folded = rows.filter(row => row.folded)
+  if (folded.length === 0) return 0
+  const firstFoldedSeq = folded[0]?.seq ?? 0
+  const restoreEvents = events.filter(event => event.seq >= firstFoldedSeq)
+  const resultsByCall = new Map<string, SessionEvent<'tool/result'>>()
+  for (const event of restoreEvents) {
+    if (event.type === 'tool/result') {
+      resultsByCall.set(event.data.message.source.callId, event)
+    }
+  }
+  let restored = 0
+  for (const row of folded) {
+    const rowSeq = row.seq
+    if (rowSeq === undefined) continue
+    if (row.kind === 'tool' && row.tool !== undefined) {
+      const call = restoreEvents.find(event => event.seq === rowSeq && event.type === 'tool/call')
+      if (call === undefined || call.type !== 'tool/call') continue
+      restoreRowFromEvent(row, call)
+      const result = resultsByCall.get(row.tool.callId)
+      if (result !== undefined) restoreToolResult(row, result)
+      row.tool.callView = views?.call(call.data.name, call.data.arguments)
+      row.tool.resultView = result !== undefined && row.tool.status === 'ok'
+        ? views?.result(call.data.name, call.data.arguments, result.data)
+        : undefined
+      row.folded = false
+      restored += 1
+      continue
+    }
+    const message = restoreEvents.find(event => event.seq >= rowSeq && event.type === 'assistant/message')
+    if (message === undefined) continue
+    restoreRowFromEvent(row, message)
+    row.folded = false
+    restored += 1
+  }
+  return restored
+}
+
+// The oracle needs the two restore helpers; the module exports them.
+const { restoreRowFromEvent, restoreToolResult } = await import('../src/dsh-adapter/channel/transcript.js')
+
+let nextId = 1
+const toolRow = (seq: number | undefined, callId: string, status: 'ok' | 'error' = 'ok'): ChatRow => ({
+  id: nextId++,
+  kind: 'tool',
+  text: 'preview',
+  folded: true,
+  ...seq === undefined ? {} : { seq },
+  tool: { callId, name: 'read_file', argsText: '{}', status } as ChatRow['tool'],
+})
+const textRow = (kind: 'assistant' | 'reasoning', seq: number | undefined): ChatRow => ({
+  id: nextId++,
+  kind,
+  text: 'preview',
+  folded: true,
+  ...seq === undefined ? {} : { seq },
+})
+
+const ev = {
+  call: (seq: number, name = 'read_file', args: unknown = { path: 'a.ts' }) =>
+    ({ seq, type: 'tool/call', data: { name, arguments: args } }) as unknown as SessionEvent,
+  result: (seq: number, callId: string, text = 'R'.repeat(40)) =>
+    ({
+      seq,
+      type: 'tool/result',
+      data: { message: { source: { callId }, content: [{ type: 'text', text }] } },
+    }) as unknown as SessionEvent,
+  message: (seq: number, text: string, reasoning?: string) =>
+    ({
+      seq,
+      type: 'assistant/message',
+      data: {
+        message: {
+          content: [
+            ...reasoning === undefined ? [] : [{ type: 'reasoning', text: reasoning }],
+            { type: 'text', text },
+          ],
+        },
+      },
+    }) as unknown as SessionEvent,
+  user: (seq: number, text: string) =>
+    ({ seq, type: 'user/message', data: { content: [{ type: 'text', text }] } }) as unknown as SessionEvent,
+}
+
+/** Run both implementations on identical inputs and diff the outcome. */
+function same(label: string, makeRows: () => ChatRow[], makeEvents: () => SessionEvent[], withViews = false): number {
+  const views: ToolViewPresenter | undefined = withViews
+    ? {
+        call: (name: string, args: unknown) => ({ kind: 'call', name, args }) as never,
+        result: (name: string, args: unknown, data: unknown) => ({ kind: 'result', name, args, data }) as never,
+      }
+    : undefined
+  const a = makeRows()
+  const b = makeRows()
+  const eventsA = makeEvents()
+  const eventsB = makeEvents()
+  const wantRestored = foldBackOracle(a, eventsA, views)
+  const gotRestored = foldBack(b, eventsB, views)
+  const snapshot = (rows: ChatRow[]) => JSON.stringify(rows.map(row => ({
+    kind: row.kind, seq: row.seq ?? null, folded: row.folded === true,
+    text: row.text,
+    argsFull: row.tool?.argsFull ?? null,
+    resultFull: row.tool?.resultFull ?? null,
+    callView: row.tool?.callView ?? null,
+    resultView: row.tool?.resultView ?? null,
+  })))
+  assert.equal(gotRestored, wantRestored, `${label}: restored count`)
+  assert.equal(snapshot(b), snapshot(a), `${label}: row state`)
+  check(label, true)
+  return gotRestored
+}
+
+// ── behaviour the oracle's linear scan defines ────────────────────────────────
+
+same('a tool row takes the call event at its own seq, and its result by callId', () => [
+  toolRow(4, 'c1'),
+], () => [ev.call(4), ev.result(7, 'c1')], true)
+
+same('a tool row whose call event is missing stays folded', () => [
+  toolRow(4, 'c1'),
+], () => [ev.result(7, 'c1')])
+
+same('a tool result whose seq is not on the row is still matched by callId', () => [
+  toolRow(2, 'zz'),
+], () => [ev.call(2), ev.result(99, 'zz')])
+
+same('a tool row needs a tool/call at its seq: another event type there does not answer it', () => [
+  toolRow(3, 'c1'),
+], () => [ev.user(3, 'hi'), ev.message(3, 'text')])
+
+same('a text row settles on the FIRST message at or after its anchor', () => [
+  textRow('assistant', 5),
+], () => [ev.message(2, 'earlier'), ev.message(9, 'later'), ev.message(12, 'latest')])
+
+same('… a message at exactly the anchor wins over a later one', () => [
+  textRow('assistant', 9),
+], () => [ev.message(9, 'at anchor'), ev.message(12, 'later')])
+
+same('… a row anchored past every message stays folded', () => [
+  textRow('assistant', 50),
+], () => [ev.message(9, 'earlier only')])
+
+same('duplicate messages at several seqs resolve to the earliest', () => [
+  textRow('assistant', 4), textRow('assistant', 10),
+], () => [ev.message(4, 'first'), ev.message(10, 'second')])
+
+same('a reasoning row restores from the message reasoning block', () => [
+  textRow('reasoning', 3),
+], () => [ev.message(3, 'answer text', 'thinking text')])
+
+same('seqs below the first folded row never answer', () => [
+  textRow('assistant', 20),
+], () => [ev.message(5, 'too old'), ev.message(20, 'the one')])
+
+same('the same tool/call seq reused later still answers from the first call', () => [
+  toolRow(6, 'c1'),
+], () => [ev.call(6), ev.call(6), ev.result(6, 'c1')], true)
+
+same('a row with no seq stays folded', () => [
+  textRow('assistant', undefined), toolRow(undefined, 'c1'),
+], () => [ev.message(1, 'x'), ev.call(1)])
+
+same('a tool row with no tool model stays folded', () => [
+  { id: nextId++, kind: 'tool', text: 'p', folded: true, seq: 1 } as ChatRow,
+], () => [ev.call(1)])
+
+same('an error tool row restores its call view but no result view', () => [
+  toolRow(2, 'c1', 'error'),
+], () => [ev.call(2), ev.result(3, 'c1')], true)
+
+same('a mix restores the restorable half in one press', () => [
+  textRow('assistant', 1), toolRow(2, 'c1'), textRow('assistant', 4),
+  textRow('assistant', 30), toolRow(31, 'gone'),
+], () => [ev.message(1, 'a'), ev.call(2), ev.result(3, 'c1'), ev.message(4, 'b'), ev.message(6, 'c')], true)
+
+// ── the container is marked dirty once, and only when something came back ────
+
+{
+  const rows = [textRow('assistant', 1)]
+  const restored = foldBack(rows, [ev.message(1, 'a')])
+  check('a restore clears the folded mark', restored === 1 && rows[0]!.folded === false)
+  check('an already-thawed window returns 0 without touching anything', foldBack([textRow('assistant', 1)].map(r => ({ ...r, folded: false })), []) === 0)
+}
+
+// ── the reason this exists: one press must stay inside the click budget ──────
+//
+// A single timed call would mostly measure V8 warming up this function, which
+// is why the budget is checked against the MEDIAN of repeated presses: a user
+// clicks "load earlier" far more than once per process, and only the steady
+// state is what the ≤50 ms budget describes. The oracle is timed on the same
+// fixture (at a smaller size — its per-row scan is quadratic, so 20k there
+// costs seconds) to pin the reason for the win, not just the number.
+
+/** Slice of a synthetic titan session: `i` tool + text row pairs, seq-ordered. */
+function titanFixture(folded: number): { makeRows: () => ChatRow[]; events: SessionEvent[] } {
+  const events: SessionEvent[] = []
+  for (let i = 0; i < folded; i += 1) {
+    const seq = i * 4
+    events.push(ev.call(seq), ev.result(seq + 1, `c${i}`), ev.message(seq + 2, `m${i} ${'x'.repeat(400)}`))
+  }
+  const makeRows = (): ChatRow[] => {
+    const rows: ChatRow[] = []
+    for (let i = 0; i < folded; i += 1) {
+      const seq = i * 4
+      rows.push(i % 2 === 0 ? toolRow(seq, `c${i}`) : textRow('assistant', seq + 2))
+    }
+    return rows
+  }
+  return { makeRows, events }
+}
+
+/** Median of `runs` timings of one foldBack over a fresh fixture each time. */
+function press(fn: (rows: ChatRow[]) => number, makeRows: () => ChatRow[], runs: number): { ms: number; restored: number } {
+  const times: number[] = []
+  let restored = 0
+  for (let run = 0; run < runs; run += 1) {
+    const rows = makeRows()
+    const t0 = process.hrtime.bigint()
+    restored = fn(rows)
+    times.push(Number(process.hrtime.bigint() - t0) / 1e6)
+  }
+  times.sort((a, b) => a - b)
+  return { ms: times[times.length >>> 1]!, restored }
+}
+
+{
+  const FOLDED = 20_000
+  const titan = titanFixture(FOLDED)
+  foldBack(titan.makeRows(), titan.events) // warm the JIT once before timing
+  const { ms, restored } = press((rows) => foldBack(rows, titan.events), titan.makeRows, 5)
+  check(
+    `${FOLDED} folded rows restore in ${ms.toFixed(1)} ms median (budget ≤50 ms)`,
+    restored === FOLDED && ms < 50,
+    { restored, ms },
+  )
+
+  const SMALL = 2_000
+  const small = titanFixture(SMALL)
+  foldBackOracle(small.makeRows(), small.events)
+  foldBack(small.makeRows(), small.events)
+  const before = press((rows) => foldBackOracle(rows, small.events), small.makeRows, 3)
+  const after = press((rows) => foldBack(rows, small.events), small.makeRows, 3)
+  check(
+    `the one-pass index beats the per-row scan (${SMALL} rows: ${before.ms.toFixed(1)} → ${after.ms.toFixed(1)} ms)`,
+    before.restored === after.restored && after.ms * 5 < before.ms,
+    { before, after },
+  )
+}
+
+console.log(`\nverify-dsh-fold-back OK (${passed} checks)`)
+process.exit(0)
