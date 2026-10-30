@@ -14,6 +14,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import type { AgentEvent } from '../src/agent/events.js'
 import {
+  CHUNK_CHARS,
   CHUNK_ROUNDS,
   OPEN_ROUNDS,
   chunkForRow,
@@ -100,6 +101,51 @@ assert.ok(chunks.at(-1)!.rounds <= OPEN_ROUNDS, 'the newest chunk is the small o
 // Deterministic for this record: 240 rounds (a prompt and a goal continuation
 // each open one) cut as newest 10, then 50 + 50 + 50 + 50, then the oldest 30.
 assert.equal(chunks.length, 6, '240 rounds cut at the older budget make six chunks')
+
+// ── the digest line's numbers ─────────────────────────────────────────────
+// A collapsed chunk reports events / tool calls / errors / weight and nothing
+// else, so those four must be right: an off-by-one there is a claim the reader
+// has no way to check.
+const weight = (event: AgentEvent): number => {
+  switch (event.type) {
+    case 'user.message':
+      return event.text.length
+    case 'assistant.message':
+      return event.blocks.reduce((sum, block) => sum + (block.text?.length ?? 0), 0)
+    case 'tool.call':
+      return event.argsJson.length
+    case 'tool.result':
+      return event.text.length
+    default:
+      return 0
+  }
+}
+for (const chunk of chunks) {
+  const range = entries.slice(chunk.start, chunk.end)
+  assert.equal(chunk.events, range.length, 'the digest reports its entry count')
+  assert.equal(chunk.toolCalls, range.filter(event => event.type === 'tool.call').length, 'and its tool calls')
+  assert.equal(chunk.errors, range.filter(event => event.type === 'tool.result' && event.isError === true).length, 'and its failures')
+  assert.equal(chunk.chars, range.reduce((sum, event) => sum + weight(event), 0), 'and its text weight')
+}
+
+// A round heavier than a whole page still lands alone: a round is taken whole
+// or not at all, because a result without its call surfaces as a stray row.
+let hugeSeq = 10_000
+const huge: AgentEvent[] = []
+for (const [text, size] of [['before', 10], ['huge', CHUNK_CHARS + 1], ['after', 10]] as const) {
+  huge.push(prompt(hugeSeq, text))
+  huge.push(answer(hugeSeq + 1, 'x'.repeat(size)))
+  hugeSeq += 2
+}
+const hugeChunks = planChunks(huge)
+assert.equal(hugeChunks.length, 3, 'an oversized round is not merged with its neighbours')
+const oversized = hugeChunks.find(chunk => chunk.chars > CHUNK_CHARS)
+assert.deepEqual(
+  [oversized?.rounds, oversized?.events],
+  [1, 2],
+  'the oversized round lands alone with both its entries',
+)
+assert.ok(hugeChunks.every((chunk, index) => chunk.start === (index === 0 ? 0 : hugeChunks[index - 1]!.end)), 'and the tiling still holds')
 
 // ── collapsed rows ────────────────────────────────────────────────────────
 for (const chunk of chunks) {
