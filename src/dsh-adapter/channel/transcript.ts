@@ -160,7 +160,6 @@ export function foldBack(rows: ChatRow[], events: readonly SessionEvent[], views
       row.folded = false
       row.restored = true
       markChannelReadDirty(row)
-      markChannelReadDirty(rows)
       restored += 1
       continue
     }
@@ -172,9 +171,11 @@ export function foldBack(rows: ChatRow[], events: readonly SessionEvent[], views
     row.folded = false
     row.restored = true
     markChannelReadDirty(row)
-    markChannelReadDirty(rows)
     restored += 1
   }
+  // The container is marked once: it is one object, so N marks only burn
+  // revision numbers.
+  if (restored > 0) markChannelReadDirty(rows)
   return restored
 }
 
