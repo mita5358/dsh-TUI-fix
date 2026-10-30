@@ -83,8 +83,9 @@ export function foldRows(
 
 /**
  * Restore folded rows from the session log, newest folded batch first.
- * Rebuilds each folded row's full text from its source events and clears
- * the folded mark, keeping row ids, scroll anchors, and selection stable.
+ * Rebuilds each folded row's full text from its source events, clears the
+ * folded mark and sets `restored` so the next fold pass leaves it alone,
+ * keeping row ids, scroll anchors, and selection stable.
  * `views` re-derives the tool presentation views foldRows dropped (the
  * presenters live on the host plane, so the channel passes them in).
  * Returns the number of rows restored.
@@ -119,6 +120,7 @@ export function foldBack(rows: ChatRow[], events: readonly SessionEvent[], views
         ? views?.result(call.data.name, call.data.arguments, result.data)
         : undefined
       row.folded = false
+      row.restored = true
       markChannelReadDirty(row)
       markChannelReadDirty(rows)
       restored += 1
@@ -130,6 +132,7 @@ export function foldBack(rows: ChatRow[], events: readonly SessionEvent[], views
     if (message === undefined) continue
     restoreRowFromEvent(row, message)
     row.folded = false
+    row.restored = true
     markChannelReadDirty(row)
     markChannelReadDirty(rows)
     restored += 1
