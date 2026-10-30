@@ -232,6 +232,17 @@ const STATUS_VIEW_UI = Object.freeze({
 /** Shared empty snapshot for hosts whose channel has no event log. */
 const NO_EVENTS: readonly SessionEvent[] = []
 
+/**
+ * Events per trajectory-fold slice on the first-frame path.
+ *
+ * The trajectory strips fold the whole session, and folding it in one pass
+ * costs ~2.3 s on a 93k-event record (nearly all of it `assistant/message`
+ * stream validation) — the conversation is painted but held back by that
+ * pass. 4k events is roughly one 150 ms slice: big enough to finish the fold
+ * in a few dozen ticks, small enough that each tick leaves the frame on time.
+ */
+const TRAJECTORY_FOLD_BUDGET = 4000
+
 const COMMAND_RESULT_CELLS = 200
 
 /** Per-line width budget for a transcript block (`/plugins`, `/goal`): much
@@ -4593,12 +4604,28 @@ export function Chat({
    * conversation pays nothing for it.
    */
   const trajectoryRef = React.useRef<TrajBuild | null>(null)
+  // oxlint-disable-next-line typescript/no-unnecessary-condition -- runtime guard: headless hosts render Chat with a partial channel
+  const trajectoryEvents = channel.traceEvents?.() ?? NO_EVENTS
+  const trajectoryStarted = trajectoryRef.current !== null
+  const trajectoryBudget = !trajectoryStarted
+    ? (trajectoryEvents.length > TRAJECTORY_FOLD_BUDGET ? 0 : null)
+    : (trajectoryRef.current!.source.length < trajectoryEvents.length ? TRAJECTORY_FOLD_BUDGET : null)
   trajectoryRef.current = extendTrajectory(
     trajectoryRef.current,
-    // oxlint-disable-next-line typescript/no-unnecessary-condition -- runtime guard: headless hosts render Chat with a partial channel
-    channel.traceEvents?.() ?? NO_EVENTS,
+    trajectoryEvents,
+    trajectoryBudget === null ? {} : { budget: trajectoryBudget },
   )
   const trajectory = trajectoryRef.current
+  // Keep pulling slices until the fold catches up with the snapshot; a live
+  // append arriving in between simply enlarges the target and the next tick
+  // picks it up through the ordinary incremental path.
+  const [, bumpTrajectoryFold] = React.useState(0)
+  React.useEffect(() => {
+    if (trajectoryRef.current === null) return
+    if (trajectoryRef.current.source.length >= trajectoryEvents.length) return
+    const timer = setTimeout(() => bumpTrajectoryFold(tick => tick + 1), 0)
+    return () => clearTimeout(timer)
+  })
 
   /**
    * The status-line wake.

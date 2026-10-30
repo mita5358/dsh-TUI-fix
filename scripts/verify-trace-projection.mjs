@@ -157,6 +157,26 @@ check('fixture folds to a non-trivial ledger', whole.nodes.length > 40, `${whole
 }
 
 {
+  // Budgeted slices — the titan first-frame path. A caller that cannot afford
+  // the whole fold spreads it over frames; the result must be the same ledger,
+  // and the cursor must advance by exactly the budget.
+  let build = extendTrajectory(null, events, { budget: 0 })
+  check('a zero budget folds nothing and keeps an empty cursor', build.nodes.length === 0 && build.source.length === 0)
+  let ticks = 0
+  while (build.source.length < events.length && ticks < events.length + 1) {
+    const before = build.source.length
+    build = extendTrajectory(build, events, { budget: 3 })
+    if (build.source.length !== Math.min(events.length, before + 3)) break
+    ticks += 1
+  }
+  check('budgeted slices fold the whole snapshot', build.source.length === events.length, `${build.source.length}/${events.length} in ${ticks} ticks`)
+  check('budgeted slices equal from-scratch', diff(build.nodes, whole.nodes) === null, diff(build.nodes, whole.nodes) ?? '')
+  const partial = extendTrajectory(null, events, { budget: 7 })
+  check('a partial build exposes a prefix of the snapshot', partial.source.length === 7 && partial.source[6] === events[6])
+  check('a budget larger than the tail consumes it whole', extendTrajectory(partial, events, { budget: 10_000 }).source.length === events.length)
+}
+
+{
   // One-event-at-a-time replay — the live streaming path.
   let build = null
   for (let i = 1; i <= events.length; i++) build = extendTrajectory(build, events.slice(0, i))

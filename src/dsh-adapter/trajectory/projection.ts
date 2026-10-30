@@ -829,40 +829,66 @@ export function emptyTrajectory(): TrajBuild {
   return { source: [], nodes: [], timing: new Map(), counts: state.counts, state }
 }
 
+/** Options for {@link extendTrajectory}. */
+export interface ExtendOptions {
+  /**
+   * Fold at most this many events, leaving the rest for the next call.
+   *
+   * A long record costs ~2.3 s of main-thread work to fold (measured on the
+   * titan log: 93k events, mostly `assistant/message` stream validation). A
+   * caller that runs on the first-frame path uses this to spread that work
+   * over several frames instead of holding the frame back; the build's
+   * `source` is then a prefix of the snapshot, and the next call resumes from
+   * it exactly like any other incremental append.
+   */
+  readonly budget?: number
+}
+
 /**
  * Extend a previous projection with the session's current event snapshot.
  *
  * @param previous - The prior build, or `null` to fold from scratch.
  * @param events - The session's current immutable event snapshot.
+ * @param options - See {@link ExtendOptions}.
  * @returns A build over `events`; `previous` itself when nothing was appended.
  */
 export function extendTrajectory(
   previous: TrajBuild | null,
   events: readonly RawTrajEvent[],
+  options: ExtendOptions = {},
 ): TrajBuild {
   const raw = asRawEvents(events)
+  const cursor = previous?.source.length ?? 0
+  const limit = options.budget === undefined
+    ? raw.length
+    : Math.min(raw.length, cursor + Math.max(0, options.budget))
+  const source = limit === raw.length ? raw : raw.slice(0, limit)
   if (
     previous !== null &&
-    raw.length >= previous.source.length &&
-    (previous.source.length === 0 ||
-      raw[previous.source.length - 1] === previous.source[previous.source.length - 1])
+    raw.length >= cursor &&
+    limit > cursor &&
+    (cursor === 0 ||
+      raw[cursor - 1] === previous.source[cursor - 1])
   ) {
-    if (raw.length === previous.source.length) return previous
     const nodes = previous.nodes
     const timing = previous.timing
     const state = cloneState(previous.state)
-    for (let index = previous.source.length; index < raw.length; index++) {
+    for (let index = cursor; index < limit; index++) {
       consume(state, nodes, timing, raw[index]!)
     }
     syncRowCount(state, nodes)
-    return { source: raw, nodes, timing, counts: state.counts, state }
+    return { source, nodes, timing, counts: state.counts, state }
+  }
+  if (previous !== null && raw.length >= cursor && limit <= cursor &&
+    (cursor === 0 || raw[cursor - 1] === previous.source[cursor - 1])) {
+    return previous
   }
   const nodes: TrajNode[] = []
   const timing = new Map<string, StepTiming>()
   const state = newState()
-  for (const event of raw) consume(state, nodes, timing, event)
+  for (let index = 0; index < limit; index++) consume(state, nodes, timing, raw[index]!)
   syncRowCount(state, nodes)
-  return { source: raw, nodes, timing, counts: state.counts, state }
+  return { source, nodes, timing, counts: state.counts, state }
 }
 
 /**
