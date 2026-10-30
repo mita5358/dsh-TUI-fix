@@ -4754,8 +4754,12 @@ export function Chat({
    * for an already-revealed row is harmless.
    */
   const revealAndSeekRow = (rowId: number): void => {
+    // A backend that collapses history loads only the region holding the row
+    // (DSH: the one chunk, never the whole record) and reports the id of the
+    // loaded twin — a collapsed row's id need not survive loading.
+    const revealed = channel.revealRow(rowId)
     if (!showAllMessages) setShowAllMessages(true)
-    seekRow(rowId)
+    seekRow(revealed === 0 ? rowId : revealed)
   }
   React.useLayoutEffect(() => {
     if (forceMountRowId === null) return

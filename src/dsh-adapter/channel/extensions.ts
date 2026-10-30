@@ -37,7 +37,7 @@ import { touchSession } from '../../sessionHistory.js'
 import { snapshotLiveSessionEvents } from '../compat/liveSession.js'
 import { DEFAULT_SESSION_MODES, resolveSessionModes } from '../../sessionModes.js'
 import { installedMeetsVersion } from '../contract.js'
-import { planChunks, placeholderRows, type HistoryChunk } from '../backend/history-chunks.js'
+import { chunkForRow, placeholderEvent, planChunks, placeholderRows, type HistoryChunk } from '../backend/history-chunks.js'
 import { createDshSession } from '../backend/session.js'
 import { createDshTranslator, dshPricingWindow } from '../backend/translate.js'
 import { concreteService } from '../host-access.js'
@@ -408,6 +408,20 @@ export function attachDshExtensions(
     ]
   }
 
+  /** Project one planned chunk in place over its placeholder rows. Returns
+   *  the rows spliced in, 0 when the chunk has no placeholder left to replace
+   *  (a stale plan) — the caller reads that as "nothing to load". */
+  const materializeChunk = (chunk: HistoryChunk): number => {
+    const at = state.rows.findIndex(row => row.id === chunk.idBase)
+    if (at < 0) return 0
+    const rows = chunkRows(chunk)
+    state.rows.splice(at, placeholderCounts.get(chunk.index) ?? 1, ...rows)
+    loadedChunks.add(chunk.index)
+    placeholderCounts.delete(chunk.index)
+    markChannelReadDirty(state.rows)
+    return rows.length
+  }
+
   /**
    * Load the next older chunk in place, replacing its placeholder rows —
    * "load earlier" for a chunked seed. Returns the rows that materialized so
@@ -418,14 +432,37 @@ export function attachDshExtensions(
     for (let index = seedChunks.length - 1; index >= 0; index -= 1) {
       const chunk = seedChunks[index]!
       if (loadedChunks.has(chunk.index)) continue
-      const at = state.rows.findIndex(row => row.id === chunk.idBase)
-      if (at < 0) return 0
-      const rows = chunkRows(chunk)
-      state.rows.splice(at, placeholderCounts.get(chunk.index) ?? 1, ...rows)
-      loadedChunks.add(chunk.index)
-      placeholderCounts.delete(chunk.index)
-      markChannelReadDirty(state.rows)
-      return rows.length
+      return materializeChunk(chunk)
+    }
+    return 0
+  }
+
+  /**
+   * Reveal one row of a collapsed chunk — the timeline rail's tick for a turn
+   * older than the fold window. Only the chunk that owns the row is projected
+   * (never the rest of the history: expanding all of it is what made a tick
+   * on a titan record crawl), and the returned id is the projected row the
+   * clicked placeholder stands for, so the caller seeks real content instead
+   * of a text-capped digest line. 0 = nothing to reveal (a live row, a row
+   * that already owns its chunk's place in the transcript, or a stale plan).
+   */
+  const revealChunkRow = (rowId: number): number => {
+    if (seedChunks === undefined) return 0
+    const chunk = chunkForRow(seedChunks, rowId)
+    if (chunk === undefined || loadedChunks.has(chunk.index)) return 0
+    // Resolve the clicked placeholder to the event it stands for, then to that
+    // event's own projected row by seq — unique per event, and stable even for
+    // a row the projector drops (an empty team message).
+    const event = placeholderEvent(chunk, seedEntries, rowId)
+    if (event === undefined) return 0
+    const seq = event.seq
+    const loaded = materializeChunk(chunk)
+    if (loaded === 0) return 0
+    const at = state.rows.findIndex(row => row.id === chunk.idBase)
+    if (at < 0) return 0
+    for (let index = at; index < at + loaded; index += 1) {
+      const row = state.rows[index]!
+      if (row.seq === seq) return row.id
     }
     return 0
   }
@@ -453,6 +490,9 @@ export function attachDshExtensions(
     conversationKey: session => session.capabilities.native.dsh?.agent ?? session,
     flushDeferred: () => subagentProjection.flush(),
     loadOlder: dshLocal.loadOlder,
+    // A timeline tick on a turn that a collapsed chunk only sketches: project
+    // that one chunk and hand back the projected row to seek.
+    revealRow: revealChunkRow,
     // Unloaded chunks sit in the transcript as digest rows, so no folded row
     // announces them: ask the chunk plan instead (the load-earlier divider).
     hasOlderHistory: () => seedChunks !== undefined && seedChunks.some(chunk => !loadedChunks.has(chunk.index)),

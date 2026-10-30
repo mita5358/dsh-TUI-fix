@@ -280,6 +280,7 @@
     "verify:plugin-catalog-extraction": "node --import tsx/esm scripts/verify-plugin-catalog-extraction.ts",
     "verify:channel-composition": "node --import tsx/esm scripts/verify-channel-composition.ts",
     "verify:channel-trace-read": "node --import tsx/esm scripts/verify-channel-trace-read.ts",
+    "verify:history-chunks": "node --import tsx/esm scripts/verify-history-chunks.ts",
     "verify:activity-store": "node --import tsx/esm scripts/verify-activity-store.ts",
     "verify:activity-store-render": "node --import tsx/esm scripts/verify-activity-store-render.tsx",
     "verify:status-fields": "node --import tsx/esm scripts/verify-status-fields.tsx",

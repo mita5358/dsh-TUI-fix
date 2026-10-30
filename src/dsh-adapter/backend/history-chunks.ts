@@ -197,11 +197,45 @@ function measure(
 
 /** True on a user message that paints a prompt row: a human prompt or a team
  *  message. A compaction notice, a replay of terminal output or a goal
- *  continuation does not — it is represented by the digest line alone. */
-function promptRow(event: AgentEvent): boolean {
+ *  continuation does not — it is represented by the digest line alone. Both
+ *  the collapsed placeholder rows and the projected slice use this rule, so a
+ *  placeholder's position maps onto the row it stands for. */
+export function promptsTurnRow(event: AgentEvent): event is Extract<AgentEvent, { type: 'user.message' }> {
   if (event.type !== 'user.message') return false
   if (event.source === 'team-message') return true
   return event.source === 'user' && (event.text !== '' || (event.images?.length ?? 0) > 0)
+}
+
+/** The chunk that owns a row id, undefined for a live row: ids are reserved
+ *  per chunk (`ID_STRIDE` ranges, negative), so a reveal can find the owning
+ *  chunk without scanning the record. */
+export function chunkForRow(chunks: readonly HistoryChunk[], rowId: number): HistoryChunk | undefined {
+  for (const chunk of chunks) {
+    if (rowId >= chunk.idBase && rowId < chunk.idBase + ID_STRIDE) return chunk
+  }
+  return undefined
+}
+
+/**
+ * The event a collapsed prompt row stands for. Ids are positional inside a
+ * chunk (`idBase` is the digest line, then one row per prompt), so the offset
+ * picks the k-th prompt event — the identity a reveal needs once the chunk's
+ * projected rows carry their own ids and seqs. Undefined for the digest row.
+ */
+export function placeholderEvent(
+  chunk: HistoryChunk,
+  entries: readonly AgentEvent[],
+  rowId: number,
+): Extract<AgentEvent, { type: 'user.message' }> | undefined {
+  let ordinal = rowId - chunk.idBase - 1
+  if (ordinal < 0) return undefined
+  for (let index = chunk.start; index < chunk.end; index += 1) {
+    const event = entries[index]!
+    if (!promptsTurnRow(event)) continue
+    if (ordinal === 0) return event
+    ordinal -= 1
+  }
+  return undefined
 }
 
 /** Cap a placeholder prompt line: the record still holds the full text. */
@@ -240,7 +274,7 @@ export function placeholderRows(
       })
       continue
     }
-    if (!promptRow(event)) continue
+    if (!promptsTurnRow(event)) continue
     rows.push({ id: chunk.idBase + rows.length, kind: 'user', text: placeholderText(event.text), ...images, restored: true })
   }
   return rows

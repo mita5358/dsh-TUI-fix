@@ -662,6 +662,14 @@ export interface ChannelUi {
    * the whole log is already materialized.
    */
   loadOlder(): number
+  /**
+   * Bring the region that owns `rowId` into the transcript before seeking it:
+   * a backend that collapses history into summaries loads just the collapsed
+   * part the row belongs to. Returns the row id to seek — the loaded twin of
+   * `rowId`, which need not survive loading — or 0 when nothing had to be
+   * loaded (the row is already live, or no backend owns it).
+   */
+  revealRow(rowId: number): number
   /** Push a transient notification above the prompt input. Returns an
    *  early-dismiss handle (the auto-timeout still runs as the backstop). */
   notify(text: string, options?: { color?: NotificationItem['color']; timeoutMs?: number }): () => void

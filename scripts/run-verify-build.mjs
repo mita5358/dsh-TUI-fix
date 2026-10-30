@@ -114,6 +114,7 @@ const GATES = [
   'verify:plugin-catalog-extraction',
   'verify:session-reset',
   'verify:channel-ui',
+  'verify:history-chunks',
   'verify:adapter-detection',
   'verify:adapter-replay-harness',
   'verify:adapter-channel-conformance',

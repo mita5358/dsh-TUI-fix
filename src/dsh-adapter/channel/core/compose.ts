@@ -96,6 +96,11 @@ export interface ChannelExtension {
    *  extension whose `loadOlder` restores history no `folded` row marks
    *  (DSH: history chunks not yet expanded). */
   hasOlderHistory?(): boolean
+  /** Bring one older row into the transcript on demand — the rail's jump to a
+   *  turn that sits behind a collapsed region rather than a `folded` row.
+   *  Returns the id the jump should seek: the loaded twin of the row asked for
+   *  (its id need not survive loading), or 0 when nothing had to be loaded. */
+  revealRow?(rowId: number): number
   /** The extension projects subagents and
    *  its host services): the core's event-driven activity projection stays
    *  inert and its controls are the extension's. */
@@ -510,6 +515,9 @@ export function createCoreChannel(
       if (extension.hasOlderHistory?.() === true) return true
       return extension.loadOlder === undefined && !viewCleared() && (binding.session.capabilities.transcript?.hasOlder() ?? false)
     },
+    // Only an extension that collapses history on its own can name the loaded
+    // twin of a collapsed row; every other backend keeps ids stable.
+    revealRow: (rowId: number): number => extension.revealRow?.(rowId) ?? 0,
     backendInit: () => {
       const fence = mcpFence()
       const init = fence.session.capabilities.init

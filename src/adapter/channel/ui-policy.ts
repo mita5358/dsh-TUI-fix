@@ -90,6 +90,7 @@ export const CHANNEL_UI_EFFECTS = Object.freeze({
   'switchPreset': 'mutate',
   'clear': 'mutate',
   'loadOlder': 'mutate',
+  'revealRow': 'mutate',
   'notify': 'mutate',
   'setActivityFrames': 'mutate',
   'listModels': 'read-only',
