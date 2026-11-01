@@ -39,7 +39,7 @@ import { snapshotLiveSessionEvents } from '../compat/liveSession.js'
 import { DEFAULT_SESSION_MODES, resolveSessionModes } from '../../sessionModes.js'
 import { installedMeetsVersion } from '../contract.js'
 import { markBoot } from '../../utils/bootTrace.js'
-import { chunkForRow, placeholderEvent, planChunks, placeholderRows, type HistoryChunk } from '../backend/history-chunks.js'
+import { chunkForRow, planChunks, placeholderRows, type HistoryChunk } from '../backend/history-chunks.js'
 import { isSubagentToolName } from './projection-helpers.js'
 import { createDshSession } from '../backend/session.js'
 import { createDshTranslator, dshPricingWindow } from '../backend/translate.js'
@@ -402,6 +402,10 @@ export function attachDshExtensions(
   // One chunk's report line: which rounds it holds, how much work and text sit
   // behind them. Text only — a collapsed chunk renders no cards, no terminal
   // output, no commands, and its newline-free text stays one row.
+  // The collapsed line also says it opens on sight: the transcript projects a
+  // chunk as soon as its section line reaches the viewport (MessageList), so a
+  // reader who stops on it is about to see the real conversation, not a wall of
+  // their own prompts.
   const chunkDigest = (chunk: HistoryChunk, loaded: boolean): string =>
     `${loaded ? '▾' : '⏸'} ${t('chunk-digest', {
       from: chunk.fromRound,
@@ -409,7 +413,7 @@ export function attachDshExtensions(
       events: chunk.events,
       tools: chunk.toolCalls,
       chars: compactChars(chunk.chars),
-    })}`
+    })}${loaded ? '' : ` · ${t('chunk-digest-hint')}`}`
 
   /** One planned chunk as fresh rows: its digest line, then its real rows. */
   const chunkRows = (chunk: HistoryChunk): ChatRow[] => {
@@ -450,33 +454,22 @@ export function attachDshExtensions(
   }
 
   /**
-   * Reveal one row of a collapsed chunk — the timeline rail's tick for a turn
-   * older than the fold window. Only the chunk that owns the row is projected
-   * (never the rest of the history: expanding all of it is what made a tick
-   * on a titan record crawl), and the returned id is the projected row the
-   * clicked placeholder stands for, so the caller seeks real content instead
-   * of a text-capped digest line. 0 = nothing to reveal (a live row, a row
-   * that already owns its chunk's place in the transcript, or a stale plan).
+   * Project the chunk that owns an unloaded row id. This is what the
+   * transcript calls when a collapsed section line scrolls into view (and what
+   * a timeline tick on such a turn calls): only that one chunk is projected,
+   * never the rest of the history — expanding all of it is what made a reveal
+   * crawl on a titan record. Returns the id of the digest line that the loaded
+   * chunk now owns (it survives materialization: `idBase` is the chunk's first
+   * row either way), so a caller can keep the reader anchored; 0 = nothing to
+   * reveal (a live row, an already loaded chunk, a stale plan).
    */
   const revealChunkRow = (rowId: number): number => {
     if (seedChunks === undefined) return 0
     const chunk = chunkForRow(seedChunks, rowId)
     if (chunk === undefined || loadedChunks.has(chunk.index)) return 0
-    // Resolve the clicked placeholder to the event it stands for, then to that
-    // event's own projected row by seq — unique per event, and stable even for
-    // a row the projector drops (an empty team message).
-    const event = placeholderEvent(chunk, seedEntries, rowId)
-    if (event === undefined) return 0
-    const seq = event.seq
     const loaded = materializeChunk(chunk)
     if (loaded === 0) return 0
-    const at = state.rows.findIndex(row => row.id === chunk.idBase)
-    if (at < 0) return 0
-    for (let index = at; index < at + loaded; index += 1) {
-      const row = state.rows[index]!
-      if (row.seq === seq) return row.id
-    }
-    return 0
+    return chunk.idBase
   }
 
   const dshLocal = createLocalActions({
@@ -502,11 +495,11 @@ export function attachDshExtensions(
     conversationKey: session => session.capabilities.native.dsh?.agent ?? session,
     flushDeferred: () => subagentProjection.flush(),
     loadOlder: dshLocal.loadOlder,
-    // A timeline tick on a turn that a collapsed chunk only sketches: project
-    // that one chunk and hand back the projected row to seek.
+    // A timeline tick or a section line on a turn that a collapsed chunk only
+    // sketches: project that one chunk and hand back the row it now owns.
     revealRow: revealChunkRow,
-    // Unloaded chunks sit in the transcript as digest rows, so no folded row
-    // announces them: ask the chunk plan instead (the load-earlier divider).
+    // Unloaded chunks sit in the transcript as one digest row each, so no
+    // folded row announces them: ask the chunk plan instead (load-earlier).
     hasOlderHistory: () => seedChunks !== undefined && seedChunks.some(chunk => !loadedChunks.has(chunk.index)),
     // Subagents and jobs come from the DSH host services (projections above).
     ownsActivity: true,
@@ -717,7 +710,7 @@ export function attachDshExtensions(
     state.rows.length = 0
     for (const chunk of seedChunks) {
       if (chunk.index === newest.index) continue
-      const rows = placeholderRows(chunk, entries, collapsed => chunkDigest(collapsed, false))
+      const rows = placeholderRows(chunk, collapsed => chunkDigest(collapsed, false))
       placeholderCounts.set(chunk.index, rows.length)
       state.rows.push(...rows)
     }

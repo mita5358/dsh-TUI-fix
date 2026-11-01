@@ -7,15 +7,14 @@
  * to 27,907 rows), never the row count — rendering is already bounded by
  * `MAX_ROWS` / `RENDERED_ROW_CAP`, and dropping the rows saved 34 ms. So the
  * record is cut into round-aligned chunks and only the NEWEST chunk is
- * projected for the first paint. Every older chunk contributes one digest row
- * (kind `notice`: a plain text report, no tool cards, no terminal output, no
- * command rows) plus one plain prompt row per human prompt it holds.
- *
- * Those prompt rows are what keeps the timeline rail complete: it indexes
- * `kind: 'user'` rows, so a collapsed chunk still shows its ticks and a tick
- * jumps to its prompt (text capped, see `PLACEHOLDER_TEXT_LIMIT`). Loading the
- * chunk replaces its placeholder rows in place (see `placeholderRows` and the
- * adapter's `loadOlderChunk`), which is what "load earlier" does.
+ * projected for the first paint. Every older chunk contributes exactly ONE
+ * digest row (kind `notice`, `collapsed: true`: a plain text report, no tool
+ * cards, no terminal output, no command rows). An unprojected chunk never
+ * fakes its conversation: the transcript shows a section line, not a hollow
+ * copy, and the list auto-projects the chunk as soon as that line reaches the
+ * viewport (MessageList's load-on-sight effect). Loading the chunk replaces
+ * the line in place (see `placeholderRows` and the adapter's
+ * `loadOlderChunk`/`revealChunkRow`), which is what "load earlier" does.
  *
  * Cut rule: only at a `user.message`, i.e. at a round's first event, whatever
  * its source. A round is never split — a tool result without its call would
@@ -48,11 +47,6 @@ export const CHUNK_CHARS = 1000000
  *  row) and ordered by chunk index, so a chunk loaded later still sorts before
  *  the chunks after it. One million ids per chunk is far above `MAX_ROWS`. */
 const ID_STRIDE = 1_000_000
-
-/** Cap on a placeholder prompt row's text: a resumed session must not pay to
- *  re-render a 500 KB paste it has not opened. Loading the chunk restores the
- *  full text from the record. */
-const PLACEHOLDER_TEXT_LIMIT = 600
 
 /** One contiguous, turn-aligned slice of a translated record. */
 export interface HistoryChunk {
@@ -195,17 +189,6 @@ function measure(
   return { events: end - start, toolCalls, errors, chars }
 }
 
-/** True on a user message that paints a prompt row: a human prompt or a team
- *  message. A compaction notice, a replay of terminal output or a goal
- *  continuation does not — it is represented by the digest line alone. Both
- *  the collapsed placeholder rows and the projected slice use this rule, so a
- *  placeholder's position maps onto the row it stands for. */
-export function promptsTurnRow(event: AgentEvent): event is Extract<AgentEvent, { type: 'user.message' }> {
-  if (event.type !== 'user.message') return false
-  if (event.source === 'team-message') return true
-  return event.source === 'user' && (event.text !== '' || (event.images?.length ?? 0) > 0)
-}
-
 /** The chunk that owns a row id, undefined for a live row: ids are reserved
  *  per chunk (`ID_STRIDE` ranges, negative), so a reveal can find the owning
  *  chunk without scanning the record. */
@@ -217,65 +200,17 @@ export function chunkForRow(chunks: readonly HistoryChunk[], rowId: number): His
 }
 
 /**
- * The event a collapsed prompt row stands for. Ids are positional inside a
- * chunk (`idBase` is the digest line, then one row per prompt), so the offset
- * picks the k-th prompt event — the identity a reveal needs once the chunk's
- * projected rows carry their own ids and seqs. Undefined for the digest row.
- */
-export function placeholderEvent(
-  chunk: HistoryChunk,
-  entries: readonly AgentEvent[],
-  rowId: number,
-): Extract<AgentEvent, { type: 'user.message' }> | undefined {
-  let ordinal = rowId - chunk.idBase - 1
-  if (ordinal < 0) return undefined
-  for (let index = chunk.start; index < chunk.end; index += 1) {
-    const event = entries[index]!
-    if (!promptsTurnRow(event)) continue
-    if (ordinal === 0) return event
-    ordinal -= 1
-  }
-  return undefined
-}
-
-/** Cap a placeholder prompt line: the record still holds the full text. */
-function placeholderText(text: string): string {
-  if (text.length <= PLACEHOLDER_TEXT_LIMIT) return text
-  return `${text.slice(0, PLACEHOLDER_TEXT_LIMIT)}…`
-}
-
-/**
- * The rows an UNLOADED chunk contributes: its digest row, then one plain
- * prompt row per turn. No tool cards, no terminal output, no command rows —
- * a collapsed chunk is text only. Every row is `restored` so a later fold pass
- * never truncates the digest, and carries no `seq`/`anchor`: these rows are
- * not derived from a single log event, and the rewind anchor must stay absent
- * until the chunk is actually loaded.
+ * The rows an UNLOADED chunk contributes: its digest line, nothing else. No
+ * tool cards, no terminal output, no command rows and no prompt stand-ins — a
+ * collapsed chunk is one section line, so the transcript never reads as if the
+ * conversation were missing every answer. The row is `restored` so a later
+ * fold pass never truncates the digest, `collapsed` so the transcript can load
+ * the chunk on sight, and carries no `seq`/`anchor`: the rewind anchor must
+ * stay absent until the chunk is actually loaded.
  */
 export function placeholderRows(
   chunk: HistoryChunk,
-  entries: readonly AgentEvent[],
   digest: (chunk: HistoryChunk) => string,
 ): ChatRow[] {
-  const rows: ChatRow[] = [{ id: chunk.idBase, kind: 'notice', text: digest(chunk), restored: true }]
-  for (let index = chunk.start; index < chunk.end; index += 1) {
-    const event = entries[index]!
-    if (event.type !== 'user.message') continue
-    const images = event.images === undefined ? {} : { images: event.images }
-    if (event.source === 'team-message') {
-      rows.push({
-        id: chunk.idBase + rows.length,
-        kind: 'user',
-        label: 'team-message',
-        text: placeholderText(event.text),
-        ...(event.sender === undefined ? {} : { sender: event.sender }),
-        ...images,
-        restored: true,
-      })
-      continue
-    }
-    if (!promptsTurnRow(event)) continue
-    rows.push({ id: chunk.idBase + rows.length, kind: 'user', text: placeholderText(event.text), ...images, restored: true })
-  }
-  return rows
+  return [{ id: chunk.idBase, kind: 'notice', text: digest(chunk), restored: true, collapsed: true }]
 }

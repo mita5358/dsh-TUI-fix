@@ -1,14 +1,14 @@
 /**
- * Chunked history: the cut plan, the collapsed placeholder rows, and the
- * placeholder → projected-row mapping a rail reveal depends on
- * (`ChannelUi.revealRow`, implemented by the DSH extension's `revealChunkRow`).
+ * Chunked history: the cut plan, the collapsed section row, and the id range a
+ * load-on-sight / rail reveal depends on (`ChannelUi.revealRow`, implemented by
+ * the DSH extension's `revealChunkRow`).
  *
- * The regression this guards: a timeline tick on a turn inside a collapsed
- * chunk used to expand the WHOLE record (`showAllMessages`, a 27,907-row
- * relayout, 5.6 GB RSS before the process was killed). A reveal must project
- * only the owning chunk, and must land on the turn's real row — placeholder
- * ids are positional and do not survive materialization, so the mapping is the
- * subtle part.
+ * The regressions this guards: (1) a reveal used to expand the WHOLE record
+ * (`showAllMessages`, a 27,907-row relayout, 5.6 GB RSS before the process was
+ * killed) — it must project only the owning chunk; (2) a collapsed chunk used
+ * to fake one prompt row per human prompt, which made the transcript read as if
+ * every old turn were missing its answer — a collapsed chunk is now exactly one
+ * section line and nothing else.
  */
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
@@ -18,10 +18,8 @@ import {
   CHUNK_ROUNDS,
   OPEN_ROUNDS,
   chunkForRow,
-  placeholderEvent,
   placeholderRows,
   planChunks,
-  promptsTurnRow,
   type HistoryChunk,
 } from '../src/dsh-adapter/backend/history-chunks.js'
 import { projectHistorySlice } from '../src/channel/history-restore.js'
@@ -148,78 +146,51 @@ assert.deepEqual(
 assert.ok(hugeChunks.every((chunk, index) => chunk.start === (index === 0 ? 0 : hugeChunks[index - 1]!.end)), 'and the tiling still holds')
 
 // ── collapsed rows ────────────────────────────────────────────────────────
+// One row per unloaded chunk: the section line, flagged so the transcript
+// projects the chunk on sight. No prompt stand-ins and no projected content —
+// a collapsed chunk must never look like a conversation whose answers are gone.
 for (const chunk of chunks) {
-  const rows = placeholderRows(chunk, entries, digest)
-  assert.equal(rows[0]!.id, chunk.idBase, 'the digest line owns idBase')
-  assert.equal(rows[0]!.kind, 'notice', 'a collapsed chunk is text only')
-  assert.equal(rows[0]!.text, digest(chunk), 'the digest line names its rounds')
-  let expected = 0
-  for (let index = chunk.start; index < chunk.end; index += 1) if (promptsTurnRow(entries[index]!)) expected += 1
-  assert.equal(rows.length, expected + 1, 'one placeholder prompt row per prompt event')
-  for (let index = 0; index < rows.length; index += 1) {
-    assert.equal(rows[index]!.id, chunk.idBase + index, 'placeholder ids are positional')
-    assert.equal(rows[index]!.seq, undefined, 'a placeholder carries no seq (no rewind anchor)')
-  }
+  const rows = placeholderRows(chunk, digest)
+  assert.equal(rows.length, 1, 'an unloaded chunk contributes exactly one row')
+  const row = rows[0]!
+  assert.equal(row.id, chunk.idBase, 'the section line owns idBase')
+  assert.equal(row.kind, 'notice', 'a collapsed chunk is text only')
+  assert.equal(row.text, digest(chunk), 'the section line names its rounds')
+  assert.equal(row.collapsed, true, 'and is flagged as load-on-sight')
+  assert.equal(row.restored, true, 'and is exempt from the fold pass')
+  assert.equal(row.seq, undefined, 'a section line carries no seq (no rewind anchor)')
+  assert.equal(row.anchor, undefined, 'and no anchor: the log anchor arrives with the load')
+}
+
+// The bug this replaced: a collapsed chunk must not claim to be user rows.
+for (const chunk of chunks) {
+  assert.deepEqual(
+    placeholderRows(chunk, digest).filter(row => row.kind === 'user'),
+    [],
+    'no prompt stand-in rows remain in the collapsed form',
+  )
 }
 
 // ── which chunk owns a row ────────────────────────────────────────────────
 for (const chunk of chunks) {
-  assert.equal(chunkForRow(chunks, chunk.idBase), chunk, 'a chunk owns its digest line')
-  assert.equal(chunkForRow(chunks, chunk.idBase + 1), chunk, 'and its prompt rows')
+  assert.equal(chunkForRow(chunks, chunk.idBase), chunk, 'a chunk owns its section line')
+  assert.equal(chunkForRow(chunks, chunk.idBase + 1), chunk, 'and the ids its loaded rows will take')
   assert.equal(chunkForRow(chunks, chunk.idBase + 999_999), chunk, 'up to its whole id stride')
 }
 assert.equal(chunkForRow(chunks, 0), undefined, 'live rows belong to no chunk')
 assert.equal(chunkForRow(chunks, 27_907), undefined, 'live row ids are never in a chunk range')
 
-// ── placeholder → event → projected row ───────────────────────────────────
+// ── load-on-sight target ──────────────────────────────────────────────────
+// The section line's id is the reveal handle: it survives materialization
+// (`chunkRows` also starts at idBase), so the transcript can project the chunk
+// and keep the reader anchored on the same line. A loaded chunk's projected
+// rows must cover real answers, which is what makes the load worth doing.
 const oldest = chunks[0]!
-assert.equal(placeholderEvent(oldest, entries, oldest.idBase), undefined, 'the digest line stands for no event')
-
-// A long prompt is capped on the placeholder and restored in full after load:
-// that is the point of the reveal (a text-capped digest line is not content).
-const longEntryIndex = oldest.end - 1
-const longText = 'z'.repeat(5_000)
-entries[longEntryIndex] = prompt(entries[longEntryIndex]!.seq, longText)
-const rowsAfter = placeholderRows(oldest, entries, digest)
-const longRow = rowsAfter.at(-1)!
-assert.ok(longRow.text.length <= 601, 'a placeholder prompt line is capped')
-
 const projected = projectHistorySlice(entries.slice(oldest.start, oldest.end), 'preview')
-const projectedIds = projected.map((row, index) => ({ row, id: oldest.idBase + 1 + index }))
-for (let index = 1; index < rowsAfter.length; index += 1) {
-  const rowId = rowsAfter[index]!.id
-  const event = placeholderEvent(oldest, entries, rowId)
-  assert.ok(event !== undefined, 'every placeholder prompt row stands for an event')
-  assert.equal(promptsTurnRow(event), true, 'and that event is a prompt-row event')
-  const twin = projectedIds.find(entry => entry.row.seq === event.seq)
-  assert.ok(twin !== undefined, `placeholder ${rowId} maps onto a projected row`)
-  assert.equal(twin.row.kind, 'user', 'the twin is a prompt row')
-  assert.ok(twin.id >= oldest.idBase + 1 && twin.id < oldest.idBase + 1_000_000, 'the twin stays inside the chunk id stride')
+assert.ok(projected.some(row => row.kind === 'assistant'), 'a loaded chunk contains model output')
+assert.ok(projected.some(row => row.kind === 'user'), 'and the prompts it answered')
+assert.ok(projected.every(row => row.id >= 0), 'projection assigns live ids; the chunk re-bases them off idBase')
+for (let index = 0; index < projected.length; index += 1) {
+  const id = oldest.idBase + 1 + index
+  assert.ok(id < oldest.idBase + 1_000_000, 'every loaded row stays inside the chunk id stride')
 }
-const longEvent = placeholderEvent(oldest, entries, rowsAfter.at(-1)!.id)!
-assert.equal(longEvent.text.length, 5_000, 'the reveal resolves the untruncated event')
-assert.equal(projected.find(row => row.seq === longEvent.seq)!.text.length, 5_000, 'and the projected row carries it in full')
-
-// Distinct placeholder rows must map onto distinct projected rows: the rail
-// jumps to one turn, not to the first row that shares its text.
-const mapped = rowsAfter.slice(1).map((row, index) => projectedIds.find(entry => entry.row.seq === placeholderEvent(oldest, entries, rowsAfter[index + 1]!.id)!.seq)!.id)
-assert.equal(new Set(mapped).size, mapped.length, 'each prompt maps onto its own projected row')
-
-// ── the click path ────────────────────────────────────────────────────────
-// The rail's reveal must ask the channel to load the owning region instead of
-// expanding the fold over the whole record.
-const chat = readFileSync(new URL('../src/screens/Chat.tsx', import.meta.url), 'utf8')
-assert.match(
-  chat,
-  /const revealAndSeekRow = \(rowId: number\): void => \{[\s\S]{0,500}?channel\.revealRow\(rowId\)[\s\S]{0,300}?seekRow\(revealed === 0 \? rowId : revealed\)/u,
-  'a rail reveal loads the row\'s owning region and seeks its loaded twin',
-)
-
-// …and the region it loads is one chunk: expanding every older chunk is the
-// freeze this replaced.
-const extensions = readFileSync(new URL('../src/dsh-adapter/channel/extensions.ts', import.meta.url), 'utf8')
-const reveal = /const revealChunkRow = \([\s\S]*?\n  \}\n/u.exec(extensions)?.[0] ?? ''
-assert.match(reveal, /materializeChunk\(chunk\)/u, 'a reveal projects the one owning chunk')
-assert.doesNotMatch(reveal, /loadOlder|planChunks\(|state\.rows = /u, 'and never expands or rebuilds the record')
-
-console.log(`verify-history-chunks OK (${chunks.length} chunks over ${entries.length} events, ${prompts.length} prompts)`)

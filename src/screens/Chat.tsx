@@ -7254,6 +7254,7 @@ export function Chat({
           fullscreen={fullscreen}
           onToggleAll={() =>{  setShowAllMessages(previous => !previous) }}
           onLoadOlder={() => channel.loadOlder()}
+          onRevealCollapsed={(rowId) => { channel.revealRow(rowId) }}
           registerRowRef={registerRowRef}
           scrollHandle={handle}
           forceMountRowId={forceMountRowId}

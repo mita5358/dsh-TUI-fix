@@ -157,6 +157,11 @@ export interface ChatRow {
   /** True when loadOlder() restored this row from the log; restored rows are
    *  exempt from the next fold pass so a restore is not instantly undone. */
   restored?: boolean
+  /** True on the digest line that stands in for an older, still unprojected
+   *  chunk (see history-chunks): the transcript auto-projects that chunk when
+   *  this row reaches the viewport, so the flag tells the list which rows are
+   *  load-on-sight and marks the line as a collapsed section, not a message. */
+  collapsed?: boolean
   /** True on rows created by LIVE event handling (not replay/resume/fold
    *  restore) — the smooth-streaming reveal animates freshly-arrived
    *  content only; replayed history must paint complete. Set when a live row

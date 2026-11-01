@@ -72,6 +72,11 @@ const JOB_GROUP_FOLD_MIN = 3
 // sticky follow, scrollbar) of a fully-mounted list.
 /** Lines of extra content mounted above/below the visible window. */
 const OVERSCAN_LINES = 8
+
+/** Settle time before a collapsed chunk section is projected on sight: long
+ *  enough that a flick through a stack of section lines projects nothing, short
+ *  enough that stopping on one shows the real turns immediately. */
+const LOAD_ON_SIGHT_MS = 120
 /** Fallback row height before the first measurement (terminal lines). */
 const DEFAULT_ROW_HEIGHT = 2
 /** Cold-start estimate of the header block above the rows; corrected by the
@@ -391,6 +396,7 @@ export function MessageList({
   showAll,
   onToggleAll,
   onLoadOlder,
+  onRevealCollapsed,
   olderHistory,
   thinkingVisible = true,
   historyPaintEnabled = true,
@@ -451,6 +457,9 @@ export function MessageList({
   /** Restore folded-away older rows from the session log; shown only when
    *  rows were folded (or `olderHistory` says more exists before them). */
   onLoadOlder?: () => void
+  /** Project the collapsed chunk that owns this digest row (load-on-sight when
+   *  it scrolls into view). Absent = collapsed sections stay digest lines. */
+  onRevealCollapsed?: (rowId: number) => void
   /** The session has history older than the first row (a compaction cut it
    *  off before a resume): the "load earlier" divider shows without any
    *  folded row. */
@@ -957,9 +966,17 @@ export function MessageList({
 
   // Scrolling bypasses React (imperative DOM scrollTop): subscribe so the
   // window follows the viewport.
+  // Load-on-sight arming: only a real scroll (wheel/key/scrollbar) may project
+  // a collapsed chunk. Mount, streaming growth and programmatic seeks must
+  // never fire it, or opening a long record would project history the reader
+  // is not looking at.
+  const autoLoadArmedRef = React.useRef(false)
   React.useEffect(() => {
     if (!scrollHandle) return
-    const tick = (): void =>{  setScrollTick(t => t + 1) }
+    const tick = (): void =>{
+      autoLoadArmedRef.current = true
+      setScrollTick(t => t + 1)
+    }
     return scrollHandle.subscribe(tick)
   }, [scrollHandle])
 
@@ -1517,6 +1534,67 @@ export function MessageList({
       }, 0)
     }
   })
+
+  // Load-on-sight: a collapsed chunk is one section line, and the transcript
+  // projects it the moment that line is on screen with the reader scrolling
+  // toward it, so scrolling up streams the real conversation in (answers,
+  // tool cards and all) instead of standing a row of prompts in for it. One
+  // chunk per scroll gesture: a flick through forty section lines must not
+  // project forty chunks in one frame.
+  let loadOnSightId: number | undefined
+  if (!sticky && visibleRows.length > 0 && onRevealCollapsed !== undefined) {
+    // First row whose bottom is below the viewport top. Binary search over the
+    // monotonic offsets: the mount window can be extended far above the
+    // viewport by history paint, and a linear scan of it per render is exactly
+    // the kind of long-session stall this list exists to avoid.
+    let low = 0
+    let high = visibleRows.length
+    while (low < high) {
+      const mid = (low + high) >> 1
+      if (offsets[mid]! + heightOf(visibleRows[mid]!) <= scrollTop) low = mid + 1
+      else high = mid
+    }
+    // Among the section lines on screen, take the one nearest the middle of
+    // the viewport: its chunk expands right where the reader is looking, so
+    // arriving in a band of section lines (a Home jump, a fast flick) loads the
+    // conversation in front of them instead of one off the edge of the screen.
+    const viewBottom = scrollTop + viewport
+    const viewMiddle = scrollTop + viewport / 2
+    let bestDistance = Number.POSITIVE_INFINITY
+    for (let i = low; i < visibleRows.length && offsets[i]! < viewBottom; i += 1) {
+      const row = visibleRows[i]!
+      if (row.collapsed !== true) continue
+      const distance = Math.abs(offsets[i]! + heightOf(row) / 2 - viewMiddle)
+      if (distance >= bestDistance) continue
+      bestDistance = distance
+      loadOnSightId = row.id
+    }
+  }
+  const autoLoadPendingRef = React.useRef<{ id: number; timer: ReturnType<typeof setTimeout> } | null>(null)
+  React.useEffect(() => {
+    const pending = autoLoadPendingRef.current
+    if (loadOnSightId === undefined || !autoLoadArmedRef.current) {
+      if (pending !== null) {
+        clearTimeout(pending.timer)
+        autoLoadPendingRef.current = null
+      }
+      return
+    }
+    if (pending !== null) {
+      if (pending.id === loadOnSightId) return
+      clearTimeout(pending.timer)
+    }
+    const timer = setTimeout(() => {
+      autoLoadPendingRef.current = null
+      autoLoadArmedRef.current = false
+      onRevealCollapsed?.(loadOnSightId)
+    }, LOAD_ON_SIGHT_MS)
+    autoLoadPendingRef.current = { id: loadOnSightId, timer }
+  }, [loadOnSightId, onRevealCollapsed])
+  React.useEffect(() => () => {
+    const pending = autoLoadPendingRef.current
+    if (pending !== null) clearTimeout(pending.timer)
+  }, [])
 
   // useCallback: the reference feeds MemoRow's shallow compare; a fresh
   // closure per render would defeat every row's memo.
