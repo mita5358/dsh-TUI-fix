@@ -469,6 +469,10 @@ export function attachDshExtensions(
     if (chunk === undefined || loadedChunks.has(chunk.index)) return 0
     const loaded = materializeChunk(chunk)
     if (loaded === 0) return 0
+    // The reader is already looking at this line: without the emit the splice
+    // lands in `state.rows` but no view commit follows, so the digest line
+    // stays painted until the next wheel tick — the reveal looked like a no-op.
+    state.emit()
     return chunk.idBase
   }
 

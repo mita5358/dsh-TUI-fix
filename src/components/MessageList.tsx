@@ -860,7 +860,8 @@ export function MessageList({
   const baseRef = React.useRef<number | null>(null)
   const measureTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
   const [, setMeasureTick] = React.useState(0)
-  const [, setScrollTick] = React.useState(0)
+  // The value is read: the load-on-sight effect keys on it (see below).
+  const [scrollTick, setScrollTick] = React.useState(0)
   React.useEffect(() => () => {
     if (measureTimerRef.current !== null) {
       clearTimeout(measureTimerRef.current)
@@ -971,6 +972,9 @@ export function MessageList({
   // never fire it, or opening a long record would project history the reader
   // is not looking at.
   const autoLoadArmedRef = React.useRef(false)
+  // Filled with the digest row nearest the painted middle (see the post-commit
+  // pass); the timer effect below only ever fires at that recorded row.
+  const autoLoadCandidateRef = React.useRef<number | undefined>(undefined)
   React.useEffect(() => {
     if (!scrollHandle) return
     const tick = (): void =>{
@@ -1508,6 +1512,34 @@ export function MessageList({
         ? null
         : { id: picked.id, index: pick, top: pickedTop, scrollTop: anchoredTop }
     }
+    // Load-on-sight candidate: the digest row nearest the middle of what is
+    // actually painted. Yoga tops of mounted rows are authoritative; the
+    // render-time offset estimate can be stale by the time the reader lands on
+    // a band of digest rows, and expanding a chunk above the fold looks like
+    // nothing happened.
+    if (autoLoadArmedRef.current) {
+      const viewTop = scrollHandle?.getScrollTop()
+      if (!sticky && viewTop !== undefined && onRevealCollapsed !== undefined) {
+        const middle = viewTop + viewport / 2
+        let bestId: number | undefined
+        let bestDistance = Number.POSITIVE_INFINITY
+        for (let i = start; i < end; i += 1) {
+          const row = visibleRows[i]!
+          if (row.collapsed !== true) continue
+          const yoga = localRefs.current.get(row.id)?.yogaNode
+          const top = yoga?.getComputedTop()
+          const height = yoga?.getComputedHeight()
+          if (top === undefined || height === undefined) continue
+          const distance = Math.abs(top + height / 2 - middle)
+          if (distance >= bestDistance) continue
+          bestDistance = distance
+          bestId = row.id
+        }
+        autoLoadCandidateRef.current = bestId
+      }
+    } else {
+      autoLoadCandidateRef.current = undefined
+    }
     if ((changed || growingStreamNeedsMeasure) && measureTimerRef.current === null) {
       // Layout corrections can cascade for many rows. Yield to the next
       // macrotask so React does not count the valid convergence as nested
@@ -1540,40 +1572,13 @@ export function MessageList({
   // toward it, so scrolling up streams the real conversation in (answers,
   // tool cards and all) instead of standing a row of prompts in for it. One
   // chunk per scroll gesture: a flick through forty section lines must not
-  // project forty chunks in one frame.
-  let loadOnSightId: number | undefined
-  if (!sticky && visibleRows.length > 0 && onRevealCollapsed !== undefined) {
-    // First row whose bottom is below the viewport top. Binary search over the
-    // monotonic offsets: the mount window can be extended far above the
-    // viewport by history paint, and a linear scan of it per render is exactly
-    // the kind of long-session stall this list exists to avoid.
-    let low = 0
-    let high = visibleRows.length
-    while (low < high) {
-      const mid = (low + high) >> 1
-      if (offsets[mid]! + heightOf(visibleRows[mid]!) <= scrollTop) low = mid + 1
-      else high = mid
-    }
-    // Among the section lines on screen, take the one nearest the middle of
-    // the viewport: its chunk expands right where the reader is looking, so
-    // arriving in a band of section lines (a Home jump, a fast flick) loads the
-    // conversation in front of them instead of one off the edge of the screen.
-    const viewBottom = scrollTop + viewport
-    const viewMiddle = scrollTop + viewport / 2
-    let bestDistance = Number.POSITIVE_INFINITY
-    for (let i = low; i < visibleRows.length && offsets[i]! < viewBottom; i += 1) {
-      const row = visibleRows[i]!
-      if (row.collapsed !== true) continue
-      const distance = Math.abs(offsets[i]! + heightOf(row) / 2 - viewMiddle)
-      if (distance >= bestDistance) continue
-      bestDistance = distance
-      loadOnSightId = row.id
-    }
-  }
+  // project forty chunks in one frame. The candidate itself is picked by the
+  // post-commit pass below, from Yoga coordinates of what is actually painted.
   const autoLoadPendingRef = React.useRef<{ id: number; timer: ReturnType<typeof setTimeout> } | null>(null)
   React.useEffect(() => {
+    const candidate = autoLoadCandidateRef.current
     const pending = autoLoadPendingRef.current
-    if (loadOnSightId === undefined || !autoLoadArmedRef.current) {
+    if (candidate === undefined || !autoLoadArmedRef.current) {
       if (pending !== null) {
         clearTimeout(pending.timer)
         autoLoadPendingRef.current = null
@@ -1581,16 +1586,20 @@ export function MessageList({
       return
     }
     if (pending !== null) {
-      if (pending.id === loadOnSightId) return
+      if (pending.id === candidate) return
       clearTimeout(pending.timer)
     }
     const timer = setTimeout(() => {
       autoLoadPendingRef.current = null
       autoLoadArmedRef.current = false
-      onRevealCollapsed?.(loadOnSightId)
+      const id = autoLoadCandidateRef.current
+      if (id !== undefined) onRevealCollapsed?.(id)
     }, LOAD_ON_SIGHT_MS)
-    autoLoadPendingRef.current = { id: loadOnSightId, timer }
-  }, [loadOnSightId, onRevealCollapsed])
+    autoLoadPendingRef.current = { id: candidate, timer }
+    // scrollTick is in the deps on purpose: arming is a ref flip and the
+    // painted rows (hence the candidate) can only be known after the commit
+    // that follows it, so without the tick this effect never sees the pair.
+  }, [scrollTick, onRevealCollapsed])
   React.useEffect(() => () => {
     const pending = autoLoadPendingRef.current
     if (pending !== null) clearTimeout(pending.timer)
