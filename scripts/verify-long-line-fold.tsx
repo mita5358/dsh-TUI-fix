@@ -378,20 +378,28 @@ console.log('--- E: mouse click toggles the fold ---')
   )
 }
 
-// 流式 assistant 行：折叠态同样要能点开（走的是独立的 streaming 分支，
-// 状态与落定行分开，接线漏掉就会出现「显示折叠标记却点不动」）。
+// 流式 assistant 行：**不折叠**（需求契约：流式期间说话不能突然断掉，
+// 落定后才允许长行折叠）。StreamingMarkdown 只封印稳定前缀/裁不稳定后缀，
+// 它从不显示 long-line 折叠标记，这里守的就是「流式帧里没有折叠标记，
+// 已到达的尾巴真的在屏上」。
 {
   const rows: Row[] = [{ id: 1, kind: 'assistant', text: `${HEAD}-stream-${'s'.repeat(60_000)}-${TAIL}`, streaming: true }]
   await withMessageList(
     () => <AlternateScreen><KeySink /><FoldList rows={rows} /></AlternateScreen>,
-    async ({ screen, term, stdin }) => {
-      check('E9 streaming row folds and shows the marker', packed(screen()).includes(MARKER_PACKED), digest(screen()))
-      const head = findText(term, `${HEAD}-stream-`)
-      check('E10 the streaming row is on screen to click', head !== null, digest(screen()))
-      if (head === null) return
-      click(stdin, head.col + 1, head.row + 1)
-      check('E11 a click on the streaming row expands the arrived text',
-        await settled(() => packed(screen()).includes(TAIL)), digest(screen()))
+    async ({ screen, term }) => {
+      check('E9 streaming row paints no long-line fold marker',
+        !packed(screen()).includes(MARKER_PACKED) && !packed(screen()).includes('chars folded'), digest(screen()))
+      // 60k 的单行让 HEAD 滚出视口，能验证「在屏」的锚点是尾巴本身。
+      check('E10 the arrived tail is already painted without a click',
+        findText(term, TAIL) !== null, digest(screen()))
+    },
+  )
+  // 落定后同一条长行才允许折叠：这是 E9 的另一半契约。
+  await withMessageList(
+    () => <AlternateScreen><KeySink /><FoldList rows={[{ id: 1, kind: 'assistant', text: `${HEAD}-stream-${'s'.repeat(60_000)}-${TAIL}` }]} /></AlternateScreen>,
+    async ({ screen }) => {
+      check('E12 the same row folds once the turn settles',
+        packed(screen()).includes(MARKER_PACKED), digest(screen()))
     },
   )
 }

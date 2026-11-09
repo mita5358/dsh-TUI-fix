@@ -18,8 +18,8 @@ import { isStandaloneToken, Markdown } from './Markdown.js'
  * every frame — an unbounded suffix (a single huge paragraph with no block
  * boundary to advance the prefix) made that O(total) per frame. The suffix
  * is clipped to this many characters (preferring a paragraph boundary),
- * with a leading marker naming the dropped amount; settling renders the
- * full text once through the non-streaming path.
+ * with a leading marker naming the dropped amount; settling switches to the
+ * non-streaming path, which may independently fold long lines.
  *
  * The cut point is STICKY (advances only when the suffix outgrows budget +
  * step): a cut that slid every frame would break append-only growth, and
@@ -33,6 +33,9 @@ const STABLE_BLOCK_BUDGET = 8192
 
 function clipSuffixTail(suffix: string, cut: { current: number }): string {
   const total = suffix.length
+  // A replacement can shrink the suffix without changing its stable prefix.
+  // An offset at or beyond its end must not suppress the entire replacement.
+  if (cut.current >= total) cut.current = 0
   if (total <= SUFFIX_TAIL_BUDGET) {
     cut.current = 0
     return suffix
@@ -47,6 +50,7 @@ function clipSuffixTail(suffix: string, cut: { current: number }): string {
       : windowStart
   }
   const dropped = cut.current
+  if (dropped === 0) return suffix
   return `${t('streaming-folded', { count: dropped })}\n\n${suffix.slice(cut.current)}`
 }
 
@@ -281,6 +285,9 @@ export function StreamingMarkdown({
   if (advance > 0) {
     const stableBoundary = analyzeStableBoundary(tokens, lastContentIdx)
     if (stableBoundary.safe) {
+      // The cut is relative to the old suffix; advancing the source boundary
+      // makes that offset invalid even when the new suffix is longer than it.
+      cutRef.current = 0
       if (!blocks.definitions) {
         let end = boundary
         for (let index = 0; index < lastContentIdx; index++) {
@@ -334,13 +341,9 @@ export function StreamingMarkdown({
           : boundaryGapRef.current + suffixStart.leadingNewlines
       : 0
 
-  // A lexer boundary must be strictly outside the stable prefix. If marked
-  // reports a raw span that ends at the current cursor (possible around an
-  // unfinished fence/table while deltas arrive), rendering both branches can
-  // paint the same tail twice. Keep the suffix authoritative and never render
-  // an overlapping empty/duplicate boundary.
-  const hasDistinctSuffix = unstableSuffix !== '' &&
-    (stablePrefix === '' || !unstableSuffix.startsWith(stablePrefix))
+  // The suffix starts at stablePrefix.length in the source, so its span
+  // cannot overlap the prefix even when their text happens to be identical.
+  const hasDistinctSuffix = unstableSuffix !== ''
 
   return (
     <Box flexDirection="column">

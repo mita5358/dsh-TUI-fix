@@ -20,11 +20,15 @@ type Props = {
 export function SyntaxText({ text, language, sourceText = text, lineIndex = 0, color, dimColor }: Props): React.ReactNode {
   const [highlighter, setHighlighter] = React.useState<CliHighlight | null>(null)
   const [themeName] = useTheme()
+  // The renderer uses plain text when there is no language/source or when a
+  // caller supplies an overriding color. Avoid loading the syntax engine then.
+  const needsHighlight = language !== undefined && sourceText !== '' && color === undefined && !dimColor
   React.useEffect(() => {
+    if (!needsHighlight) return
     let mounted = true
     void getCliHighlightPromise().then(value => { if (mounted) setHighlighter(value) })
     return () => { mounted = false }
-  }, [])
+  }, [needsHighlight])
   // 当次渲染解析色板，**不按名字 memo**：`auto` 明暗翻转、运行时同名重注册
   // 都不改名字，只改色板身份；按名字缓存会一直留着旧色板（getTheme 本身只是
   // 一次 switch / resolver 查表，与其它取色组件一致）。

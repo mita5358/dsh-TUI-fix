@@ -11,7 +11,7 @@ import type { DOMNode, TextNode, DOMElement } from '../src/ink/dom.js'
 import type { Frame } from '../src/ink/frame.js'
 import type { Screen } from '../src/ink/screen.js'
 
-const [React, { marked }, { Box, Text }, { Markdown }, { StreamingMarkdown }, { MarkdownTable }, { CodeBlockFrame }, { configureMarked, formatToken }, { renderToScreen }, { cellAtIndex }, { TerminalSizeContext }] = await Promise.all([
+const [React, { marked }, { Box, Text }, { Markdown }, { StreamingMarkdown }, { MarkdownTable }, { CodeBlockFrame }, { appendBlockText, configureMarked, formatToken }, { renderToScreen }, { cellAtIndex }, { TerminalSizeContext }] = await Promise.all([
   import('react'), import('marked'), import('../src/ui.js'),
   import('../src/components/Markdown.js'), import('../src/components/StreamingMarkdown.js'),
   import('../src/components/MarkdownTable.js'), import('../src/components/CodeBlockFrame.js'),
@@ -37,7 +37,7 @@ function unsplit(source: string): React.ReactElement {
       // uses, so the unsplit reference matches Markdown's node decisions.
       flush()
       nodes.push(<CodeBlockFrame key={nodes.length} token={token as Tokens.Code} highlight={null} />)
-    } else text += formatToken(token)
+    } else text = appendBlockText(text, formatToken(token))
   }
   flush()
   return <Box flexDirection="column" gap={1}>{nodes}</Box>
@@ -72,6 +72,10 @@ function snapshot(element: React.ReactElement, width: number, styles = true) {
 const paragraph = (index: number) => `Paragraph ${index}: **bold text**, inline \`value\`, and ordinary words to exercise wrapping across the sealed boundary.\n\n`
 const prefix = Array.from({ length: 100 }, (_, index) => paragraph(index)).join('')
 const cases = [
+  // Neither boundary has actually been cut; no synthetic fold marker or
+  // extra blank row may appear before the streaming source.
+  'x'.repeat(3585),
+  'x'.repeat(4608),
   prefix + 'tail',
   prefix + '\n\n\nlast paragraph\n',
   prefix + '```ts\nconst value = 1\n```\nprose after code\n\n',
@@ -156,6 +160,40 @@ try {
     assert.ok(await settled(() => scanPositions(ink.frontFrame.screen, marker).length === 1))
     assert.deepEqual(screenSnapshot(ink.frontFrame.screen, undefined, false), snapshot(unsplit(source), 55, false), 'growing suffix resolves definitions from the stable prefix')
   }
+
+  // The same bytes can occur in distinct source spans. An unsafe hr boundary
+  // keeps the previous prefix, so comparing bytes instead of offsets used to
+  // hide the entire second paragraph and the newly appended tail.
+  const repeated = 'REPEATED-PARAGRAPH\n\nREPEATED-PARAGRAPH'
+  app.rerender(<StreamingMarkdown>{repeated}</StreamingMarkdown>)
+  assert.ok(await settled(() => scanPositions(ink.frontFrame.screen, 'REPEATED-PARAGRAPH').length === 2), 'both repeated paragraphs must initially render')
+  const repeatedAppended = `${repeated}\n\n---\nREPEATED-END`
+  app.rerender(<StreamingMarkdown>{repeatedAppended}</StreamingMarkdown>)
+  assert.ok(await settled(() => scanPositions(ink.frontFrame.screen, 'REPEATED-END').length === 1), 'an equal prefix must not hide the later source span')
+  assert.equal(scanPositions(ink.frontFrame.screen, 'REPEATED-PARAGRAPH').length, 2)
+  assert.deepEqual(screenSnapshot(ink.frontFrame.screen, undefined, false), snapshot(unsplit(repeatedAppended), 55, false), 'repeated prefix and suffix match full Markdown')
+
+  // A cut into an old long suffix is not an offset into a newly opened one.
+  // Accept an uncut old suffix too, so this regression does not require the
+  // legacy streaming fold once full streaming rendering becomes available.
+  const oldSuffix = `OLD-HEAD-${'x'.repeat(4982)}-OLD-TAIL`
+  app.rerender(<StreamingMarkdown>{oldSuffix}</StreamingMarkdown>)
+  assert.ok(await settled(() => scanPositions(ink.frontFrame.screen, '-OLD-TAIL').length === 1 && (scanPositions(ink.frontFrame.screen, 'folded').length === 1 || scanPositions(ink.frontFrame.screen, 'OLD-HEAD-').length === 1)), 'old suffix must finish painting')
+  const newSuffix = `NEW-HEAD-${'y'.repeat(3980)}-NEW-TAIL`
+  const advancedSource = `${oldSuffix}\n\n${newSuffix}`
+  app.rerender(<StreamingMarkdown>{advancedSource}</StreamingMarkdown>)
+  assert.ok(await settled(() => scanPositions(ink.frontFrame.screen, 'NEW-HEAD-').length === 1 && scanPositions(ink.frontFrame.screen, '-NEW-TAIL').length === 1), 'advanced suffix must keep its own head and tail')
+  assert.deepEqual(screenSnapshot(ink.frontFrame.screen, undefined, false), snapshot(unsplit(advancedSource), 55, false), 'advancing source boundary resets the old cut')
+
+  // Replacement may preserve an empty stable prefix while shrinking below an
+  // old cut. Do not let that now-out-of-range offset hide the new source.
+  const beforeReplacement = `REPLACE-OLD-${'z'.repeat(9983)}R-END`
+  app.rerender(<StreamingMarkdown key="replace-cut">{beforeReplacement}</StreamingMarkdown>)
+  assert.ok(await settled(() => scanPositions(ink.frontFrame.screen, 'R-END').length === 1 && (scanPositions(ink.frontFrame.screen, 'folded').length === 1 || scanPositions(ink.frontFrame.screen, 'REPLACE-OLD-').length === 1)), 'replacement control must finish painting')
+  const afterReplacement = `REPLACE-HEAD-${'v'.repeat(3974)}-REPLACE-TAIL`
+  app.rerender(<StreamingMarkdown key="replace-cut">{afterReplacement}</StreamingMarkdown>)
+  assert.ok(await settled(() => scanPositions(ink.frontFrame.screen, 'REPLACE-HEAD-').length === 1 && scanPositions(ink.frontFrame.screen, '-REPLACE-TAIL').length === 1), 'replacement shorter than the old cut remains visible')
+  assert.deepEqual(screenSnapshot(ink.frontFrame.screen, undefined, false), snapshot(unsplit(afterReplacement), 55, false), 'out-of-range cut cannot survive replacement')
 } finally {
   await app.unmount()
 }

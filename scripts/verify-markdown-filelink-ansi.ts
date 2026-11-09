@@ -17,6 +17,7 @@ process.env.TERM_PROGRAM = 'kitty'
 const { default: chalk } = await import('chalk')
 const { applyMarkdown } = await import('../src/terminal-utils/markdown.js')
 const { createHyperlink } = await import('../src/terminal-utils/hyperlink.js')
+const { default: stripAnsi } = await import('strip-ansi')
 const React = await import('react')
 const { Markdown } = await import('../src/components/Markdown.js')
 const { StreamingMarkdown } = await import('../src/components/StreamingMarkdown.js')
@@ -54,6 +55,27 @@ try {
     explicit.includes('file:///tmp/state') && !explicit.includes('dsh-file:'),
     JSON.stringify(explicit),
   )
+
+  // Malformed UTF-16 cannot be encoded as a file URL. Keep the text visible
+  // through the terminal's UTF-8 transport, without inventing another target.
+  const targets = (text: string): string[] =>
+    [...text.matchAll(/\x1b\]8;[^;]*;([^\x07\x1b]*)(?:\x07|\x1b\\)/g)].map(match => match[1]!).filter(Boolean)
+  for (const form of ['plain', 'code'] as const) {
+    for (const [part, invalid] of [['high', 'a\ud800/b.ts'], ['low', 'a\udc00/b.ts']] as const) {
+      try {
+        const out = applyMarkdown(form === 'plain' ? `open ${invalid} now` : `open \`${invalid}\` now`)
+        const visible = Buffer.from(stripAnsi(out), 'utf8').toString('utf8')
+        check(`${form} ${part} surrogate stays visible without a link`,
+          visible.includes('open a\ufffd/b.ts now') && targets(out).length === 0, JSON.stringify(out))
+      } catch (error) {
+        check(`${form} ${part} surrogate renders without throwing`, false, String(error))
+      }
+    }
+    const path = './src/文件.ts'
+    const out = applyMarkdown(form === 'plain' ? `open ${path} now` : `open \`${path}\` now`)
+    check(`${form} valid Unicode path keeps its exact target`,
+      targets(out).includes('dsh-file:.%2Fsrc%2F%E6%96%87%E4%BB%B6.ts') && stripAnsi(out).includes(path), JSON.stringify(out))
+  }
 
   const source = 'working/idle/needs-input state,\n\nsrc/utils/fileTarget.ts'
   for (const [name, Component] of [['Markdown', Markdown], ['StreamingMarkdown', StreamingMarkdown]] as const) {

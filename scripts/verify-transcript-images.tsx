@@ -518,6 +518,7 @@ const virtualScroll: ScrollBoxHandle = {
   scrollBy(dy) { virtualScrollTop += dy },
   scrollToElement() {},
   scrollToBottom() {},
+  getScrollIntentVersion: () => 0,
   getScrollTop: () => virtualScrollTop,
   getPendingDelta: () => 0,
   getScrollHeight: () => 100,

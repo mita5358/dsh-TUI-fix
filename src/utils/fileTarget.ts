@@ -20,6 +20,7 @@ import { resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { existsSync } from 'node:fs'
+import { scanPathSpans, trailingPathPunctuationStart } from './pathSpan.js'
 
 /** Our custom OSC 8 scheme carrying a raw display path (URI-encoded). */
 export const FILE_LINK_SCHEME = 'dsh-file:'
@@ -107,7 +108,9 @@ function hasPlausibleExtension(stripped: string): boolean {
  */
 export function looksLikeFilePath(text: string): boolean {
   const t = text.trim()
-  if (t.length < 2 || t.length > 200) return false
+  // encodeURIComponent cannot encode isolated UTF-16 surrogates. Keep such
+  // text visible but do not turn it into a different, misleading file link.
+  if (t.length < 2 || t.length > 200 || !t.isWellFormed()) return false
   if (!t.includes('/') && !t.includes('\\')) return false
   if (/\s/u.test(t)) return false
   if (/[<>"'`|?*]/.test(t)) return false
@@ -141,19 +144,11 @@ export function pathExistsOnDisk(path: string): boolean {
 }
 
 /**
- * Candidate-span scanner: anchored paths (`./`, `../`, `/`, `~/`, drive)
- * run to the end of the word; everything else must contain a slash AND a
- * dot-extension tail. This is only a pre-filter — every span is then
- * verified by `looksLikeFilePath` before it becomes clickable.
- */
-const PATH_SPAN_RE =
-  /(?:\.{1,2}[\\/]|[\\/]|~[\\/]|[A-Za-z]:[\\/])[^\s<>"'`|?#]*|(?:[^\s<>"'`|?#]*[\\/][^\s<>"'`|?#]*\.[A-Za-z0-9]{1,6})/gu
-
-/**
  * Replace every path-looking span in `text` via `wrap(path, display)`.
  * Trailing sentence punctuation stays OUTSIDE the wrapped display (so
  * "src/foo.ts." links `src/foo.ts` and keeps the period). Spans that fail
- * `looksLikeFilePath` are returned unchanged.
+ * `looksLikeFilePath` are returned unchanged. Anchored spans run to the word
+ * end; other candidates need a slash and an extension.
  * @param text - plain text to scan (no ANSI).
  * @param wrap - builds the clickable rendering for one path.
  */
@@ -161,15 +156,20 @@ export function linkifyFilePaths(
   text: string,
   wrap: (path: string, display: string) => string,
 ): string {
-  return text.replace(PATH_SPAN_RE, (match, offset, full) => {
-    // A candidate must start at a text boundary, not inside another token:
-    // `/idle/needs-input` in `working/idle/needs-input` otherwise looks like
-    // an absolute path (#1181). Colons and slashes are not boundaries, so
-    // URL interiors stay excluded too. Quotes/opening delimiters and `=`
-    // still allow standalone anchored paths in prose and assignments.
-    if (offset > 0 && !/[\s<>"'`|([{=]/u.test(full[offset - 1]!)) return match
-    const display = match.replace(/[.,;:!?]+$/u, '')
-    if (display === '' || !looksLikeFilePath(display)) return match
-    return wrap(display, display) + match.slice(display.length)
-  })
+  // Every path candidate contains a separator; skip scanning otherwise.
+  if (!text.includes('/') && !text.includes('\\')) return text
+  let output = ''
+  let cursor = 0
+  for (const { offset, end } of scanPathSpans(text)) {
+    output += text.slice(cursor, offset)
+    const match = text.slice(offset, end)
+    cursor = end
+    // Do not turn a suffix inside another token or URL into an absolute path
+    // (#1181). Quotes, opening delimiters and '=' remain valid boundaries.
+    if (offset > 0 && !/[\s<>"'`|([{=]/u.test(text[offset - 1]!)) { output += match; continue }
+    const display = match.slice(0, trailingPathPunctuationStart(match))
+    if (display === '' || !looksLikeFilePath(display)) { output += match; continue }
+    output += wrap(display, display) + match.slice(display.length)
+  }
+  return output + text.slice(cursor)
 }

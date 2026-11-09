@@ -3,7 +3,7 @@ import { marked, type Token, type Tokens } from 'marked'
 import { Box, Text, useTheme } from '../ui.js'
 import type { TextDecoration } from '../ink/styles.js'
 import { getTheme } from '../theme.js'
-import { appendBlockText, configureMarked, formatToken, stripPromptXMLTags } from '../terminal-utils/markdown.js'
+import { appendBlockText, codeLanguageTag, configureMarked, formatToken, stripPromptXMLTags } from '../terminal-utils/markdown.js'
 import { getCliHighlightPromise, type CliHighlight } from '../terminal-utils/cliHighlight.js'
 import { isMermaidLang } from '../terminal-utils/mermaid.js'
 import { isMathBlockToken, isMathToken } from '../terminal-utils/math.js'
@@ -13,6 +13,8 @@ import { CodeBlockFrame } from './CodeBlockFrame.js'
 import { MermaidDiagram } from './MermaidDiagram.js'
 import { InlineMathParagraph } from './InlineMathParagraph.js'
 import { MathBlock } from './MathBlock.js'
+import type { ClickEvent } from '../ink/events/click-event.js'
+import { t as translate } from '../i18n.js'
 
 /**
  * Markdown 渲染组件：marked 分词 + ANSI 格式化。
@@ -47,6 +49,20 @@ type Props = {
    * line (that API promises raw code, not the chat's pre-processing).
    */
   stripPromptTags?: boolean
+  /**
+   * Fold every top-level fence to a one-row digest (language · lines · head
+   * of the body, click to expand). Set for settled transcript rows in the
+   * windowed transcript: an old chunk is mounted whole while the rail seek
+   * runs, and painting/highlighting its fences was the dominant per-click
+   * cost. Streaming does not use this settled code-block fold; its separate
+   * unstable-suffix limit is handled by StreamingMarkdown.
+   */
+  foldedCode?: boolean
+  /** Expanded structural token paths, owned by the transcript rather than the mounted row. */
+  expandedCodePaths?: ReadonlySet<string>
+  closedGlobalCodePaths?: ReadonlySet<string>
+  /** Toggle one path; callers own its lifetime across virtualization. */
+  onToggleCodePath?: (path: string, event: ClickEvent) => void
 }
 
 /**
@@ -156,6 +172,62 @@ function isMermaidToken(token: Token): token is Tokens.Code {
   return token.type === 'code' && isMermaidLang((token as Tokens.Code).lang)
 }
 
+// Visit only children consumed by the formatter. Unknown or oversized token
+// trees conservatively request the shared highlighter rather than miss code.
+const HIGHLIGHT_SCAN_LIMIT = 8192
+const HIGHLIGHT_CONTAINER_TYPES = new Set([
+  'blockquote', 'em', 'strong', 'del', 'heading', 'link', 'list_item', 'paragraph',
+])
+const HIGHLIGHT_LEAF_TYPES = new Set([
+  'checkbox', 'codespan', 'hr', 'image', 'space', 'br', 'escape', 'math', 'mathBlock', 'def', 'html',
+])
+function tokenTreeNeedsHighlight(value: unknown): boolean {
+  const pending: unknown[] = [value]
+  const seen = new WeakSet<object>()
+  let visited = 0
+  const append = (children: unknown): boolean => {
+    if (!Array.isArray(children) || pending.length + children.length > HIGHLIGHT_SCAN_LIMIT) return false
+    for (const child of children) pending.push(child)
+    return true
+  }
+  while (pending.length > 0) {
+    if (++visited > HIGHLIGHT_SCAN_LIMIT) return true
+    const value = pending.pop()
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return true
+    const node = value as Record<string, unknown>
+    const type = node.type
+    if (typeof type !== 'string') return true
+    if (type === 'code') return true
+    if (HIGHLIGHT_LEAF_TYPES.has(type)) continue
+    if (seen.has(value)) continue
+    seen.add(value)
+    if (type === 'list') {
+      if (!append(node.items)) return true
+    } else if (type === 'table') {
+      if (!Array.isArray(node.header) || !Array.isArray(node.rows) || node.rows.length > HIGHLIGHT_SCAN_LIMIT) return true
+      const rows = [node.header, ...node.rows]
+      let cellCount = 0
+      for (const row of rows) {
+        if (!Array.isArray(row)) return true
+        cellCount += row.length
+        if (cellCount > HIGHLIGHT_SCAN_LIMIT) return true
+        for (const cell of row) {
+          if (cell === null || typeof cell !== 'object') return true
+          const tokens = (cell as { tokens?: unknown }).tokens
+          if (tokens !== undefined && !append(tokens)) return true
+        }
+      }
+    } else if (HIGHLIGHT_CONTAINER_TYPES.has(type)) {
+      if (!append(node.tokens)) return true
+    } else if (type === 'text') {
+      if (node.tokens !== undefined && !append(node.tokens)) return true
+    } else {
+      return true
+    }
+  }
+  return false
+}
+
 /**
  * 把 lexer 产出的 token 列表转成 React 节点序列：table、mermaid 与公式块
  * 独立渲染，其余 token 的 ANSI 文本按完整块分批拼接，只去整段首尾空白。
@@ -165,8 +237,13 @@ function renderTokensToNodes(
   highlight: CliHighlight | null,
   dimColor: boolean,
   inlineMathImages: boolean,
-): React.ReactNode[] {
+  foldedCode: boolean,
+  expandedCodePaths: ReadonlySet<string> | undefined,
+  closedGlobalCodePaths: ReadonlySet<string> | undefined,
+  onToggleCodePath: ((path: string, event: ClickEvent) => void) | undefined,
+): { nodes: React.ReactNode[]; needsHighlight: boolean } {
   const nodes: React.ReactNode[] = []
+  let needsHighlight = false
   let ansiText = ''
   let textParts: string[] = []
   let afterOwnNode = false
@@ -197,10 +274,11 @@ function renderTokensToNodes(
     textParts = []
   }
 
-  for (const token of tokens) {
+  for (const [index, token] of tokens.entries()) {
     const ownNodeBefore = afterOwnNode
     afterOwnNode = false
     if (token.type === 'table') {
+      if (!needsHighlight) needsHighlight = tokenTreeNeedsHighlight(token)
       flushAnsiText()
       nodes.push(
         <MarkdownTable
@@ -210,6 +288,7 @@ function renderTokensToNodes(
         />,
       )
     } else if (inlineMathImages && token.type === 'paragraph' && hasInlineMath(token)) {
+      if (!needsHighlight) needsHighlight = tokenTreeNeedsHighlight(token)
       flushAnsiText()
       nodes.push(<InlineMathParagraph key={nodes.length} token={token as Tokens.Paragraph} highlight={highlight} />)
       afterOwnNode = true
@@ -220,28 +299,31 @@ function renderTokensToNodes(
     } else if (isMathBlockToken(token)) {
       flushAnsiText()
       nodes.push(<MathBlock key={nodes.length} token={token} dimColor={dimColor} />)
-    } else if (isMermaidToken(token)) {
-      flushAnsiText()
-      nodes.push(
-        <MermaidDiagram
-          key={nodes.length}
-          token={token}
-          highlight={highlight}
-          dimColor={dimColor}
-        />,
-      )
     } else if (token.type === 'code') {
-      // Top-level fences get the CodeBlockFrame (header/rail/padding);
-      // the mermaid branch above keeps diagram fences routed to
-      // MermaidDiagram (whose fallback re-enters the frame), and code
-      // nested in lists/quotes keeps formatToken's ANSI path.
       flushAnsiText()
+      const code = token as Tokens.Code
+      // Token-array paths extend naturally to list items and quotes later;
+      // never derive identity from the rendered-node count or code text.
+      const path = `tokens/${index}`
+      const fence = /^ {0,3}(?:`{3,}|~{3,})/.test(code.raw)
+      const toggle = fence && onToggleCodePath !== undefined
+        ? (event: ClickEvent): void => onToggleCodePath(path, event)
+        : undefined
+      const folded = fence && (foldedCode ? !expandedCodePaths?.has(path) : closedGlobalCodePaths?.has(path))
+      if (!folded) needsHighlight = true
+      const body = isMermaidToken(token)
+        ? <MermaidDiagram token={code} highlight={highlight} dimColor={dimColor} />
+        : <CodeBlockFrame token={code} highlight={highlight} dimColor={dimColor} />
       nodes.push(
-        <CodeBlockFrame key={nodes.length} token={token as Tokens.Code} highlight={highlight} dimColor={dimColor} />,
+        folded
+          ? <FoldedCodeRow key={path} token={code} dimColor={dimColor} onExpand={toggle} />
+          : toggle === undefined ? <React.Fragment key={path}>{body}</React.Fragment>
+            : <Box key={path} onClick={toggle}>{body}</Box>,
       )
     } else {
       // appendBlockText inserts the row break after the (newline-free) hr
       // divider when the next block does not open its own line.
+      if (!needsHighlight) needsHighlight = tokenTreeNeedsHighlight(token)
       ansiText = appendBlockText(ansiText, formatToken(token, 0, null, null, highlight))
       // A top-level token boundary keeps inline formatting and code fences
       // intact while letting the painter cull finished offscreen text blocks.
@@ -253,7 +335,88 @@ function renderTokensToNodes(
   }
 
   flushAnsiText()
-  return nodes
+  return { nodes, needsHighlight }
+}
+
+/** Preview clip before the wrap engine sees it: a minified fence can be a
+ *  single 100k-char line, and pushing that through truncation is the cost
+ *  this fold exists to avoid. */
+const FOLDED_CODE_PREVIEW_CHARS = 160
+
+/** Summarize without splitting every line or retaining the fence in the preview. */
+export function summarizeFoldedCode(text: string): { lineCount: number; preview: string } {
+  let lineCount = 0
+  let newline = -1
+  while ((newline = text.indexOf('\n', newline + 1)) !== -1) lineCount++
+  // A trailing newline terminates the last line, rather than starting one.
+  if (text !== '' && !text.endsWith('\n')) lineCount++
+
+  // Bounded chunks use native trim semantics without allocating a whole line
+  // or leaving the input in JavaScript's legacy RegExp match state.
+  const chunkSize = 4096
+  let start = 0
+  while (start < text.length) {
+    const chunk = text.slice(start, start + chunkSize)
+    const trimmed = chunk.trimStart()
+    start += chunk.length - trimmed.length
+    if (trimmed !== '') break
+  }
+  if (start === text.length) return { lineCount, preview: '' }
+  let end = text.indexOf('\n', start)
+  if (end === -1) end = text.length
+  while (end > start) {
+    const chunk = text.slice(Math.max(start, end - chunkSize), end)
+    const trimmed = chunk.trimEnd()
+    end -= chunk.length - trimmed.length
+    if (trimmed !== '') break
+  }
+
+  // Copy at most 160 UTF-16 code units, so a substring cannot keep a huge
+  // original string alive. Code units intentionally match slice(), including
+  // a possible split surrogate pair at the clipping boundary.
+  let preview = ''
+  const limit = Math.min(end, start + FOLDED_CODE_PREVIEW_CHARS)
+  for (let index = start; index < limit; index++) preview += String.fromCharCode(text.charCodeAt(index))
+  if (end - start > FOLDED_CODE_PREVIEW_CHARS) preview += '…'
+  return { lineCount, preview }
+}
+
+/**
+ * A settled fence folded to ONE row: `⌁ <lang> · <n> 行 · <head> … （点击展开）`.
+ * The body is never formatted, highlighted or laid out — that pipeline is
+ * exactly what made a revealed historical chunk expensive, since the rail
+ * seek mounts the chunk whole before the viewport window takes over again.
+ * The transcript owns each token path's disclosure state, including across
+ * unmounts; Ctrl+O temporarily exposes every fence.
+ */
+function FoldedCodeRow({ token, dimColor, onExpand }: {
+  token: Tokens.Code
+  dimColor: boolean
+  onExpand: ((event: ClickEvent) => void) | undefined
+}): React.ReactNode {
+  const [hovered, setHovered] = React.useState(false)
+  const clickable = onExpand !== undefined
+  const { lineCount, preview } = React.useMemo(() => summarizeFoldedCode(token.text), [token.text])
+  const summary = translate('code-fence-folded', {
+    lang: codeLanguageTag(token) || 'code',
+    n: lineCount,
+  })
+  const hint = translate('code-fence-folded-expand')
+  return (
+    <Box
+      flexDirection="row"
+      onClick={onExpand}
+      onMouseEnter={clickable ? () => setHovered(true) : undefined}
+      onMouseLeave={clickable ? () => setHovered(false) : undefined}
+    >
+      <Text dimColor={dimColor} wrap="truncate-end">
+        <Text color={hovered ? 'text' : 'subtle'}>{'⌁ '}{summary}</Text>
+        {preview === '' ? '' : ` · ${preview}`}
+        {' … '}
+        <Text italic color={hovered ? 'text' : undefined}>{hint}</Text>
+      </Text>
+    </Box>
+  )
 }
 
 /**
@@ -267,7 +430,7 @@ function renderTokensToNodes(
  * block — the dominant long-output stall (string-width via wrap-ansi, 60%+
  * of CPU in streaming profiles).
  */
-function MarkdownImpl({ children, dimColor = false, cacheTokens = true, inlineMathImages = true, stripPromptTags = true }: Props): React.ReactNode {
+function MarkdownImpl({ children, dimColor = false, cacheTokens = true, inlineMathImages = true, stripPromptTags = true, foldedCode = false, expandedCodePaths, closedGlobalCodePaths, onToggleCodePath }: Props): React.ReactNode {
   const [highlight, setHighlight] = React.useState<CliHighlight | null>(null)
   // Inline math is baked into the ANSI text, so the switch must invalidate
   // the memo below (MathBlock nodes subscribe on their own).
@@ -279,16 +442,6 @@ function MarkdownImpl({ children, dimColor = false, cacheTokens = true, inlineMa
   const [themeName] = useTheme()
   const palette = getTheme(themeName)
 
-  React.useEffect(() => {
-    let mounted = true
-    void getCliHighlightPromise().then((loaded) => {
-      if (mounted) setHighlight(loaded)
-    })
-    return () => {
-      mounted = false
-    }
-  }, [])
-
   configureMarked()
 
   const renderedNodes = React.useMemo(() => {
@@ -299,12 +452,27 @@ function MarkdownImpl({ children, dimColor = false, cacheTokens = true, inlineMa
       dimColor,
       // Dimmed text (thinking) cannot dim an image, so it keeps Unicode.
       inlineMathImages && mathRendering === 'image' && !dimColor,
+      foldedCode,
+      expandedCodePaths,
+      closedGlobalCodePaths,
+      onToggleCodePath,
     )
-  }, [children, dimColor, highlight, cacheTokens, mathRendering, inlineMathImages, palette, stripPromptTags])
+  }, [children, dimColor, highlight, cacheTokens, mathRendering, inlineMathImages, palette, stripPromptTags, foldedCode, expandedCodePaths, closedGlobalCodePaths, onToggleCodePath])
+
+  // Plain prose and folded fences do not need the highlighter. Keep the
+  // existing shared, asynchronous loader for code that actually renders.
+  React.useEffect(() => {
+    if (!renderedNodes.needsHighlight) return
+    let mounted = true
+    void getCliHighlightPromise().then((loaded) => {
+      if (mounted) setHighlight(loaded)
+    })
+    return () => { mounted = false }
+  }, [renderedNodes.needsHighlight])
 
   return (
     <Box flexDirection="column" gap={1}>
-      {renderedNodes}
+      {renderedNodes.nodes}
     </Box>
   )
 }
@@ -320,5 +488,9 @@ export const Markdown = React.memo(
     prev.dimColor === next.dimColor &&
     prev.cacheTokens === next.cacheTokens &&
     prev.inlineMathImages === next.inlineMathImages &&
-    prev.stripPromptTags === next.stripPromptTags,
+    prev.stripPromptTags === next.stripPromptTags &&
+    prev.foldedCode === next.foldedCode &&
+    prev.expandedCodePaths === next.expandedCodePaths &&
+    prev.closedGlobalCodePaths === next.closedGlobalCodePaths &&
+    prev.onToggleCodePath === next.onToggleCodePath,
 )
