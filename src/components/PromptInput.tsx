@@ -224,8 +224,12 @@ interface DraftImageLease {
  */
 const FOLD_MIN_LINES = 6
 const FOLD_MIN_CHARS = 600
-const isBigInput = (text: string): boolean =>
-  text.split('\n').length >= FOLD_MIN_LINES || text.length >= FOLD_MIN_CHARS
+const isBigInput = (text: string): boolean => {
+  // A long string already meets the threshold; avoid an extra line split on
+  // every render. Preserve the old failure order for malformed host values.
+  if (typeof text === 'string' && text.length >= FOLD_MIN_CHARS) return true
+  return text.split('\n').length >= FOLD_MIN_LINES || text.length >= FOLD_MIN_CHARS
+}
 
 /** Format label for one image media type, matching the image preview card's
  *  title (`JPEG`, `PNG`, `WEBP`, `GIF`). */
@@ -1337,10 +1341,13 @@ export function PromptInput({
    * whole token, Backspace at its end / Delete at its start remove it whole,
    * a selection never cuts it, and it renders as a chip (the whole token is
    * the caret cluster when the caret sits at its start). A raw token typed
-   * or restored without a capability is ordinary text.
+   * or restored without a capability is ordinary text. An empty capability
+   * map needs no scan here; wrapLineRows still keeps raw tokens together.
    */
   const boundImageSpans = (text: string): ImageTokenSpan[] =>
-    imageTokenSpans(text).filter(span => draftImagesRef.current.has(span.token))
+    typeof text === 'string' && draftImagesRef.current.size === 0
+      ? []
+      : imageTokenSpans(text).filter(span => draftImagesRef.current.has(span.token))
 
   /** Move the caret to `offset`, snapped off any token interior. */
   const placeCaret = (offset: number, prefer: 'start' | 'end' | 'nearest'): void => {
@@ -2519,10 +2526,6 @@ export function PromptInput({
       }
     }
 
-    // Grapheme boundaries of the current text: every caret move / delete
-    // below snaps onto one of these offsets (never mid-cluster).
-    const bounds = graphemeBoundaries(value)
-
     /** Insert text at the caret (typing, paste) and dismiss overlays. An
      *  active selection is REPLACED by the insert (standard editor
      *  semantics). Returns the insertion offset so callers can derive the
@@ -3167,6 +3170,8 @@ export function PromptInput({
       setInput(value, sel ? sel.end : wordBoundaryRight(value, cursor))
       return
     }
+    // Only caret/delete arms need old-value grapheme boundaries; typing and
+    // paste normalize the new value separately in setInput.
     if (key.leftArrow) {
       // ← on an EMPTY prompt opens the session manager; the caller decides
       // whether the backend can background the session first.
@@ -3180,22 +3185,22 @@ export function PromptInput({
       // combining mark) so the caret never sits inside one. With a
       // selection, collapse to its start edge instead.
       const sel = selectionRef.current
-      setInput(value, sel ? sel.start : previousGraphemeBoundary(bounds, cursor))
+      setInput(value, sel ? sel.start : previousGraphemeBoundary(graphemeBoundaries(value), cursor))
       return
     }
     if (key.rightArrow) {
       const sel = selectionRef.current
-      setInput(value, sel ? sel.end : nextGraphemeBoundary(bounds, cursor))
+      setInput(value, sel ? sel.end : nextGraphemeBoundary(graphemeBoundaries(value), cursor))
       return
     }
     if (key.backspace && !key.meta) {
       if (cursor === 0) return
-      const start = previousGraphemeBoundary(bounds, cursor)
+      const start = previousGraphemeBoundary(graphemeBoundaries(value), cursor)
       deleteInputRange(start, cursor)
       return
     }
     if (key.delete) {
-      const end = nextGraphemeBoundary(bounds, cursor)
+      const end = nextGraphemeBoundary(graphemeBoundaries(value), cursor)
       if (end === cursor) return
       deleteInputRange(cursor, end)
       return
@@ -3287,8 +3292,8 @@ export function PromptInput({
       // One stdin batch can merge several bare keys into a single event
       // (fast typing), so re-read the synchronous mirrors and recompute
       // the grapheme boundaries: every key in the batch operates on the
-      // text/caret its predecessor produced (the outer `value`/`cursor`/
-      // `bounds` reflect only the batch's first key).
+      // text/caret its predecessor produced (the outer `value`/`cursor`
+      // reflect only the batch's first key).
       const value = valueRef.current
       const cursor = cursorRef.current
       const bounds = graphemeBoundaries(value)
@@ -3739,8 +3744,9 @@ export function PromptInput({
   const foldHint = t('input-fold-hover')
   const foldPreviewWidth =
     inputWidth - stringWidth(foldBadge) - stringWidth(`・${foldHint}`) - 6
+  // Only the collapsed chip uses this preview, not an ordinary editable draft.
   const foldPreview =
-    foldPreviewWidth >= 8
+    block !== null && foldPreviewWidth >= 8
       ? truncateToWidth(foldText.split('\n')[0] ?? '', foldPreviewWidth)
       : ''
 
@@ -3946,12 +3952,15 @@ export function PromptInput({
   // edit the real input). The footer reports the clipped remainder.
   const PEEK_MAX_ROWS = 10
   const peekVisualLines: string[] = []
-  for (const line of foldText.split('\n')) {
-    for (const row of wrapToWidth(line, cardContentWidth(columns))) {
+  // Hidden peek rows have no consumer; avoid rewrapping a large draft per key.
+  if (peekOpen) {
+    for (const line of foldText.split('\n')) {
+      for (const row of wrapToWidth(line, cardContentWidth(columns))) {
+        if (peekVisualLines.length >= PEEK_MAX_ROWS) break
+        peekVisualLines.push(row)
+      }
       if (peekVisualLines.length >= PEEK_MAX_ROWS) break
-      peekVisualLines.push(row)
     }
-    if (peekVisualLines.length >= PEEK_MAX_ROWS) break
   }
   const peekClipped = peekVisualLines.length >= PEEK_MAX_ROWS
 
@@ -4762,7 +4771,11 @@ function wrapLineRows(
 ): Array<{ start: number; end: number }> {
   if (line === '') return [{ start: 0, end: 0 }]
   const rows: Array<{ start: number; end: number }> = []
-  const segmenter = getGraphemeSegmenter()
+  // Printable ASCII is one cell per grapheme, so long code or plain-English
+  // drafts do not need ICU segmentation on every key and caret click. Control
+  // characters and all non-ASCII text keep the grapheme-aware path below.
+  const ascii = /^[\x20-\x7e]+$/.test(line)
+  const segments = ascii ? line : getGraphemeSegmenter().segment(line)
   // The space inside `[Image #N]` is not a break opportunity: the token is
   // one unit on screen (its caret cluster and chip styling span it), so it
   // wraps whole, like a word.
@@ -4771,8 +4784,9 @@ function wrapLineRows(
   let currentWidth = 0
   let offset = 0
   let lastBreak = -1
-  for (const { segment } of segmenter.segment(line)) {
-    const w = stringWidth(segment)
+  for (const item of segments) {
+    const segment = typeof item === 'string' ? item : item.segment
+    const w = ascii ? 1 : stringWidth(segment)
     while (currentWidth + w > width && offset > rowStart) {
       if (lastBreak > rowStart) {
         rows.push({ start: rowStart, end: lastBreak })
@@ -4813,22 +4827,31 @@ function caretInText(
 ): { line: number; charCol: number; visualCol: number } {
   let line = 0
   let lineBase = 0
-  let last = { line: 0, charCol: 0, visualCol: 0 }
+  let lastLogical = ''
+  let lastStart = 0
+  let lastCharCol = 0
   for (const logical of text.split('\n')) {
     for (const r of wrapLineRows(logical, width)) {
       const start = lineBase + r.start
       const charCol = Math.max(0, offset - start)
-      last = {
-        line,
-        charCol,
-        visualCol: stringWidth(logical.slice(r.start, r.start + charCol)),
+      if (offset <= lineBase + r.end) {
+        return { line, charCol, visualCol: stringWidth(logical.slice(r.start, r.start + charCol)) }
       }
-      if (offset <= lineBase + r.end) return last
+      // Only the matching row (or final row for an out-of-range offset)
+      // needs a width. Measuring the suffix at every earlier wrapped row is
+      // quadratic for long drafts and runs on every key and caret click.
+      lastLogical = logical
+      lastStart = r.start
+      lastCharCol = charCol
       line++
     }
     lineBase += logical.length + 1
   }
-  return last
+  return {
+    line: Math.max(0, line - 1),
+    charCol: lastCharCol,
+    visualCol: stringWidth(lastLogical.slice(lastStart, lastStart + lastCharCol)),
+  }
 }
 
 /**

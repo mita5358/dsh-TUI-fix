@@ -19,12 +19,14 @@ process.env.DSH_TUI_LANG = 'en'
 // Redirect ~/.dsh-tui (history.jsonl / resume.txt / theme.json) into a temp
 // dir BEFORE any module import resolves utils/paths.js — os.homedir() reads
 // these env vars, so the submits below never touch the real history.
-const [{ mkdtempSync, rmSync }, { tmpdir }, { join }] = await Promise.all([
+const [{ lstatSync, mkdtempSync, realpathSync, rmSync }, { tmpdir }, { basename, dirname, join }] = await Promise.all([
   import('node:fs'),
   import('node:os'),
   import('node:path'),
 ])
-const dataDir = mkdtempSync(join(tmpdir(), 'repro-paste-fold-data-'))
+const tempRoot = realpathSync(tmpdir())
+const dataDir = mkdtempSync(join(tempRoot, 'repro-paste-fold-data-'))
+const dataDirCreated = lstatSync(dataDir)
 process.env.HOME = dataDir
 process.env.USERPROFILE = dataDir
 
@@ -269,6 +271,15 @@ try {
   check('Esc clears a small (non-foldable) input', await settled(() => !screenHas('tiny')))
 } finally {
   await instance.unmount()
-  rmSync(dataDir, { recursive: true, force: true })
+  const current = lstatSync(dataDir)
+  if (
+    dirname(dataDir) !== tempRoot || !basename(dataDir).startsWith('repro-paste-fold-data-') ||
+    realpathSync(dataDir) !== dataDir || !current.isDirectory() ||
+    current.dev !== dataDirCreated.dev || current.ino !== dataDirCreated.ino ||
+    (process.platform !== 'win32' && (typeof process.getuid !== 'function' ||
+      current.uid !== process.getuid() || (current.mode & 0o077) !== 0))
+  ) throw new Error('refusing to remove a replaced or nonprivate test directory')
+  // The identity check is not dirfd-atomic; leave cleanup to the operator on failure.
+  rmSync(dataDir, { recursive: true })
 }
 process.exit(failed)

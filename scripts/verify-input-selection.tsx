@@ -58,6 +58,7 @@ const [
 ])
 const { getTheme, registerRuntimeThemeResolver } = await import('../src/theme.js')
 const { NativeCursorContext } = await import('../src/ink/components/CursorDeclarationContext.js')
+const { activateModernEmojiWidths } = await import('./lib/modern-widths.mjs')
 
 import type { PromptController } from '../src/components/PromptInput.js'
 
@@ -90,6 +91,9 @@ type Harness = {
 
 function makeHarness(cols: number, rows: number): Harness {
   const term = new XTerm({ cols, rows, scrollback: 100, allowProposedApi: true })
+  // Match the renderer's modern emoji cell widths; xterm's default Unicode 6
+  // table treats 😀 as one cell and produces unrelated stale-cell artifacts.
+  activateModernEmojiWidths(term)
   const frames: string[] = []
   class FakeStdout extends Writable {
     columns = cols
@@ -648,6 +652,21 @@ function makePromptChannel(): Record<string, unknown> {
         oscPayloads().at(-1) === word,
       oscPayloads().at(-1) ?? 'no osc52',
     )
+
+    // A13: Long wrapped draft followed by a wide-character tail. The caret
+    // must use the tail row's own offset rather than any prior wrapped row.
+    controllerBox.current?.clear()
+    await settled(() => !screenHas(word))
+    controllerBox.current?.append(`${'x'.repeat(1000)}\n尾😀z`)
+    check('A13 长草稿尾部可见', await settled(() => findText('尾😀z') !== null))
+    const tail = findText('尾😀z')
+    check('A13 跨多行后的宽字符尾部光标位置', tail !== null && await settled(() => caretAt(tail.col + 5, tail.row)))
+    stdin.write('\x1b[D')
+    check('A13 左移后光标位于尾字前', tail !== null && await settled(() => caretAt(tail.col + 4, tail.row)))
+    stdin.write('Q')
+    const inserted = await settled(() => controllerBox.current?.text().endsWith('尾😀Qz') === true)
+    check('A13 宽字符后插入不破坏内容', inserted, JSON.stringify(controllerBox.current?.text().slice(-12)))
+    check('A13 插入后屏幕同步', await settled(() => screenHas('尾😀Qz')), JSON.stringify(termTest.viewportLines(h.term).slice(-7)))
   } finally {
     app.unmount()
   }

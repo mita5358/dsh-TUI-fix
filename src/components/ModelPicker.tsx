@@ -86,7 +86,11 @@ export function ModelPicker({
   const listRows = Math.max(1, availableRows - (showHeaderHints
     ? frameRows + shortcutRows.length + (compact ? 0 : gaps) + (showDescription ? 1 : 0)
     : frameRows - (showEfforts ? 0 : 1)))
-  const showModelDescriptions = listRows >= 2
+  // Descriptions are decoration; never let them halve the visible choices.
+  // When the window cannot fit every row described, fall back to one row per
+  // model so short frames (folded history, narrow terminals) still show more
+  // than the focused entry.
+  const showModelDescriptions = listRows >= 6 || listRows >= models.length * 2
   const modelHeights = models.map(model => showModelDescriptions && model.description ? 2 : 1)
   const { start, end } = listWindow(modelHeights, focusIndex, listRows)
   const providerFocus = groups.findIndex(group => group.provider === provider)

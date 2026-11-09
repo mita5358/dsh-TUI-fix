@@ -45,6 +45,12 @@ import { settle, settled, viewportLines } from './lib/term-test.mjs'
 import { stringWidth } from '../src/ink/stringWidth.js'
 const { Terminal: XTerm } = xterm
 
+// 落地页条件位只有一个格子：后台更新探测发现新版本时「有新版本」顶掉「帮助」。
+// 本门禁点的就是「帮助」chip，挂载前把探测钉成离线（CI 的现实）——否则一次
+// 能联网的发布会中途把 chip 换掉，V3/V4 变成假红。
+const originalFetch = globalThis.fetch
+globalThis.fetch = async () => { throw new Error('launchpad update probe is offline in this gate') }
+
 const [
   { render, Box, ThemeProvider, AlternateScreen },
   { Chat },
@@ -2169,6 +2175,7 @@ else process.stdout.write(offer.kind === 'image' ? Buffer.from(offer.png, 'base6
   }
 }
 
+globalThis.fetch = originalFetch
 if (failures === 0) console.log(`\nverify-launchpad-onboarding-chat: ${checks} checks, all passed`)
 else console.error(`\nverify-launchpad-onboarding-chat: ${failures} of ${checks} checks FAILED`)
 process.exit(failures === 0 ? 0 : 1)

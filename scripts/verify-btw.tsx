@@ -10,22 +10,45 @@
  *  6. an unresolved tool call in the derived tail never reaches the request,
  *     and the wrapper names it as still running instead — but only a call of
  *     the open step; a closed step's orphan is dropped without the note.
- * Follows smoke.tsx: FakeStdout/FakeStderr/FakeStdin + plainText ANSI wash.
+ * Run: node --import tsx/esm scripts/verify-btw.tsx
  */
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { settled, screenHas, viewportLines } from './lib/term-test.mjs'
 
+// Set these before importing the application, even when invoked outside CI.
+// Ignore inherited trace/session paths and temp overrides that may point home.
+for (const key of Object.keys(process.env)) {
+  if (key.startsWith('DSH_TUI_')) delete process.env[key]
+}
+delete process.env.TMPDIR
+delete process.env.TMP
+delete process.env.TEMP
+const fixtureHome = mkdtempSync(join(tmpdir(), 'verify-btw-'))
+process.env.HOME = fixtureHome
+process.env.USERPROFILE = fixtureHome
+process.env.DSH_HOME = join(fixtureHome, '.dsh')
+process.env.XDG_CONFIG_HOME = join(fixtureHome, '.config')
+process.env.XDG_CACHE_HOME = join(fixtureHome, '.cache')
+process.env.XDG_DATA_HOME = join(fixtureHome, '.local', 'share')
+process.env.XDG_STATE_HOME = join(fixtureHome, '.local', 'state')
+process.on('exit', () => rmSync(fixtureHome, { recursive: true, force: true }))
 process.env.FORCE_COLOR = '3'
 process.env.DSH_TUI_LANG = 'zh'
 
-const [{ PassThrough, Writable }, React, { render }, { Chat }, { QuestionStore }, { LOCAL_COMMANDS }, { wrapSideQuestion, runSideQuestion, splitUnresolvedToolCalls, openStepToolCallIds }, { applySidePanelPanels }] = await Promise.all([
+const [{ PassThrough, Writable }, React, { Terminal: XTerm }, { render }, { Chat }, { QuestionStore }, { LOCAL_COMMANDS }, { wrapSideQuestion, runSideQuestion, splitUnresolvedToolCalls, openStepToolCallIds }, { applySidePanelPanels }, { btwThreads }] = await Promise.all([
   import('node:stream'),
   import('react'),
+  import('@xterm/headless'),
   import('../src/ui.js'),
   import('../src/screens/Chat.js'),
   import('../src/dsh-adapter/questions.js'),
   import('../src/commands.js'),
   import('../src/dsh-adapter/sideQuestion.js'),
   import('../src/tuiDisplayPrefs.js'),
+  import('../src/components/sidePanel/btw/threads.js'),
 ])
 
 // This script exercises the fallback overlay. The default now enables btw;
@@ -36,10 +59,10 @@ class FakeStdout extends Writable {
   columns = 100
   rows = 28
   isTTY = true
-  frames: string[] = []
+  term = new XTerm({ cols: this.columns, rows: this.rows, allowProposedApi: true })
   _write(chunk: unknown, _encoding: BufferEncoding, callback: () => void) {
-    this.frames.push(String(chunk))
-    callback()
+    // Writable completion follows xterm parsing, not just enqueueing the bytes.
+    this.term.write(String(chunk), callback)
   }
 }
 
@@ -63,16 +86,10 @@ class FakeStdin extends PassThrough {
   }
 }
 
-const plainText = (frames: string[]) => frames
-  .join('')
-  .replace(/\x1b\[(\d+)C/g, (_, n) => ' '.repeat(Number(n)))
-  .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
-  .replace(/\x1b\]9;[^\x07]*\x07/g, '')
-
-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
-
 /** Fake channel in smoke.tsx's shape, plus the btw seams. */
 function makeChannel() {
+  let stream: ((delta: string) => void) | undefined
+  let finish: ((result: { answer: string | null }) => void) | undefined
   return {
     version: 0,
     whaleIdle: false, // 探针确定性：鲸鱼闲置动画不进测量窗口
@@ -102,6 +119,8 @@ function makeChannel() {
     submitCalls: [] as string[],
     steerCalls: [] as string[],
     notifyCalls: [] as string[],
+    sideCalls: [] as string[],
+    sideDeltas: [] as string[],
     submit(text: string) { this.submitCalls.push(text) },
     steer(text: string) { this.steerCalls.push(text) },
     cancel() {},
@@ -110,18 +129,21 @@ function makeChannel() {
     listModels: () => Promise.resolve([]),
     listSessions: () => [],
     setResumeTarget: () => {},
-    async sideQuestion(
-      _question: string,
-      options?: { onText?: (delta: string) => void },
-    ): Promise<{ answer: string | null; error?: string }> {
-      // Deterministic stream: both deltas land within ~60ms, so any overlay
-      // older than the settle window shows the answer text (the working
-      // assertion keys on the ANSWER, not the spinner, which the fake's
-      // near-instant fill would already have replaced).
-      options?.onText?.('The answer is ')
-      await delay(40)
-      options?.onText?.('**42**.')
-      return { answer: 'The answer is **42**.' }
+    sideQuestion(question: string, options?: { onText?: (delta: string) => void }): Promise<{ answer: string | null }> {
+      this.sideCalls.push(question)
+      stream = options?.onText
+      return new Promise(resolve => { finish = resolve })
+    },
+    emit(delta: string) {
+      assert.ok(stream, 'side question must start before emitting')
+      this.sideDeltas.push(delta)
+      stream(delta)
+    },
+    finish() {
+      assert.ok(finish, 'side question must start before finishing')
+      finish({ answer: 'The answer is **42**.' })
+      finish = undefined
+      stream = undefined
     },
   }
 }
@@ -135,47 +157,58 @@ function makeChannel() {
     <Chat channel={channel as never} questionStore={new QuestionStore()} />,
     { stdout, stdin, stderr: new FakeStderr(), exitOnCtrlC: false, patchConsole: false },
   )
-  await delay(400)
+  const screen = () => viewportLines(stdout.term).join('\n')
+  const diagnostics = () => JSON.stringify({ screen: screen(), notifications: channel.notifyCalls, submits: channel.submitCalls, steers: channel.steerCalls, sideCalls: channel.sideCalls, sideDeltas: channel.sideDeltas })
+  const has = (text: string) => screenHas(stdout.term, text)
+  assert.ok(await settled(() => screen().trim().length > 0), 'initial screen must render')
   stdin.write('/btw what is the answer?')
-  await delay(100)
+  assert.ok(await settled(() => has('/btw what is the answer?')), `command must reach composer: ${diagnostics()}`)
   stdin.write('\r')
-  await delay(700)
-  const openedMark = stdout.frames.length
-  const opened = plainText(stdout.frames.slice(0, openedMark)).includes('what is the answer?')
-  const streamed = plainText(stdout.frames.slice(0, openedMark)).includes('42')
+  const opened = await settled(() => has('what is the answer?') && !has('/btw what is the answer?') && channel.sideCalls.includes('what is the answer?'))
+  assert.ok(opened, `side question must open: ${diagnostics()}`)
+  channel.emit('The answer is ')
+  assert.ok(await settled(() => has('The answer is')), `first streamed delta must be visible before completion: ${diagnostics()}`)
+  channel.emit('**42**.')
+  const streamed = await settled(() => has('The answer is') && has('42'))
+  assert.ok(streamed, `streamed answer must be visible before completion: ${diagnostics()}`)
+  channel.finish()
+  assert.ok(await settled(() => btwThreads.get(channel.agentId)?.turns.at(-1)?.phase === 'completed'), `side question must complete: ${diagnostics()}`)
   const noTranscript = channel.submitCalls.length === 0 && channel.steerCalls.length === 0
-  assert.ok(opened && streamed && noTranscript, 'side question must open, stream, and leave the transcript untouched')
-  console.log('scenario1 idle trigger opens + streams + leaves transcript untouched:',
-    opened, streamed, noTranscript)
+  assert.ok(noTranscript, `side question must leave the transcript untouched: ${diagnostics()}`)
+  console.log('scenario1 idle trigger opens + streams + leaves transcript untouched:', opened, streamed, noTranscript)
 
   // ── Scenario 2: Space dismisses, then /btw on a working channel ──────
-  // (assertions read only frames AFTER the close key: the diff renderer
-  // repaints deltas, so earlier frames still hold the panel text)
   stdin.write(' ')
-  await delay(250)
-  const afterClose = plainText(stdout.frames.slice(openedMark))
-  const closedOk = !afterClose.includes('what is the answer?')
+  const closedOk = await settled(() => !has('what is the answer?'))
+  assert.ok(closedOk, `Space must close the current screen: ${diagnostics()}`)
   channel.working = true
-  const workingMark = stdout.frames.length
   stdin.write('/btw again?')
-  await delay(100)
+  assert.ok(await settled(() => has('/btw again?')), `working command must reach composer: ${diagnostics()}`)
   stdin.write('\r')
-  await delay(700)
-  const working = plainText(stdout.frames.slice(workingMark))
-  const workingOk = working.includes('again?') && working.includes('42')
+  assert.ok(await settled(() => has('again?') && !has('/btw again?') && channel.sideCalls.some(question => question.endsWith('again?'))), `working side question must open: ${diagnostics()}`)
+  channel.emit('The answer is ')
+  channel.emit('**42**.')
+  // The fallback also shows earlier thread pairs: require the new answer
+  // after the new question, not a 42 left over from the first exchange.
+  const workingOk = await settled(() => {
+    const current = screen()
+    const questionAt = current.lastIndexOf('again?')
+    return questionAt >= 0 && current.slice(questionAt).includes('42')
+  })
+  channel.finish()
+  assert.ok(await settled(() => btwThreads.get(channel.agentId)?.turns.at(-1)?.phase === 'completed'), `working side question must complete: ${diagnostics()}`)
   const notSteered = channel.steerCalls.length === 0
-  assert.ok(closedOk && workingOk && notSteered, 'side question must work while the main turn is running')
-  console.log('scenario2 Space dismisses; working-channel opens without steering:',
-    closedOk, workingOk, notSteered)
+  assert.ok(workingOk && notSteered, `side question must work while the main turn is running: ${diagnostics()}`)
+  console.log('scenario2 Space dismisses; working-channel opens without steering:', closedOk, workingOk, notSteered)
 
   // ── Scenario 3: Space closes the working-channel overlay too ─────────
-  const closeMark = stdout.frames.length
   stdin.write(' ')
-  await delay(250)
-  assert.ok(!plainText(stdout.frames.slice(closeMark)).includes('again?'), 'Space must dismiss the overlay')
-  console.log('scenario3 Space dismisses overlay:', !plainText(stdout.frames.slice(closeMark)).includes('again?'))
+  const closedWorking = await settled(() => !has('again?'))
+  assert.ok(closedWorking, `Space must dismiss the overlay: ${diagnostics()}`)
+  console.log('scenario3 Space dismisses overlay:', closedWorking)
 
   await instance.unmount()
+  stdout.term.dispose()
 }
 // ── Scenario 4: bare /btw notifies usage ───────────────────────────────
 {
@@ -186,15 +219,15 @@ function makeChannel() {
     <Chat channel={channel as never} questionStore={new QuestionStore()} />,
     { stdout, stdin, stderr: new FakeStderr(), exitOnCtrlC: false, patchConsole: false },
   )
-  await delay(400)
+  assert.ok(await settled(() => viewportLines(stdout.term).join('').trim().length > 0), 'initial screen must render')
   stdin.write('/btw')
-  await delay(100)
+  assert.ok(await settled(() => screenHas(stdout.term, '/btw')), 'bare command must reach composer')
   stdin.write('\r')
-  await delay(300)
-  const usageNotified = channel.notifyCalls.some(text => text.includes('用法：/btw'))
-  assert.ok(usageNotified, 'bare command must report usage')
+  const usageNotified = await settled(() => channel.notifyCalls.some(text => text.includes('用法：/btw')))
+  assert.ok(usageNotified, `bare command must report usage: ${JSON.stringify(channel.notifyCalls)}`)
   console.log('scenario4 bare /btw notifies usage:', usageNotified)
   await instance.unmount()
+  stdout.term.dispose()
 }
 
 // ── Scenario 5: wrapper + runner over a fake chunk stream ──────────────
