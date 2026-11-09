@@ -1,4 +1,4 @@
-import React, { type PropsWithChildren, type Ref, useCallback, useImperativeHandle, useRef, useState } from 'react';
+import React, { type PropsWithChildren, type Ref, useCallback, useImperativeHandle, useLayoutEffect, useRef, useState } from 'react';
 import type { Except } from 'type-fest';
 import { FRAME_INTERVAL_MS } from '../constants.js';
 import { markScrollActivity } from '../../bootstrap/state.js';
@@ -20,8 +20,10 @@ export type ScrollBoxHandle = {
    * render-node-to-output reads `el.yogaNode.getComputedTop()` in the
    * SAME Yoga pass that computes scrollHeight. Deterministic. One-shot.
    */
-  scrollToElement: (el: DOMElement, offset?: number) => void;
+  scrollToElement: (el: DOMElement, offset?: number, hold?: boolean, snapToText?: boolean) => void;
   scrollToBottom: () => void;
+  /** Monotonic explicit scroll intent; geometry corrections do not advance it. */
+  getScrollIntentVersion: () => number;
   getScrollTop: () => number;
   getPendingDelta: () => number;
   getScrollHeight: () => number;
@@ -79,6 +81,8 @@ export type ScrollBoxProps = Except<Styles, 'textWrap' | 'overflow' | 'overflowX
    * grows. Unset manually via scrollTo/scrollBy to break the stickiness.
    */
   stickyScroll?: boolean;
+  /** Called before a nonzero scrollBy on this mounted box, including bottom overscroll. */
+  onScrollByIntent?: () => void;
 };
 
 /**
@@ -95,9 +99,13 @@ function ScrollBox({
   children,
   ref,
   stickyScroll,
+  onScrollByIntent,
   ...style
 }: PropsWithChildren<ScrollBoxProps>): React.ReactNode {
   const domRef = useRef<DOMElement>(null);
+  const onScrollByIntentRef = useRef(onScrollByIntent);
+  // Publish only committed props; a discarded concurrent render must not change input behavior.
+  useLayoutEffect(() => { onScrollByIntentRef.current = onScrollByIntent; }, [onScrollByIntent]);
   // scrollTo/scrollBy bypass React: they mutate scrollTop on the DOM node,
   // mark it dirty, and call the root's throttled scheduleRender directly.
   // The Ink renderer reads scrollTop from the node — no React state needed,
@@ -156,7 +164,9 @@ function ScrollBox({
       notify();
     }, Math.max(0, FRAME_INTERVAL_MS - since));
   };
+  const scrollIntentRef = useRef(0);
   function scrollMutated(el: DOMElement): void {
+    scrollIntentRef.current += 1;
     // Signal background intervals (IDE poll, LSP poll, GCS fetch, orphan
     // check) to skip their next tick — they compete for the event loop and
     // contributed to 1402ms max frame gaps during scroll drain.
@@ -188,20 +198,29 @@ function ScrollBox({
       el.scrollTop = Math.max(0, Math.floor(y));
       scrollMutated(el);
     },
-    scrollToElement(el: DOMElement, offset = 0) {
+    scrollToElement(el: DOMElement, offset = 0, hold = false, snapToText = false) {
       const box = domRef.current;
       if (!box) return;
       box.stickyScroll = false;
       box.pendingScrollDelta = undefined;
       box.scrollAnchor = {
         el,
-        offset
+        offset,
+        // Seek hold: the reader asked for THIS row, so keep re-resolving its
+        // text top until they scroll (every explicit scroll drops the anchor
+        // first). One-shot would freeze a scrollTop the next layout pass has
+        // already moved past — window quantization and live deltas below are
+        // enough to leave the prompt one row under the bar with the pinned
+        // turn header showing the previous turn.
+        hold,
+        snapToText
       };
       scrollMutated(box);
     },
     scrollBy(dy: number) {
       const el = domRef.current;
       if (!el) return;
+      if (dy !== 0) onScrollByIntentRef.current?.();
       const dyFloor = Math.floor(dy);
       // Wheel-down / scroll-down while the view is already AT the bottom is
       // pure overscroll: nothing left to reveal. Ignore it entirely — no
@@ -232,7 +251,9 @@ function ScrollBox({
       //    notch drains to the bottom and the re-pin restores sticky /
       //    clears the new-messages pill on that frame. No epsilon is
       //    needed — the whole chain is integer rows.
-      if (dyFloor > 0) {
+      // A pending anchor is newer than the cached bottom geometry: an explicit
+      // scroll must cancel it even if the old scrollTop still appears at bottom.
+      if (dyFloor > 0 && !el.scrollAnchor) {
         const sticky = el.stickyScroll ?? Boolean(el.attributes['stickyScroll']);
         const pending = el.pendingScrollDelta ?? 0;
         const maxScroll = Math.max(
@@ -268,6 +289,9 @@ function ScrollBox({
       el.scrollTop = maxScroll;
       scrollMutated(el);
       forceRender(n => n + 1);
+    },
+    getScrollIntentVersion() {
+      return scrollIntentRef.current;
     },
     getScrollTop() {
       return domRef.current?.scrollTop ?? 0;

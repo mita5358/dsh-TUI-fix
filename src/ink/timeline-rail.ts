@@ -40,25 +40,23 @@ export const RAIL_MIN_TURNS = 2
 /** Stored preview cap (chars). Render paths re-truncate to card width. */
 export const PREVIEW_MAX_CHARS = 120
 
-/** One user turn, as the rail sees it. Identity is the row id — never an
- *  array index (deletion / rewind / loadOlder would mis-target it). */
+/** One user turn, as the rail sees it. Identity is a stable jump target —
+ *  never an array index (deletion / rewind / loadOlder would mis-target it). */
 export interface TimelineTurn {
-  /** ChatRow id of the user message (jump/preview target). */
+  /** User-row id, or an opaque target resolved by revealRow after loading. */
   id: number
-  /** Content-space top of the prompt TEXT (scrollTo(target) pins it to
-   *  the viewport top). */
+  /** Content-space prompt TEXT top. For an unloaded chunk, its summary's
+   *  top is a navigation proxy, not a coordinate to jump to directly.
+   *  −1 means the row/summary is before the recent-rows fold window. */
   top: number
   /** First non-empty prompt line, char-capped (see clipPreview). */
   preview: string
   /**
-   * True while the row sits BEFORE the fold window (older than the most
-   * recent RENDERED_ROW_CAP rows): its top is unknown (unmounted since
-   * before the fold; `top` carries −1) and clicking the tick must first
-   * reveal the folded history (Chat: showAll + force-mount + seek) rather
-   * than scrollTo(−1). Rendering a tick for it is still correct — the
-   * turn EXISTS and is navigable, it is just folded away right now
-   * (drawing only window turns read as "the rail covers just 2-3 nodes"
-   * on tool-heavy sessions where 300 rows ≈ a handful of turns).
+   * A click must reveal and seek, never scrollTo(top): either a real row
+   * before the fold window (top < 0), or an unprojected turn whose summary
+   * supplies a proxy (top >= 0). An unloaded chunk may be BELOW the current
+   * viewport after a rail jump to an older chunk, so folded alone does not
+   * imply "above". Several turns can share one summary's proxy top.
    */
   folded?: boolean
 }
@@ -74,12 +72,53 @@ export interface TimelineSnapshot {
   /** Turn the sticky header names: the active turn once its prompt has
    *  scrolled out above the viewport top (or is folded away); null while
    *  that prompt, or pre-turn content such as the logo, is still on the
-   *  top row, where naming it would repeat text already on screen. */
+   *  top row. A collapsed-summary proxy never pins a nonexistent prompt. */
   pinnedId: number | null
   /** ▲ target (strictly above the top), null at the first turn. */
   upId: number | null
   /** ▼ target (below the top and reachable), null at the end. */
   downId: number | null
+}
+
+/**
+ * Derive header/rail targets from conversation-ordered turns. Known tops,
+ * including collapsed-summary proxies, use strict geometry: the last turn
+ * above the viewport is ▲, the first below it is ▼. Unknown folded rows
+ * form an older prefix, so they can supply ▲ without overriding a measured
+ * active turn. Equal summary tops deliberately choose the last turn above
+ * and the first below; revealing either gives subsequent steps real tops.
+ *
+ * maxScroll excludes unreachable real prompts from ▼ (otherwise the arrow
+ * repeats forever). A summary proxy is different: loading it creates new
+ * content, so its old top need not be reachable before the reveal.
+ */
+export function timelineTargets(
+  turns: ReadonlyArray<TimelineTurn>,
+  viewTop: number,
+  maxScroll: number,
+): Pick<TimelineSnapshot, 'activeId' | 'pinnedId' | 'upId' | 'downId'> {
+  let active: TimelineTurn | undefined
+  let upId: number | null = null
+  let downId: number | null = null
+  for (const turn of turns) {
+    if (turn.folded === true && turn.top < 0) {
+      upId = turn.id
+      continue
+    }
+    if (turn.top <= viewTop) active = turn
+    if (turn.top < viewTop) upId = turn.id
+    if (downId === null && turn.top > viewTop && (turn.folded === true || turn.top <= maxScroll)) {
+      downId = turn.id
+    }
+  }
+  active ??= turns[0]
+  const pinned = active !== undefined && (active.folded === true ? active.top < 0 : active.top < viewTop)
+  return {
+    activeId: active?.id ?? null,
+    pinnedId: pinned ? active!.id : null,
+    upId,
+    downId,
+  }
 }
 
 /** Per-render rail geometry: where the ticks and chevrons landed. */
@@ -126,29 +165,34 @@ export function railEligible(opts: {
  * Windowing: when turns outnumber tick rows (viewport − 2 chevrons), slide
  * a window around the ACTIVE turn; at the bottom prefer the tail so the
  * newest ticks stay visible — but never exclude the active turn, or no
- * tick would highlight. The chevron+tick block is vertically centered in
- * the rail column.
+ * tick would highlight. `windowStart` overrides that automatic placement
+ * while the reader scrolls the index bar itself (chevrons / wheel over the
+ * rail): clamped to a full window, it never moves the transcript. The
+ * chevron+tick block is vertically centered in the rail column.
  */
 export function computeRailGeometry(
   turnCount: number,
   viewportRows: number,
   activeIndex: number | null,
   atBottom: boolean,
+  windowStart: number | null = null,
 ): RailGeometry | null {
   if (turnCount < RAIL_MIN_TURNS) return null
   const maxTicks = viewportRows - 2
   if (maxTicks < 1) return null
 
+  const shown = Math.min(turnCount, maxTicks)
+  const tailStart = Math.max(0, turnCount - shown)
   let start = 0
-  if (turnCount > maxTicks) {
-    const tailStart = turnCount - maxTicks
+  if (windowStart !== null) {
+    start = Math.min(Math.max(0, windowStart), tailStart)
+  } else if (turnCount > maxTicks) {
     const anchor = activeIndex ?? turnCount - 1
     start = atBottom
       ? Math.min(anchor, tailStart)
       : Math.min(Math.max(0, anchor - Math.floor(maxTicks / 2)), tailStart)
   }
-  const shown = Math.min(turnCount, maxTicks)
-  // Vertically center the ▲ + ticks + ▼ stack, like the web rail.
+  // Vertically center the ▲ + ticks + ▼ block, like the web rail.
   const blockTop = Math.max(0, Math.floor((viewportRows - (shown + 2)) / 2))
   return {
     windowStart: start,
@@ -199,7 +243,9 @@ export function clipPreview(text: string, maxChars = PREVIEW_MAX_CHARS): string 
   // Keep the cap INCLUDING the ellipsis marker, like grok's preview. Slice
   // by CODE POINTS, not UTF-16 units — a surrogate pair split mid-pair
   // would emit a lone surrogate to the terminal.
-  return `${[...line].slice(0, maxChars - 1).join('')}…`
+  // Cap the UTF-16 prefix BEFORE allocating code points: the full-history
+  // index must not split a multi-megabyte prompt just to store 120 characters.
+  return `${[...line.slice(0, maxChars * 2)].slice(0, maxChars - 1).join('')}…`
 }
 
 /**

@@ -59,9 +59,12 @@ const PIN_SETTLE_CHECKS = 3
 export function ScrollbarGutter({
   handle,
   terminalWidth,
+  onScrollToIntent,
 }: {
   handle: ScrollBoxHandle | null
   terminalWidth: number
+  /** Called before an explicit track click or drag changes scroll position. */
+  onScrollToIntent?: () => void
 }): React.ReactNode {
   const [, setTick] = React.useState(0)
   // Geometry the last render painted with. The Ink render pass runs AFTER
@@ -157,7 +160,10 @@ export function ScrollbarGutter({
     if (y >= trackH) return maxScroll
     return Math.round((y / trackH) * maxScroll)
   }
+  // Explicit track input supersedes a deferred transcript seek, even when the
+  // selected coordinate equals the current scroll position.
   const applyDragRow = (event: DragEvent): void => {
+    onScrollToIntent?.()
     handle.scrollTo(trackScrollTop(event.localRow))
   }
 
@@ -169,7 +175,10 @@ export function ScrollbarGutter({
         key={y}
         height={1}
         flexShrink={0}
-        onClick={() => handle.scrollTo(trackScrollTop(y))}
+        onClick={() => {
+          onScrollToIntent?.()
+          handle.scrollTo(trackScrollTop(y))
+        }}
         onMouseEnter={() => {
           setHoverRow(y)
           // Resting pointer: chip follows immediately once dwell has

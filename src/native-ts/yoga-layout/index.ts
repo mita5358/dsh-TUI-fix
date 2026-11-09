@@ -1445,7 +1445,15 @@ export class Node {
 
 const DEFAULT_CONFIG = createConfig()
 
-const CACHE_SLOTS = 4
+// Input pairs retained per node by the cross-generation layout cache. Four
+// slots covered steady scrolling, but a fresh mounted chunk probes each card
+// with far more width/mode combinations in one pass and the LRU wrapped
+// before the probes repeated. Eight slots cuts a rail-click layout from
+// ~102k layoutNode visits / ~31k text measures to ~30k / ~6k (measured with
+// scripts/perf-rail-click.tsx on a 372-chunk transcript), and ~28% off the
+// click's p95 paint. Sixteen measured no better than eight, so the memory
+// trade (11 doubles per slot per node) stays at eight.
+const CACHE_SLOTS = 8
 function cacheWrite(
   node: Node,
   aW: number,

@@ -147,6 +147,30 @@ export function resetScrollHint(): void {
 
 /** A node fills every cell of its rect when it has its own background or
  *  is declared `opaque`; anything else leaves gaps to the layer below. */
+/**
+ * Top of a row's first painted text line, relative to the row box.
+ * Turn spacing lives on an inner box for user prompts, so the row's own
+ * `getComputedTop()` is the blank margin above the prompt: a seek anchored
+ * there leaves the prompt one row down and the pinned turn header showing
+ * the PREVIOUS turn. Resolved here, at the render pass, because a row that
+ * was just force-mounted has no child layout yet when React's commit runs.
+ */
+function firstTextTop(row: DOMElement): number | undefined {
+  const walk = (node: DOMElement, offset: number, depth: number): number | undefined => {
+    if (depth > 8) return undefined
+    for (const child of node.childNodes ?? []) {
+      if (child.nodeName === '#text') {
+        if (child.nodeValue.trim() !== '') return offset
+        continue
+      }
+      const found = walk(child, offset + (child.yogaNode?.getComputedTop() ?? 0), depth + 1)
+      if (found !== undefined) return found
+    }
+    return undefined
+  }
+  return walk(row, 0, 0)
+}
+
 function paintsOwnRect(node: DOMElement): boolean {
   return node.style.opaque === true || node.style.backgroundColor !== undefined
 }
@@ -1572,13 +1596,24 @@ function renderNodeToOutput(
         // → firstVisible wrong. Also: SCROLL_MIN_PER_FRAME=4 with snap-at-1
         // ping-ponged forever at delta=2. Smooth needs drain-end notify
         // plumbing; shipping instant first. stickyScroll overrides.
+        const explicitSeek = node.scrollAnchor !== undefined
         if (node.scrollAnchor) {
-          const anchorTop = node.scrollAnchor.el.yogaNode?.getComputedTop()
+          const rowTop = node.scrollAnchor.el.yogaNode?.getComputedTop()
+          const anchorTop =
+            rowTop == null
+              ? undefined
+              : rowTop + (node.scrollAnchor.snapToText ? (firstTextTop(node.scrollAnchor.el) ?? 0) : 0)
           if (anchorTop != null) {
             node.scrollTop = anchorTop + node.scrollAnchor.offset
             node.pendingScrollDelta = undefined
           }
-          node.scrollAnchor = undefined
+          // A held anchor survives the pass (see ScrollBox.scrollToElement):
+          // the target keeps re-measuring after the jump, so the first
+          // resolution is stale by the time the reader looks. Explicit
+          // scrolls clear the anchor themselves; no hold → one-shot snap.
+          if (node.scrollAnchor.hold !== true) {
+            node.scrollAnchor = undefined
+          }
         }
         // At-bottom follow. Positional: if scrollTop was at (or past) the
         // previous max, pin to the new max. Scroll away → stop following;
@@ -1618,9 +1653,13 @@ function renderNodeToOutput(
         // stickyScroll below) so the "N new messages" pill clears once the
         // user scrolls home — otherwise sticky stays broken until the next
         // content growth, and an idle stream leaves the pill stuck.
+        // A reveal may grow a short summary into hundreds of real rows.
+        // Its explicit element target can lie past the OLD maxScroll without
+        // being at the NEW bottom. Do not turn that seek back into tail-follow
+        // in the very frame that resolves it; the next frame has fresh bounds.
         const atBottom =
           sticky ||
-          (scrollTopBeforeFollow >= prevMaxScroll &&
+          (!explicitSeek && scrollTopBeforeFollow >= prevMaxScroll &&
             (grew || scrollTopBeforeFollow >= maxScroll))
         if (atBottom && (node.pendingScrollDelta ?? 0) >= 0 && !shrunk) {
           node.scrollTop = maxScroll

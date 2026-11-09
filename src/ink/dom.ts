@@ -130,7 +130,19 @@ export type DOMElement = {
   // imperative scrollTo(N) which bakes in a number that's stale by the
   // time the throttled render fires, the element ref defers the position
   // read to paint time. One-shot.
-  scrollAnchor?: { el: DOMElement; offset: number }
+  scrollAnchor?: {
+    el: DOMElement
+    offset: number
+    // Keep re-resolving the anchor every frame until an explicit scroll
+    // (wheel, scrollTo, scrollToBottom) drops it. A seek target far up the
+    // transcript keeps re-measuring after the jump — window quantization,
+    // fold/markdown transitions, live deltas below — and a one-shot snap
+    // leaves the reader one row off.
+    hold?: boolean
+    // Anchor on the row's first painted text line instead of its box top
+    // (turn spacing lives on an inner box for user prompts).
+    snapToText?: boolean
+  }
   // Only set on ink-root. The document owns focus — any node can
   // reach it by walking parentNode, like browser getRootNode().
   focusManager?: FocusManager

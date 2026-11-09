@@ -8,6 +8,7 @@
  *   - 溢出窗口：围绕 active 滑动、active 收尾 clamp、无 active 锚定末尾、
  *     at-bottom 贴尾但绝不排除 active；
  *   - railHit 行 ↔ (▲/tick/▼) 映射；
+ *   - timelineTargets：严格导航、折叠前缀、摘要代理与随机加载的中间块；
  *   - clipPreview：首个非空行、120 字符上限 + …；
  *   - wrapPreviewLines：CJK 宽度、两行上限、末行省略。
  *
@@ -18,8 +19,10 @@ import {
   railEligible,
   computeRailGeometry,
   railHit,
+  timelineTargets,
   clipPreview,
   wrapPreviewLines,
+  type TimelineTurn,
 } from '../src/ink/timeline-rail.js'
 import { stringWidth } from '../src/ink/stringWidth.js'
 
@@ -61,6 +64,15 @@ check('rail 宽 2 列', RAIL_WIDTH === 2)
   check('at-bottom active 已在尾部 → 固定末尾', (() => { const g = computeRailGeometry(50, 20, 40, true)!; return eq([g.windowStart, g.windowEnd], [32, 50]) })())
 }
 
+// ── 索引浏览覆盖：windowStart 参数压过自动窗口，并 clamp 到整窗 ──
+{
+  check('windowStart=3 覆盖自动窗口', (() => { const g = computeRailGeometry(50, 20, 25, false, 3)!; return eq([g.windowStart, g.windowEnd], [3, 21]) })())
+  check('windowStart 负值 clamp 到 0', (() => { const g = computeRailGeometry(50, 20, 25, false, -5)!; return eq([g.windowStart, g.windowEnd], [0, 18]) })())
+  check('windowStart 超尾 clamp 到 tail', (() => { const g = computeRailGeometry(50, 20, 25, false, 999)!; return eq([g.windowStart, g.windowEnd], [32, 50]) })())
+  check('windowStart 覆盖 at-bottom 也生效', (() => { const g = computeRailGeometry(50, 20, 25, true, 10)!; return eq([g.windowStart, g.windowEnd], [10, 28]) })())
+  check('turn 数不足时 windowStart 恒为 0', (() => { const g = computeRailGeometry(4, 20, 1, false, 7)!; return eq([g.windowStart, g.windowEnd], [0, 4]) })())
+}
+
 // ── railHit 映射（grok: hit_maps_chevrons_and_ticks）──
 {
   const geo = computeRailGeometry(4, 20, 1, false)!
@@ -71,6 +83,87 @@ check('rail 宽 2 列', RAIL_WIDTH === 2)
   check('块外行未命中', railHit(geo, geo.upRow - 1) === null && railHit(geo, geo.downRow + 1) === null)
   const of = computeRailGeometry(50, 20, 25, false)!
   check('溢出窗口行映射窗口内序号', eq(railHit(of, of.tickTop), { kind: 'tick', index: of.windowStart }))
+}
+
+// ── timelineTargets：普通真实轮次保持严格的视口顶部锚定 ──
+{
+  const turns: TimelineTurn[] = [10, 30, 50, 80].map((top, index) => ({ id: index + 1, top, preview: `turn ${index + 1}` }))
+  const targets = (viewTop: number, maxScroll = 60) => timelineTargets(turns, viewTop, maxScroll)
+  check('导航: pre-turn 内容以首轮作 active，不置顶', eq(targets(0), {
+    activeId: 1, pinnedId: null, upId: null, downId: 1,
+  }))
+  check('导航: prompt 恰在顶行，▲严格排除当前轮', eq(targets(30), {
+    activeId: 2, pinnedId: null, upId: 1, downId: 3,
+  }))
+  check('导航: 轮次中部先▲对齐本轮，▼到下一轮', eq(targets(40), {
+    activeId: 2, pinnedId: 2, upId: 2, downId: 3,
+  }))
+  check('导航: ▼排除超过 maxScroll 的真实尾轮', eq(targets(60), {
+    activeId: 3, pinnedId: 3, upId: 3, downId: null,
+  }))
+  check('导航: maxScroll 上的真实 prompt 仍可达', targets(40, 50).downId === 3)
+  check('导航: maxScroll 之下不可达的 prompt 不成为▼', targets(40, 49).downId === null)
+}
+
+// ── 从索引加载中间块，两侧仍各有摘要代理 ──
+{
+  const turns: TimelineTurn[] = [
+    { id: -11, top: 10, preview: 'older A', folded: true },
+    { id: -12, top: 10, preview: 'older B', folded: true },
+    { id: 21, top: 30, preview: 'loaded A' },
+    { id: 22, top: 50, preview: 'loaded B' },
+    { id: -31, top: 80, preview: 'newer A', folded: true },
+    { id: -32, top: 80, preview: 'newer B', folded: true },
+    { id: 41, top: 100, preview: 'tail' },
+  ]
+  const targets = (viewTop: number, maxScroll = 120) => timelineTargets(turns, viewTop, maxScroll)
+  check('代理: 下方未加载块不覆盖中间真实 active/▲', eq(targets(40), {
+    activeId: 21, pinnedId: 21, upId: 21, downId: 22,
+  }))
+  check('代理: 中间真实 prompt 顶部▼取下方摘要第一轮', eq(targets(50), {
+    activeId: 22, pinnedId: null, upId: 21, downId: -31,
+  }))
+  check('代理: 摘要上方▼取该组第一轮，▲保持真实前轮', eq(targets(70), {
+    activeId: 22, pinnedId: 22, upId: 22, downId: -31,
+  }))
+  check('代理: 同摘要多轮以末轮代表 active，但不伪造置顶 prompt', eq(targets(80), {
+    activeId: -32, pinnedId: null, upId: 22, downId: 41,
+  }))
+  check('代理: 摘要严格上方▲取组末轮，仍不置顶', eq(targets(90), {
+    activeId: -32, pinnedId: null, upId: -32, downId: 41,
+  }))
+  check('代理: 后方真实轮 active 不受前方摘要干扰', eq(targets(100), {
+    activeId: 41, pinnedId: null, upId: -32, downId: null,
+  }))
+  check('代理: ▼可揭示当前 maxScroll 之外的摘要，加载后再计算真坐标', targets(50, 60).downId === -31)
+  check('代理: 上方多轮▲取最后一个，不能跳到下方摘要', eq(targets(20), {
+    activeId: -12, pinnedId: null, upId: -12, downId: 21,
+  }))
+}
+
+// ── fold window 外的未知前缀与空列表 ──
+{
+  const turns: TimelineTurn[] = [
+    { id: 1, top: -1, preview: 'folded A', folded: true },
+    { id: 2, top: -1, preview: 'folded B', folded: true },
+    { id: 3, top: 20, preview: 'visible A' },
+    { id: 4, top: 50, preview: 'visible B' },
+  ]
+  check('未知前缀: 可作▲，不覆盖真实 active', eq(timelineTargets(turns, 30, 100), {
+    activeId: 3, pinnedId: 3, upId: 3, downId: 4,
+  }))
+  check('未知前缀: 首个真实 prompt 顶部▲取最近折叠轮', eq(timelineTargets(turns, 20, 100), {
+    activeId: 3, pinnedId: null, upId: 2, downId: 4,
+  }))
+  check('未知前缀: 无 measured active 时保留既有首轮 fallback', eq(timelineTargets(turns, 0, 100), {
+    activeId: 1, pinnedId: 1, upId: 2, downId: 3,
+  }))
+  check('导航: 无轮次时所有目标均为空', eq(timelineTargets([], 0, 100), {
+    activeId: null, pinnedId: null, upId: null, downId: null,
+  }))
+  check('未知前缀: 全折叠仍能向上揭示，但没有▼', eq(timelineTargets(turns.slice(0, 2), 0, 100), {
+    activeId: 1, pinnedId: 1, upId: 2, downId: null,
+  }))
 }
 
 // ── clipPreview ──

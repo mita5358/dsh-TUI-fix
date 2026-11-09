@@ -112,6 +112,7 @@ const channel: any = {
   renameSessionTo: () => Promise.resolve(true),
   setResumeTarget: () => {},
   loadOlder: () => {},
+  revealRow: () => 0,
   mcpStatus: () => [],
   pushLocal: () => {},
   commandCompletions: (input: string) => completeCommands(input),
@@ -259,40 +260,36 @@ await wheel(true, 4)
   }
 }
 
-// ── 4. ▼ → 问题 4 到顶；▲ → 问题 3 回到顶 ──
+// ── 4. 8 轮全显示 → 索引窗口无处可翻：▲/▼ 均 no-op，不跳轮次、不滚转录 ──
 {
   const snap = railSnapshot()
+  const beforeTop = screenLines().slice(0, 3).join('\n')
+  const beforeTicks = snap.ticks.join(',')
   if (snap.downRow !== null) {
+    // 稳定性探针：clickAt 的固定窗口给错误滚动/跳轮次留现身时间。
     await clickAt(COLS, snap.downRow + 1)
-    check('▼ 后 问题 4 到顶', await settled(() => screenLines().slice(0, 3).some(l => l.includes('问题 4'))),
+    check('▼ 不跳轮次（场景 3 的 问题 3 仍在顶）', screenLines().slice(0, 3).join('\n') === beforeTop,
       `top3=${JSON.stringify(screenLines().slice(0, 3).map(l => l.trimEnd()))}`)
-    const snap2 = railSnapshot()
-    if (snap2.upRow !== null) {
-      await clickAt(COLS, snap2.upRow + 1)
-      check('▲ 后 问题 3 回到顶', await settled(() => screenLines().slice(0, 3).some(l => l.includes('问题 3'))),
-        `top3=${JSON.stringify(screenLines().slice(0, 3).map(l => l.trimEnd()))}`)
-    } else {
-      check('▲ 行存在', false, 'upRow missing')
-    }
   } else {
     check('▼ 行存在', false, 'downRow missing')
   }
+  if (snap.upRow !== null) {
+    await clickAt(COLS, snap.upRow + 1)
+    check('▲ 不跳轮次（仍停在 问题 3）', screenLines().slice(0, 3).join('\n') === beforeTop,
+      `top3=${JSON.stringify(screenLines().slice(0, 3).map(l => l.trimEnd()))}`)
+  } else {
+    check('▲ 行存在', false, 'upRow missing')
+  }
+  check('三角点击未移动索引窗口（tick 行不变）', railSnapshot().ticks.join(',') === beforeTicks,
+    `before=${beforeTicks} after=${railSnapshot().ticks.join(',')}`)
 }
 
-// ── 5. 滚到顶：active = 首 tick，▲ 无操作 ──
+// ── 5. 滚到顶：active = 首 tick（auto 窗口继续跟随转录）──
 await wheel(true, 40)
 {
   const snap = railSnapshot()
   check('顶部 active = 第一个 tick', snap.activeRow === snap.ticks[0],
     `active=${snap.activeRow} first=${snap.ticks[0]}`)
-  const before = screenLines()[0]
-  if (snap.upRow !== null) {
-    // 稳定性探针：断言点击后「无操作」——clickAt 内置的固定窗口就是给
-    // 错误滚动留的现身时间，settle 对已成立条件会立即返回，等于没测。
-    await clickAt(COLS, snap.upRow + 1)
-    const after = screenLines()[0]
-    check('顶部 ▲ 无操作（dim = no-op）', before === after, `before=${JSON.stringify(before)} after=${JSON.stringify(after)}`)
-  }
 }
 
 // ── 6. 悬停第 2 个 tick：预览卡出现又消失 ──
