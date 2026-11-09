@@ -464,6 +464,11 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
   /** Replay paints settled history without the live smooth-reveal animation. */
   let replaying = false
 
+  /** A scratch projection's state is thrown away, so context-bar estimates
+   *  (O(text) per event) are not worth computing. Set by `apply`. */
+  let scratch = false
+  const countTokens = (text: string): number => (scratch ? 0 : estimateTokens(text))
+
   type Delta = AgentEventOf<'assistant.delta'>['delta']
   /** Whether one delta advances the first-token/decode boundary. */
   const isTokenDelta = (delta: Delta): boolean => {
@@ -734,9 +739,9 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
     // tool calls in the assistant segment, thinking separately.
     for (const block of event.blocks) {
       if (block.type === 'text' && block.text) {
-        state.contextSegments.assistant += estimateTokens(block.text)
+        state.contextSegments.assistant += countTokens(block.text)
       } else if (block.type === 'reasoning' && block.text) {
-        state.contextSegments.thinking += estimateTokens(block.text)
+        state.contextSegments.thinking += countTokens(block.text)
       }
     }
   }
@@ -765,7 +770,7 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
       // occupancy total.
       state.contextSegments = {
         system: state.contextSegments.system,
-        prompt: estimateTokens(summary),
+        prompt: countTokens(summary),
         assistant: 0,
         thinking: 0,
         tools: 0,
@@ -827,7 +832,7 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
     if (event.source === 'team-message') {
       if (event.text === '') return
       appendRow({ id: deps.rowIds.value, kind: 'user', label: 'team-message', text: event.text, ...(event.sender === undefined ? {} : { sender: event.sender }), seq: event.seq })
-      state.contextSegments.prompt += estimateTokens(textOfBlocks(event.blocks))
+      state.contextSegments.prompt += countTokens(textOfBlocks(event.blocks))
       deps.rowIds.value += 1
       return
     }
@@ -859,7 +864,7 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
       state.lastUserText = text || t('transcript-image-message', { count: images.length })
       // The context estimate counts everything sent to the model: typed
       // text and the `@`-mention attachment blocks.
-      state.contextSegments.prompt += estimateTokens(textOfBlocks(event.blocks))
+      state.contextSegments.prompt += countTokens(textOfBlocks(event.blocks))
       deps.rowIds.value += 1
     }
   }
@@ -916,7 +921,7 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
     toolCards.set(event.callId, card)
     appendRow(card)
     state.activeToolCount += 1
-    state.contextSegments.assistant += estimateTokens(
+    state.contextSegments.assistant += countTokens(
       `${event.name}${event.argsJson}`,
     )
     updateSpinnerMode()
@@ -961,7 +966,7 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
         }
         deps.rowIds.value += 1
         appendRow(errorCard)
-        state.contextSegments.tools += estimateTokens(event.errorText ?? '')
+        state.contextSegments.tools += countTokens(event.errorText ?? '')
       }
       return
     }
@@ -979,7 +984,7 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
       card.tool.status = 'error'
       const errorText = event.errorText ?? ''
       card.tool.errorText = errorText
-      state.contextSegments.tools += estimateTokens(errorText)
+      state.contextSegments.tools += countTokens(errorText)
     } else {
       card.tool.status = 'ok'
       const result = event.text
@@ -994,7 +999,7 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
         // read content…) wins over the raw text body.
         card.tool.resultView = event.presentation
       }
-      state.contextSegments.tools += estimateTokens(result)
+      state.contextSegments.tools += countTokens(result)
       settledCardCallId = callId
     }
     state.activeToolCount = Math.max(0, state.activeToolCount - 1)
@@ -1394,7 +1399,7 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
       case 'system.prompt':
         // The latest system prompt holds the active instructions (an empty
         // render clears them); the context bar's system segment tracks it.
-        state.contextSegments.system = estimateTokens(event.text)
+        state.contextSegments.system = countTokens(event.text)
         return
       case 'request.header':
         // Reasoning effort readout (status line) from the call config.
@@ -1475,7 +1480,7 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
         if (event.ok && event.contextReplaced === true) {
           state.contextSegments = {
             system: state.contextSegments.system,
-            prompt: estimateTokens(event.summary ?? ''),
+            prompt: countTokens(event.summary ?? ''),
             assistant: 0,
             thinking: 0,
             tools: 0,
@@ -1624,10 +1629,12 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
     // previous snapshot.
     if (droppedFresh) markChannelReadDirty(state.rows)
     replaying = true
+    scratch = meta.scratch === true
     try {
       for (const event of events) applyEvent(event)
     } finally {
       replaying = false
+      scratch = false
     }
   }
 

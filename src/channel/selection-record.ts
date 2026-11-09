@@ -25,18 +25,25 @@ export function replaySelectionAttachment(
     if ((block as { type?: unknown }).type !== 'text' || typeof text !== 'string') continue
     const opened = /^<attached-file path="([^"]+)" selection(?: count="(\d+)")?>\n/.exec(text)
     if (opened === null) continue
-    let closed = text.slice(opened[0].length)
-    if (closed.endsWith('</attached-file>')) closed = closed.slice(0, -'</attached-file>'.length)
-    // The builder writes `body\n</attached-file>` — strip the newline the
-    // close tag rode on, or every body counts one phantom line.
-    if (closed.endsWith('\n')) closed = closed.slice(0, -1)
-    const lines = closed.split('\n').length
-    // `count` is authoritative when present (the builder always writes it).
-    // Blocks persisted before it existed fall back to the old tail heuristic,
-    // which misreads a body whose last line is literally the truncation marker.
+    // `count` is authoritative when present (the builder always writes it),
+    // so current records need no explicit body scan or split.
     const counted = opened[2] === undefined ? undefined : Number(opened[2])
+    let lines = counted
+    if (lines === undefined) {
+      const start = opened[0].length
+      let end = text.length
+      const close = '</attached-file>'
+      if (end - start >= close.length && text.endsWith(close, end)) end -= close.length
+      // The closing tag's preceding newline is not a body line.
+      if (end > start && text.charCodeAt(end - 1) === 10) end -= 1
+      lines = 1
+      for (let pos = text.indexOf('\n', start); pos !== -1 && pos < end; pos = text.indexOf('\n', pos + 1)) lines += 1
+      // Preserve the legacy heuristic for records predating `count`.
+      const marker = '\n[… truncated]'
+      if (end - start >= marker.length && text.endsWith(marker, end)) lines -= 1
+    }
     return {
-      lines: counted ?? (closed.endsWith('\n[… truncated]') ? lines - 1 : lines),
+      lines,
       // Reverse escapeSnippetAttr so the replayed indicator shows the path
       // exactly as the live one did (`&` first so entities are not re-baked).
       path: opened[1]!

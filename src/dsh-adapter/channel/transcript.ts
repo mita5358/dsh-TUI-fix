@@ -1,5 +1,6 @@
 import { type SessionEvent } from '@deepseek-ai/dsh-session'
 import { toolResultPayload } from '../compat/messages.js'
+import { withoutTeammateReminder } from '../compat/agent-team-0.2.0.js'
 import { t } from '../../i18n.js'
 import type { ChatRow, ToolResultView, ToolViewPresenter } from './types.js'
 import { markChannelReadDirty } from '../../adapter/channel/read-view.js'
@@ -8,6 +9,8 @@ import { ARGS_PREVIEW_LIMIT, LOCAL_OUTPUT_LIMIT, MAX_ROWS, preview, previewInden
 // Limits and the preview helper are backend-neutral (src/channel/transcript.ts);
 // re-exported here for the existing importers.
 export { ARGS_PREVIEW_LIMIT, LOCAL_OUTPUT_LIMIT, MAX_ROWS, preview, previewIndented, RESULT_PREVIEW_LIMIT, trimLocalRows }
+
+const ROW_TEXT_PREVIEW_LIMIT = 200
 
 /**
  * Fold the oldest rows beyond the transcript window cap: drop each row's
@@ -69,7 +72,7 @@ export function foldRows(
     } else if (row.text.length > 0) {
       // Keep a short preview so the transcript reads naturally; the full
       // text lives in the session log and is restored by loadOlder().
-      row.text = preview(row.text, 200)
+      row.text = preview(row.text, ROW_TEXT_PREVIEW_LIMIT)
     }
     markChannelReadDirty(row)
     markChannelReadDirty(rows)
@@ -101,6 +104,7 @@ export function foldBack(rows: ChatRow[], events: readonly SessionEvent[], views
   // click, budgeted at ≤50 ms. Every lookup below is a map hit or a binary
   // search, so the cost is O(events + folded × log messages): 43.6 ms for the
   // same input.
+  const usersBySeq = new Map<number, SessionEvent<'user/message'>>()
   const callsBySeq = new Map<number, SessionEvent<'tool/call'>>()
   // tool results are matched by callId, not seq, because the result event
   // seq differs from the call event seq that anchored the row.
@@ -114,7 +118,12 @@ export function foldBack(rows: ChatRow[], events: readonly SessionEvent[], views
   let ordered = true
   let lastSeq = -Infinity
   for (const event of events) {
-    if (event.seq < firstFoldedSeq) continue
+    // User rows may be out of seq order, unlike the existing bounded
+    // assistant/tool window. Keep the first user event at each seq.
+    if (event.seq < firstFoldedSeq) {
+      if (event.type === 'user/message' && !usersBySeq.has(event.seq)) usersBySeq.set(event.seq, event)
+      continue
+    }
     if (event.type === 'tool/call') {
       // Only a call can answer a tool row, and the first one at a seq wins —
       // the same filters the per-row scan applied before this change.
@@ -125,6 +134,8 @@ export function foldBack(rows: ChatRow[], events: readonly SessionEvent[], views
       if (event.seq < lastSeq) ordered = false
       lastSeq = event.seq
       messages.push(event)
+    } else if (event.type === 'user/message' && !usersBySeq.has(event.seq)) {
+      usersBySeq.set(event.seq, event)
     }
   }
   // A stable sort keeps array order among equal seqs, which is the event the
@@ -145,6 +156,32 @@ export function foldBack(rows: ChatRow[], events: readonly SessionEvent[], views
   for (const row of folded) {
     const rowSeq = row.seq
     if (rowSeq === undefined) continue
+    if (row.kind === 'user') {
+      const event = usersBySeq.get(rowSeq)
+      // Team/other sources have different projection rules. Never guess.
+      if (event === undefined || row.label === 'team-message') continue
+      const data = event.data as SessionEvent<'user/message'>['data'] | null | undefined
+      if (data?.source?.kind !== 'user' || !Array.isArray(data.content)) continue
+      if (data.content.some(block => block === null || typeof block !== 'object' || (block.type === 'text' && typeof block.text !== 'string'))) continue
+      const firstText = (content: SessionEvent<'user/message'>['data']['content']): string =>
+        content.find(block => block.type === 'text')?.text.trim() ?? ''
+      // The translator strips a legacy teammate identity block only on its
+      // first human prompt. The fold window cannot establish that state, so
+      // accept only the unique candidate consistent with the existing preview.
+      const original = firstText(data.content)
+      const stripped = withoutTeammateReminder(data)
+      const alternate = stripped === data ? original : firstText(stripped.content)
+      const originalMatches = preview(original, ROW_TEXT_PREVIEW_LIMIT) === row.text
+      const alternateMatches = alternate === original ? originalMatches : preview(alternate, ROW_TEXT_PREVIEW_LIMIT) === row.text
+      if (alternate !== original && originalMatches === alternateMatches) continue
+      if (!originalMatches && !alternateMatches) continue
+      row.text = originalMatches ? original : alternate
+      row.folded = false
+      row.restored = true
+      markChannelReadDirty(row)
+      restored += 1
+      continue
+    }
     if (row.kind === 'tool' && row.tool !== undefined) {
       // The tool row is anchored on its tool/call seq; its result text comes
       // from the matching tool/result event.
@@ -179,15 +216,10 @@ export function foldBack(rows: ChatRow[], events: readonly SessionEvent[], views
   return restored
 }
 
-/** Rebuild a folded row's full text from its source session event. */
+/** Rebuild assistant/reasoning/tool content. User rows must go through
+ * foldBack's source and preview checks rather than this unverified helper. */
 export function restoreRowFromEvent(row: ChatRow, event: SessionEvent): void {
   switch (row.kind) {
-    case 'user': {
-      if (event.type !== 'user/message') break
-      const text = event.data.content.map(block => block.type === 'text' ? block.text : '').join('').trim()
-      if (text) row.text = text
-      break
-    }
     case 'assistant': {
       if (event.type !== 'assistant/message') break
       const text = event.data.message.content.map(block => block.type === 'text' ? block.text : '').join('').trim()

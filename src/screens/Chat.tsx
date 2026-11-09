@@ -739,6 +739,12 @@ export function Chat({
   const [expandedRows, setExpandedRows] = React.useState<ReadonlySet<number>>(
     () => new Set(),
   )
+  // Kept above MessageList so virtual unmount and history chunk eviction do
+  // not lose individual fence disclosures. A session reset clears row ids.
+  const [expandedCodePaths, setExpandedCodePaths] = React.useState<ReadonlyMap<number, ReadonlySet<string>>>(() => new Map())
+  // Temporary exceptions while Ctrl+O exposes all blocks; the normal
+  // per-block state is restored when transcript mode is closed.
+  const [closedGlobalCodePaths, setClosedGlobalCodePaths] = React.useState<ReadonlyMap<number, ReadonlySet<string>>>(() => new Map())
   /** 流式 reasoning 行相对 thinkingFold 默认值的用户切换。与
    *  expandedRows 分开：preview 默认三行、full 默认全文，点击在两者间
    *  翻转；落定后自动回到普通行的折叠语义。 */
@@ -1757,7 +1763,7 @@ export function Chat({
   const lastAgentIdRef = React.useRef<string | undefined>(undefined)
   const lastResetScopeRef = React.useRef<string | undefined>(revealScope)
   React.useEffect(() => {
-    const id = channel.agentId
+    const id = JSON.stringify([channel.agentId, channel.sessionId])
     if (lastAgentIdRef.current === undefined) {
       lastAgentIdRef.current = id
       return
@@ -1776,6 +1782,8 @@ export function Chat({
     if (sameKeyspace) resetRevealSession(revealScope)
     setExpanded(false)
     setExpandedRows(new Set())
+    setExpandedCodePaths(new Map())
+    setClosedGlobalCodePaths(new Map())
     setSelectedId(null)
     setSelectionActive(false)
     setShowAllMessages(false)
@@ -1786,7 +1794,7 @@ export function Chat({
     setSearchCurrent(0)
     setBtwOverlayOpen(false)
     repaintTranscript()
-  }, [channel.agentId]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [channel.agentId, channel.sessionId]) // eslint-disable-line react-hooks/exhaustive-deps
   /** The session attached when the agent view opened; a close on a
    *  DIFFERENT session means a switch happened inside the view, and the
    *  transcript repaint cannot be skipped. */
@@ -3366,6 +3374,8 @@ export function Chat({
           // top, then clear native scrollback and repaint the whale homepage.
           setExpanded(false)
           setExpandedRows(new Set())
+          setExpandedCodePaths(new Map())
+          setClosedGlobalCodePaths(new Map())
           setStreamViewToggledRows(new Set())
           setSelectedId(null)
           setSelectionActive(false)
@@ -3392,6 +3402,8 @@ export function Chat({
         // without their reveal.
         resetRevealSession(revealScope)
         setExpandedRows(new Set())
+        setExpandedCodePaths(new Map())
+        setClosedGlobalCodePaths(new Map())
         setStreamViewToggledRows(new Set())
         setSelectedId(null)
         setSelectionActive(false)
@@ -4533,15 +4545,36 @@ export function Chat({
     return q ? historyEntries.filter(e => e.text.toLowerCase().includes(q)) : historyEntries
   }, [historyEntries, historyQuery])
 
-  // Double-Esc rewind: the user's own messages, newest first (the list shows
-  // selectable user turns; steering side-questions are excluded). Computed
-  // per render while the picker is open — `channel.rows` is a live in-place
-  // array (see selectableRows).
-  const rewindRows = overlay.kind === 'rewind'
-    ? channel.rows
-      .filter(row => row.kind === 'user' && row.label === undefined)
-      .reverse()
-    : NO_ROWS
+  /**
+   * The user's own messages, newest first (the list shows selectable user
+   * turns; steering side-questions are excluded). A chunked seed keeps every
+   * older chunk collapsed: its prompts live in the placeholder's
+   * `collapsedTurns` (durable seq + text), and rewinding to one needs only
+   * that seq, so they are listed like projected rows without loading the
+   * chunk — the picker must reach the whole conversation, not just the two
+   * rounds the first paint opened.
+   */
+  const collectRewindRows = (rows: readonly ChatRow[]): ChatRow[] => {
+    const candidates: ChatRow[] = []
+    for (const row of rows) {
+      if (row.collapsedTurns !== undefined) {
+        for (const turn of row.collapsedTurns) {
+          candidates.push({
+            id: turn.id,
+            kind: 'user',
+            text: turn.text || t('transcript-image-message', { count: turn.imageCount }),
+            seq: turn.seq,
+          })
+        }
+        continue
+      }
+      if (row.kind === 'user' && row.label === undefined) candidates.push(row)
+    }
+    return candidates.reverse()
+  }
+  // Computed per render while the picker is open — `channel.rows` is a live
+  // in-place array (see selectableRows).
+  const rewindRows = overlay.kind === 'rewind' ? collectRewindRows(channel.rows) : NO_ROWS
   /** Open the rewind picker (from PromptInput's double-Esc on an empty input). */
   const openRewind = () => {
     if ((channel.backendCapabilities as Channel['backendCapabilities'] | undefined)?.rewind === false) {
@@ -4550,9 +4583,7 @@ export function Chat({
     }
     // The overlay is not 'rewind' yet this render, so rewindRows is empty —
     // scan directly instead of reading the gated list.
-    const candidates = channel.rows
-      .filter(row => row.kind === 'user' && row.label === undefined)
-      .reverse()
+    const candidates = collectRewindRows(channel.rows)
     if (candidates.length === 0) {
       channel.notify(t('rewind-none'))
       return
@@ -4764,35 +4795,76 @@ export function Chat({
   // an unmounted one is force-mounted first, then sought by the completion
   // effect below once its ref lands.
   const [forceMountRowId, setForceMountRowId] = React.useState<number | null>(null)
+  // A seek is in flight (synchronous anchor or deferred force-mount). The
+  // key router treats "still at the bottom" as End/Enter being a no-op, but
+  // a click that just started a seek up the transcript must not swallow a
+  // same-batch End: remember the intent until the seek lands or is canceled.
+  const pendingSeekRef = React.useRef(false)
   const seekRow = (rowId: number): void => {
     const el = rowRefsRef.current.get(rowId)
     if (el) {
-      handle?.scrollToElement(el)
+      pendingSeekRef.current = true
+      handle?.scrollToElement(el, 0, true, true)
       return
     }
+    pendingSeekRef.current = true
     setForceMountRowId(rowId)
   }
+  // A deferred seek (the row was unmounted, so the completion effect scrolls
+  // once its ref lands) must not outlive an explicit "go to the bottom". Both
+  // land in the same parsed input batch when the reader clicks an old rail
+  // tick and presses End immediately: the click queued the force-mount, and
+  // without this the effect would re-anchor *after* scrollToBottom and pull
+  // the viewport back up off the tail.
+  const cancelPendingSeek = React.useCallback((): void => {
+    pendingSeekRef.current = false
+    setForceMountRowId(null)
+  }, [])
+  const cancelPendingSeekOnScroll = React.useCallback((): void => {
+    if (pendingSeekRef.current) cancelPendingSeek()
+  }, [cancelPendingSeek])
   /**
-   * Reveal-and-seek for a row folded behind the recent-rows window (the
-   * rail's tick for an old turn, the doc's revealAndSeekRow): expand the
-   * fold first, then the ordinary seek takes over — the completion effect
-   * below force-mounts the row and scrollToElement lands it once its ref
-   * (and Yoga top) exist. The fold toggle is idempotent, so calling this
-   * for an already-revealed row is harmless.
+   * Rail jump for a turn that already has a measured top: the coordinate
+   * scroll moves the viewport in the same frame (the row may be unmounted),
+   * then `seekRow` re-seats it on the prompt's TEXT top with a held anchor.
+   * Under a live tail the captured coordinate is one row stale, and the
+   * coordinate-only jump leaves the pinned header naming the previous turn.
    */
+  const jumpToTurnRow = (rowId: number): void => {
+    const turn = timeline?.turns.find(t => t.id === rowId)
+    if (turn !== undefined && turn.top >= 0) handle?.scrollTo(turn.top)
+    seekRow(rowId)
+  }
+
+  /**
+   * Reveal-and-seek for a row the backend collapsed (an old chunk's digest
+   * row, a folded tick): load the region that owns it, then seek the loaded
+   * row. No fold/expansion state is latched — the completion effect below
+   * force-mounts exactly the one row the seek needs, and `revealRow` is
+   * idempotent for an already-loaded row.
+   */
+  // Stable identity: every transcript row shallow-compares its props, so an
+  // inline arrow here would re-render the whole window on each Chat render.
+  const revealCollapsedRow = React.useCallback((rowId: number): void => {
+    channel.revealRow(rowId)
+  }, [channel])
   const revealAndSeekRow = (rowId: number): void => {
     // A backend that collapses history loads only the region holding the row
     // (DSH: the one chunk, never the whole record) and reports the id of the
     // loaded twin — a collapsed row's id need not survive loading.
     const revealed = channel.revealRow(rowId)
-    if (!showAllMessages) setShowAllMessages(true)
+    // Do NOT latch showAll here: showAll disables MessageList's row cap for the
+    // REST of the session, so repeated reveals can make later layouts much
+    // larger. This is a risky path, not a confirmed cause of every reported
+    // crash. seekRow requests the destination row without changing showAll.
     seekRow(revealed === 0 ? rowId : revealed)
   }
   React.useLayoutEffect(() => {
     if (forceMountRowId === null) return
     const el = rowRefsRef.current.get(forceMountRowId)
     if (el) {
-      handle?.scrollToElement(el)
+      handle?.scrollToElement(el, 0, true, true)
+      pendingSeekRef.current = false
       // Clear deferred to a macrotask: clearing here would let React's
       // synchronous re-render narrow the virtualization window and unmount
       // the row BEFORE the renderer's deferred pass reads its Yoga top
@@ -4856,10 +4928,28 @@ export function Chat({
   // useCallback: these feed MessageList → MemoRow's shallow compare; fresh
   // closures each render would defeat every row's memo.
   const toggleRowExpanded = React.useCallback((rowId: number) => {
+    setClosedGlobalCodePaths(previous => {
+      if (!previous.has(rowId)) return previous
+      const next = new Map(previous)
+      next.delete(rowId)
+      return next
+    })
     setExpandedRows((previous) => {
       const next = new Set(previous)
       if (next.has(rowId)) next.delete(rowId)
       else next.add(rowId)
+      return next
+    })
+  }, [])
+  const toggleCodePath = React.useCallback((rowId: number, path: string, forceExpanded: boolean) => {
+    const update = forceExpanded ? setClosedGlobalCodePaths : setExpandedCodePaths
+    update(previous => {
+      const next = new Map(previous)
+      const paths = new Set(previous.get(rowId))
+      if (paths.has(path)) paths.delete(path)
+      else paths.add(path)
+      if (paths.size === 0) next.delete(rowId)
+      else next.set(rowId, paths)
       return next
     })
   }, [])
@@ -5053,6 +5143,8 @@ export function Chat({
       // contract) — so paging back home clears the new-messages pill too.
       const viewport = handle?.getViewportHeight() ?? 0
       const page = viewport > 1 ? viewport - 1 : 12
+      // A deferred rail seek must not override this newer scroll intent.
+      cancelPendingSeek()
       handle?.scrollBy(key.pageUp ? -page : page)
       event.stopImmediatePropagation()
       return
@@ -5070,7 +5162,13 @@ export function Chat({
     if (questionSnapshot !== null) {
       // Only transcript navigation belongs here. The mounted questionnaire
       // owns fold/expand keys, including when it interrupts another screen.
-      if (questionMinimized && !isSticky && (isPlainReturnInput(input, key) || key.end)) {
+      // End at the apparent bottom still cancels an unmounted pending seek;
+      // Enter at the bottom keeps its existing no-op behavior.
+      if (
+        questionMinimized &&
+        ((!isSticky && isPlainReturnInput(input, key)) || (key.end && (!isSticky || pendingSeekRef.current)))
+      ) {
+        cancelPendingSeek()
         handle?.scrollToBottom()
         event.stopImmediatePropagation()
       }
@@ -5897,6 +5995,7 @@ export function Chat({
       // transcript search instead of slash-command completion after Help
       // closes.
       setExpanded(previous => !previous)
+      setClosedGlobalCodePaths(new Map())
       // The toggle rewrites every thinking row's layout at once. The
       // ordinary scroll-based diff pushes rows into terminal scrollback on
       // each expand and nothing removes them on collapse — rapid toggling
@@ -5987,12 +6086,14 @@ export function Chat({
       // Enter while scrolled up returns to the bottom: the
       // affordance now exists whenever the view is off the bottom, not
       // only with unseen rows).
+      cancelPendingSeek()
       handle?.scrollToBottom()
-    } else if (key.end && !isSticky) {
+    } else if (key.end && (!isSticky || pendingSeekRef.current)) {
       // End = jump to bottom, less/vim semantics. Global on the chat
       // screen (search/history overlays consume their own End first —
       // cursor-to-line-end there). At the bottom already: no-op, so the
       // key stays harmless in muscle memory.
+      cancelPendingSeek()
       handle?.scrollToBottom()
       event.stopImmediatePropagation()
     } else if (extensionShortcuts !== undefined && extensionShortcuts.dispatch(input, key)) {
@@ -7178,8 +7279,10 @@ export function Chat({
             // compares against — and the header would flip to the previous
             // turn immediately after the click.
             const turn = timeline.turns.find(t => t.id === anchorUserRowId)
-            if (turn) handle?.scrollTo(turn.top)
-            else if (anchorUserRowId !== null) seekRow(anchorUserRowId)
+            if (turn) {
+              cancelPendingSeek()
+              handle?.scrollTo(turn.top)
+            } else if (anchorUserRowId !== null) seekRow(anchorUserRowId)
             else handle?.scrollToBottom()
           }}
         />
@@ -7192,7 +7295,7 @@ export function Chat({
           and cards keep the content column). No explicit width: cross-axis
           stretch with the margin yields exactly content+margin. */}
       <Box flexDirection="row" flexGrow={1} flexShrink={1} marginRight={sidePanel.split ? 0 : -pageInsetX}>
-        <ScrollBox ref={setHandle} flexDirection="column" flexGrow={1} flexShrink={1} stickyScroll>
+        <ScrollBox ref={setHandle} onScrollByIntent={cancelPendingSeekOnScroll} flexDirection="column" flexGrow={1} flexShrink={1} stickyScroll>
         <LogoHeader
           key={logoNonce}
           model={channel.modelDisplay ?? channel.model}
@@ -7235,6 +7338,9 @@ export function Chat({
           failureHint={t('traj-hint-failure', { key: primaryComboString('trajectory') })}
           expanded={expanded}
           expandedRows={expandedRows}
+          expandedCodePaths={expandedCodePaths}
+          closedGlobalCodePaths={closedGlobalCodePaths}
+          onToggleCodePath={toggleCodePath}
           selectedId={selectionActive ? selectedId : null}
           onToggleRow={toggleRowExpanded}
           streamViewToggledRows={streamViewToggledRows}
@@ -7254,7 +7360,7 @@ export function Chat({
           fullscreen={fullscreen}
           onToggleAll={() =>{  setShowAllMessages(previous => !previous) }}
           onLoadOlder={() => channel.loadOlder()}
-          onRevealCollapsed={(rowId) => { channel.revealRow(rowId) }}
+          onRevealCollapsed={revealCollapsedRow}
           registerRowRef={registerRowRef}
           scrollHandle={handle}
           forceMountRowId={forceMountRowId}
@@ -7281,18 +7387,17 @@ export function Chat({
           const gutter = normalizeScrollGutter(channel.scrollGutter)
           if (gutter === 'hidden') return null
           if (gutter === 'scrollbar') {
-            return <ScrollbarGutter handle={handle} terminalWidth={chatColumns} />
+            return <ScrollbarGutter handle={handle} terminalWidth={chatColumns} onScrollToIntent={cancelPendingSeekOnScroll} />
           }
           return (
             <TimelineRail
               handle={handle}
               turns={timeline.turns}
               activeId={timeline.activeId}
-              upId={timeline.upId}
-              downId={timeline.downId}
               terminalWidth={chatColumns}
               hoverEnabled={!promptSelectionActive}
               onRevealTurn={revealAndSeekRow}
+              onJumpTurn={jumpToTurnRow}
             />
           )
         })()}
@@ -7305,7 +7410,10 @@ export function Chat({
         {showPill && (
           <NewMessagesPill
             count={unseenCount}
-            onClick={() => handle?.scrollToBottom()}
+            onClick={() => {
+              cancelPendingSeek()
+              handle?.scrollToBottom()
+            }}
           />
         )}
         {channel.working &&

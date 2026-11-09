@@ -379,12 +379,24 @@ export function attachDshExtensions(
 
   // The bound session's translated record, cut into chunks by the seed replay
   // (see `replaySessionSeed`): the newest chunk is projected for the first
-  // paint, every older one is represented by its digest row plus its prompt
-  // rows until "load earlier" projects it in place.
+  // paint, every older one has one digest row and navigation-only prompt
+  // metadata until a reveal projects it in place.
   let seedChunks: readonly HistoryChunk[] | undefined
   let seedEntries: readonly AgentEvent[] = []
   const loadedChunks = new Set<number>()
   const placeholderCounts = new Map<number, number>()
+  /** Rows a projected chunk currently occupies (its digest line included),
+   *  so folding it back replaces exactly its own slice. */
+  const chunkSpans = new Map<number, number>()
+  /** Reveal recency per projected chunk: the LRU key for eviction. */
+  const chunkTouched = new Map<number, number>()
+  let touchSeq = 0
+  /** Projected chunks kept resident. Beyond this the least recently revealed
+   *  one folds back to its digest line; scrolling onto it reloads on sight. */
+  const MAX_LOADED_CHUNKS = 6
+  // Keep aliases until the next seed/clear: a tick already painted before an
+  // on-sight load must still seek its exact prompt, not a colliding row offset.
+  const turnTargets = new Map<number, { readonly chunk: HistoryChunk; readonly seq: number }>()
   /**
    * Presenting a settled result's card costs real time on a long record
    * (`presentResultView` over 16k results is ~730 ms of a 1.8 s titan
@@ -434,8 +446,55 @@ export function attachDshExtensions(
     state.rows.splice(at, placeholderCounts.get(chunk.index) ?? 1, ...rows)
     loadedChunks.add(chunk.index)
     placeholderCounts.delete(chunk.index)
+    chunkSpans.set(chunk.index, rows.length)
+    chunkTouched.set(chunk.index, ++touchSeq)
     markChannelReadDirty(state.rows)
     return rows.length
+  }
+
+  /** Put one projected chunk back behind its digest line. Rows are only a
+   *  cache: the durable log still holds the chunk, and scrolling back onto the
+   *  digest re-projects it on sight (MessageList's load-on-sight → revealRow),
+   *  so nothing the reader can see is lost. */
+  const foldChunkBack = (chunk: HistoryChunk): void => {
+    const at = state.rows.findIndex(row => row.id === chunk.idBase)
+    if (at < 0) return
+    const rows = placeholderRows(chunk, collapsed => chunkDigest(collapsed, false), seedEntries)
+    for (const turn of rows[0]!.collapsedTurns!) turnTargets.set(turn.id, { chunk, seq: turn.seq })
+    state.rows.splice(at, chunkSpans.get(chunk.index) ?? 1, ...rows)
+    placeholderCounts.set(chunk.index, rows.length)
+    chunkSpans.delete(chunk.index)
+    chunkTouched.delete(chunk.index)
+    loadedChunks.delete(chunk.index)
+    markChannelReadDirty(state.rows)
+  }
+
+  /** Keep the projected-chunk window bounded. Every reveal used to leave its
+   *  chunk permanently spliced into the row array, so a reader who clicked
+   *  through rail ticks grew the transcript without limit: row count is the
+   *  O(rows) term of every frame's geometry pass, which is why a long-running
+   *  TUI got slower the more of the conversation it had loaded. The newest
+   *  chunk (the live tail) is never evicted, and neither is the chunk the
+   *  caller just asked for. */
+  const evictStaleChunks = (keep: HistoryChunk): void => {
+    if (seedChunks === undefined) return
+    const newest = seedChunks[seedChunks.length - 1]
+    while (loadedChunks.size > MAX_LOADED_CHUNKS) {
+      let victim: HistoryChunk | undefined
+      let victimTouch = Number.POSITIVE_INFINITY
+      for (const chunk of seedChunks) {
+        if (!loadedChunks.has(chunk.index)) continue
+        if (chunk.index === keep.index) continue
+        if (newest !== undefined && chunk.index === newest.index) continue
+        const touched = chunkTouched.get(chunk.index) ?? 0
+        if (touched < victimTouch) {
+          victimTouch = touched
+          victim = chunk
+        }
+      }
+      if (victim === undefined) return
+      foldChunkBack(victim)
+    }
   }
 
   /**
@@ -448,7 +507,9 @@ export function attachDshExtensions(
     for (let index = seedChunks.length - 1; index >= 0; index -= 1) {
       const chunk = seedChunks[index]!
       if (loadedChunks.has(chunk.index)) continue
-      return materializeChunk(chunk)
+      const loaded = materializeChunk(chunk)
+      if (loaded > 0) evictStaleChunks(chunk)
+      return loaded
     }
     return 0
   }
@@ -458,22 +519,26 @@ export function attachDshExtensions(
    * transcript calls when a collapsed section line scrolls into view (and what
    * a timeline tick on such a turn calls): only that one chunk is projected,
    * never the rest of the history — expanding all of it is what made a reveal
-   * crawl on a titan record. Returns the id of the digest line that the loaded
-   * chunk now owns (it survives materialization: `idBase` is the chunk's first
-   * row either way), so a caller can keep the reader anchored; 0 = nothing to
-   * reveal (a live row, an already loaded chunk, a stale plan).
+   * crawl on a titan record. Returns the exact prompt row for a navigation
+   * handle, or the surviving digest id for an on-sight section reveal;
+   * 0 = nothing to reveal (a live row, an already loaded real row, a stale plan).
    */
   const revealChunkRow = (rowId: number): number => {
     if (seedChunks === undefined) return 0
-    const chunk = chunkForRow(seedChunks, rowId)
-    if (chunk === undefined || loadedChunks.has(chunk.index)) return 0
-    const loaded = materializeChunk(chunk)
-    if (loaded === 0) return 0
-    // The reader is already looking at this line: without the emit the splice
-    // lands in `state.rows` but no view commit follows, so the digest line
-    // stays painted until the next wheel tick — the reveal looked like a no-op.
-    state.emit()
-    return chunk.idBase
+    const target = turnTargets.get(rowId)
+    const chunk = target?.chunk ?? chunkForRow(seedChunks, rowId)
+    if (chunk === undefined) return 0
+    if (!loadedChunks.has(chunk.index)) {
+      if (materializeChunk(chunk) === 0) return 0
+      evictStaleChunks(chunk)
+      // The splice must publish before the force-mount/seek, without waiting
+      // for another input (also used by load-on-sight).
+      state.emit()
+    } else if (target === undefined) return 0
+    if (target === undefined) return chunk.idBase
+    // Event offsets are not projected row offsets. Resolve the exact human
+    // prompt after projection, not the section heading or the first prompt.
+    return state.rows.find(row => row.kind === 'user' && row.label !== 'team-message' && row.seq === target.seq)?.id ?? 0
   }
 
   const dshLocal = createLocalActions({
@@ -514,6 +579,14 @@ export function attachDshExtensions(
     // The DSH workspace may be remote: no local-disk stand-in for `fs`.
     localFs: false,
     dropRows: () => {
+      seedChunks = undefined
+      seedEntries = []
+      loadedChunks.clear()
+      placeholderCounts.clear()
+      chunkSpans.clear()
+      chunkTouched.clear()
+      turnTargets.clear()
+      presentDeferredResults = entries => entries
       subagentProjection.dropRows()
       jobProjection.dropRows()
     },
@@ -658,8 +731,8 @@ export function attachDshExtensions(
     // record: 1,766 ms for 27,907 rows). Dropping the rows does not help — the
     // cost is the per-event fold over ~335 MB of message and tool text — so
     // the pass itself is what has to shrink. The record is cut into turn-
-    // aligned chunks (history-chunks.ts); every older chunk keeps a digest row
-    // and its prompt rows, and "load earlier" projects it in place.
+    // aligned chunks (history-chunks.ts); every older chunk keeps one digest
+    // row with navigation-only prompt metadata, and loads in place on demand.
     markBoot('seed-enter')
     const entries = dshNative().translateReplay(events, { present: false })
     markBoot('translate-done')
@@ -667,6 +740,9 @@ export function attachDshExtensions(
     seedChunks = planChunks(entries)
     loadedChunks.clear()
     placeholderCounts.clear()
+    chunkSpans.clear()
+    chunkTouched.clear()
+    turnTargets.clear()
     // What a deferred card payload needs: the call's name and arguments (its
     // presenter input) and the raw result event. Raw events outlive the seed
     // in the caller anyway; these two indexes only hold references to them.
@@ -714,7 +790,8 @@ export function attachDshExtensions(
     state.rows.length = 0
     for (const chunk of seedChunks) {
       if (chunk.index === newest.index) continue
-      const rows = placeholderRows(chunk, collapsed => chunkDigest(collapsed, false))
+      const rows = placeholderRows(chunk, collapsed => chunkDigest(collapsed, false), entries)
+      for (const turn of rows[0]!.collapsedTurns!) turnTargets.set(turn.id, { chunk, seq: turn.seq })
       placeholderCounts.set(chunk.index, rows.length)
       state.rows.push(...rows)
     }

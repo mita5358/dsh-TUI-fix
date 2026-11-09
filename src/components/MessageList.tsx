@@ -2,7 +2,7 @@ import React, { useState } from 'react'
 import { getLang, subscribeLang, t, type Lang } from '../i18n.js'
 import { Box, Text, useTerminalSize, type ScrollBoxHandle } from '../ui.js'
 import type { ClickEvent } from '../ink/events/click-event.js'
-import type { ChatRow, ToolRow, ToolCallView, ToolResultView, SubagentRow, JobGroupRow, JobRow } from '../dsh-adapter/channel.js'
+import type { ChatRow, ToolRow, ToolCallView, ToolResultView, SubagentRow, JobGroupRow, JobRow, SubagentGroupRow } from '../dsh-adapter/channel.js'
 import type { TurnUsageSummary } from '../adapter/ports/channel-view.js'
 import type { JobGroupFoldMode } from '../tuiDisplayPrefs.js'
 import { normalizeIdePath } from '../dsh-adapter/ide-channel.js'
@@ -16,8 +16,10 @@ import { liveOutputMaxLines, liveOutputRows } from './messages/liveOutputLines.j
 import { SubagentMessage } from './Chat/SubagentMessage.js'
 import { JobCard } from './Chat/JobCard.js'
 import { JobGroupHeader } from './Chat/JobGroupHeader.js'
+import { SubagentGroupHeader } from './Chat/SubagentGroupHeader.js'
 import { isMinimalUiMode } from '../minimalUiMode.js'
 import { noteFrameCause, noteListGeometry } from '../ink/geometry-trace.js'
+import { noteRowWindow } from '../ink/frame-stats.js'
 import { getTerminalFlushTick } from '../ink/flush-tick.js'
 import { TurnInterruptedRow } from './TurnInterruptedRow.js'
 import { TurnUsageRow } from './TurnUsageRow.js'
@@ -29,7 +31,7 @@ import { stripNarration } from '../utils/narration.js'
 import { foldLongLines } from '../utils/fold-long-lines.js'
 import { stringWidth } from '../ink/stringWidth.js'
 import { truncateToWidth } from '../ink/truncateToWidth.js'
-import { clipPreview, type TimelineSnapshot, type TimelineTurn } from '../ink/timeline-rail.js'
+import { clipPreview, timelineTargets, type TimelineSnapshot, type TimelineTurn } from '../ink/timeline-rail.js'
 import type { ToolBackground } from '../tuiDisplayPrefs.js'
 import { getRevealVersion, revealLengthOf, revealTextOf, scopeRevealKey } from './smoothReveal.js'
 import { useRevealScope } from './revealScope.js'
@@ -57,6 +59,16 @@ import { primaryComboString } from '../utils/keymap.js'
  *  is a viewport, not a printout; load-earlier restores older rows. */
 const RENDERED_ROW_CAP = 120
 
+/** Extra rows one wheel-up gesture at the top edge pages in. The transcript
+ *  stays anchored where the reader is; the newly mounted block sits above the
+ *  old floor until they scroll into it, so a page-in never teleports the
+ *  viewport (or the rail) to the oldest row. */
+const TOP_PAGE_ROWS = 100
+
+/** A wheel-up burst at the top edge must SETTLE for this long before a page
+ *  commits: one mount per gesture, not one per notch. */
+const TOP_PAGE_SETTLE_MS = 180
+
 /** Threshold of the `auto` jobGroupFold policy: a run of this many (or
  *  more) FULLY SETTLED jobs folds into its own summary line. Two jobs are
  *  still a pair worth reading card by card — the group rail alone already
@@ -64,6 +76,14 @@ const RENDERED_ROW_CAP = 120
  *  Ctrl+O and a click on the summary reopen any group; clicking again folds
  *  it back. */
 const JOB_GROUP_FOLD_MIN = 3
+
+/** Threshold of the subagent group fold: a fan-out lands as N adjacent `⑂`
+ *  task cards; a run of this many (or more) FULLY SETTLED cards folds into
+ *  its group header. A pair stays card-by-card (the shared header already
+ *  saves their separator lines), and a live worker keeps its card visible —
+ *  work in flight must never be folded away. Ctrl+O and a header click reopen
+ *  the run; clicking again folds it back. */
+const SUBAGENT_GROUP_MIN = 3
 
 // --- layout virtualization constants -------------------------------------
 // Offscreen rows render as fixed-height spacers whose heights come from the
@@ -87,6 +107,7 @@ const DEFAULT_HEADER_LINES = 14
  *  render must not throw (same rule as Chat's stubbed channel APIs). Module
  *  scope keeps the identities stable so MemoRow's shallow compare and the
  *  toggle callback's deps never churn. */
+const NO_EXPANDED_CODE_PATHS: ReadonlyMap<number, ReadonlySet<string>> = new Map()
 const NO_STREAM_VIEW_TOGGLED: ReadonlySet<number> = new Set()
 const NOOP_TOGGLE_STREAM_VIEW = (_rowId: number): void => {}
 
@@ -200,8 +221,8 @@ export function displaySelectionPath(
  * degrades to the previous behavior.
  *
  * Returns a PARTS VECTOR instead of a joined string: the caller compares
- * slot-by-slot against the cached vector (all primitives), allocating only
- * when a row's inputs actually changed. Building a joined string per row
+ * slot-by-slot against the cached vector (primitives plus immutable per-row
+ * disclosure sets), allocating only when a row's inputs actually changed. Building a joined string per row
  * per render was O(rows) allocation churn on every scroll tick — the GC
  * share of the long-session scroll profile.
  *
@@ -210,7 +231,8 @@ export function displaySelectionPath(
  * majority) allocates nothing. Callers that retain the vector must copy
  * (parts.slice()).
  */
-const signatureScratch: Array<string | number | boolean> = []
+type SignaturePart = string | number | boolean | ReadonlySet<string>
+const signatureScratch: SignaturePart[] = []
 
 /** Status code for the job-group fingerprint (a hash input only — the values
  *  just have to be distinct per status). */
@@ -225,11 +247,25 @@ function jobStatusCode(status: string): number {
   }
 }
 
+/** Coarse subagent-status code for the run fingerprint (see `subagentsSig`). */
+function subagentStatusCode(status: string): number {
+  switch (status) {
+    case 'starting': return 1
+    case 'running': return 2
+    case 'completed': return 3
+    case 'failed': return 4
+    case 'cancelled': return 5
+    default: return 7
+  }
+}
+
 function signatureParts(
   row: ChatRow,
   columns: number,
   expanded: boolean,
   expandedRows: ReadonlySet<number>,
+  expandedCodePaths: ReadonlyMap<number, ReadonlySet<string>>,
+  closedGlobalCodePaths: ReadonlyMap<number, ReadonlySet<string>>,
   streamViewToggledRows: ReadonlySet<number>,
   thinkingVisible: boolean,
   thinkingFold: string,
@@ -241,7 +277,7 @@ function signatureParts(
   displayTextLen: number,
   sessionCwd: string | undefined,
   fullscreen: boolean,
-): Array<string | number | boolean> {
+): SignaturePart[] {
   signatureScratch.length = 0
   // Universal height inputs: width reflows every row; kind switches height
   // semantics wholesale; text length drives wrapping. `displayTextLen` is the
@@ -258,7 +294,7 @@ function signatureParts(
       // Streaming vs settled swaps renderers; Ctrl+O/per-row expand adds the
       // metadata row (model only renders expanded — keeps an idle /model
       // switch from touching settled rows).
-      signatureScratch.push(row.streaming === true, expanded, expandedRows.has(row.id), expanded ? model : '')
+      signatureScratch.push(row.streaming === true, expanded, expandedRows.has(row.id), expanded ? model : '', expandedCodePaths.get(row.id) ?? '', closedGlobalCodePaths.get(row.id) ?? '')
       break
     case 'reasoning':
       // thinkingFold (preview vs full), its per-row live override, and the
@@ -303,6 +339,10 @@ function signatureParts(
         row.subagent?.toolCalls.length ?? 0,
         row.subagent?.outputLines.length ?? 0,
         row.subagent?.error?.length ?? 0,
+        // A group head adds a summary; a folded group drops every card body.
+        row.subagentGroup !== undefined,
+        row.subagentGroup?.head === true,
+        row.subagentGroup?.folded === true,
       )
       break
     case 'job': {
@@ -380,6 +420,9 @@ export function MessageList({
   rows,
   expanded,
   expandedRows,
+  expandedCodePaths = NO_EXPANDED_CODE_PATHS,
+  closedGlobalCodePaths = NO_EXPANDED_CODE_PATHS,
+  onToggleCodePath,
   selectedId,
   onToggleRow,
   streamViewToggledRows = NO_STREAM_VIEW_TOGGLED,
@@ -404,6 +447,7 @@ export function MessageList({
   registerRowRef,
   scrollHandle,
   forceMountRowId,
+  onSeekReady,
   newSinceRowId,
   onUnseenCount,
   onTimeline,
@@ -421,6 +465,9 @@ export function MessageList({
   rows: readonly ChatRow[]
   expanded: boolean
   expandedRows: ReadonlySet<number>
+  expandedCodePaths?: ReadonlyMap<number, ReadonlySet<string>>
+  closedGlobalCodePaths?: ReadonlyMap<number, ReadonlySet<string>>
+  onToggleCodePath?: (rowId: number, path: string, forceExpanded: boolean) => void
   selectedId: number | null
   onToggleRow: (rowId: number) => void
   /** 流式 reasoning 行相对 thinkingFold 默认视图的逐行切换。 */
@@ -484,6 +531,9 @@ export function MessageList({
   scrollHandle?: ScrollBoxHandle | null
   /** Row that must be mounted this pass (seek target for scrollToElement). */
   forceMountRowId?: number | null
+  /** Complete an explicit seek only after mounted-row geometry has settled.
+   *  Supplies the prompt-text offset inside its wrapper (including margin). */
+  onSeekReady?: (rowId: number, textOffset: number) => void
   /** "Seen up to" anchor for the new-messages pill: rows with id greater
    *  than this are new. Null when pinned to the bottom (nothing unseen). */
   newSinceRowId?: number | null
@@ -543,7 +593,71 @@ export function MessageList({
   // Reveal memory is per Chat root: a recompose can mount this transcript
   // under a fresh root, and each root owns its row ids.
   const revealScope = useRevealScope()
-  const hiddenCount = rows.length - RENDERED_ROW_CAP
+  /** Rows a top-edge wheel gesture has paged in beyond RENDERED_ROW_CAP.
+   *  Reset when the transcript is replaced (new session / rewind), not when
+   *  rows are appended or prepended in place. */
+  const [topPaged, setTopPaged] = React.useState(0)
+  const transcriptIdentityRef = React.useRef(rows)
+  /**
+   * Window floor a force-mounted seek pinned, keyed on the row it landed on
+   * (null: none).
+   *
+   * The row window is a SUFFIX of `rows`: rows above the floor are outside
+   * the content model entirely (`topPad` starts at zero there, so it cannot
+   * stand in for them). A rail click on an old turn therefore has to give
+   * that turn a floor of its own, and the floor must OUTLIVE the force-mount
+   * release — lowering it back would unmount the row we just landed on and
+   * clamp the viewport to the tail again (the "click did nothing" bug).
+   *
+   * Validity is the LANDED ROW, not the transcript identity: projecting a
+   * chunk splices rows in place but publishes a fresh `rows` reference (the
+   * channel rebuilds its view on every emit), so an identity reset fires
+   * mid-seek and drops the floor back to the 120-row suffix — which is the
+   * "click loads, then the screen snaps to the tail" drift. When the row
+   * itself is gone (new session, rewind, or the chunk got folded back) the
+   * floor no longer means anything and is dropped.
+   */
+  const seekFloorRef = React.useRef<{ floor: number; id: number } | null>(null)
+  /**
+   * A seek owns the viewport until the reader scrolls again.
+   *
+   * Landing on an old row can put a neighbouring chunk's section line on
+   * screen; load-on-sight would then project it ~120ms later, and that
+   * projection evicts the chunk the reader just asked for (the eviction
+   * policy keeps the newest chunk plus the one being loaded) — the landed
+   * row unmounts and the viewport falls back to wherever the position
+   * happens to land. Only wheel/page-key debt proves the reader is browsing,
+   * so that is the sole thing that re-arms projection after a seek.
+   */
+  const seekSettleRef = React.useRef(false)
+  React.useEffect(() => {
+    if (transcriptIdentityRef.current === rows) return
+    transcriptIdentityRef.current = rows
+    setTopPaged(0)
+  }, [rows])
+  const windowRows = showAll ? rows.length : RENDERED_ROW_CAP + topPaged
+  let hiddenCount = Math.max(0, rows.length - windowRows)
+  // A pending seek outside the window must join the content model FIRST:
+  // for an index above the floor `visibleRows.findIndex` misses (the target
+  // is not in the slice) and the force-mount would mount nothing. Keep one
+  // row of context above the target so the landing is not the very first
+  // content row (scrollTop 0 would arm the top-edge pager on every click).
+  if (forceMountRowId !== undefined && forceMountRowId !== null) {
+    const target = rows.findIndex(row => row.id === forceMountRowId)
+    if (target >= 0) {
+      const floor = Math.max(0, target - 1)
+      const held = seekFloorRef.current
+      if (held === null || held.id !== forceMountRowId || floor < held.floor) {
+        seekFloorRef.current = { floor, id: forceMountRowId }
+      }
+      seekSettleRef.current = true
+    }
+  }
+  if (seekFloorRef.current !== null) {
+    const held = seekFloorRef.current
+    if (rows.findIndex(row => row.id === held.id) < 0) seekFloorRef.current = null
+    else if (held.floor < hiddenCount) hiddenCount = held.floor
+  }
   // The thinking filter runs BEFORE virtualization so window indices line up.
   //
   // Fingerprint memo: every scroll tick re-rendered this pipeline even when
@@ -558,6 +672,9 @@ export function MessageList({
     rows: readonly ChatRow[]
     rowsLength: number
     showAll: boolean
+    /** Window floor (`hiddenCount`): a top-edge page-in mounts older rows
+     *  without touching the row array or showAll. */
+    floor: number
     thinkingVisible: boolean
     out: readonly ChatRow[]
     margins: ReadonlyMap<number, boolean>
@@ -565,9 +682,17 @@ export function MessageList({
      * in place, rows identity/length unchanged) changes empty-assistant
      * filtering below, so the cache must rebuild on any bit change. */
     streamBits: Uint8Array
+    /** Row-object snapshot. A live projection may swap ONE entry for a fresh
+     *  copy without touching the array identity or its length (re-rendered
+     *  row, patched text); pointer-comparing against this snapshot is the
+     *  only way the cached slice stops aliasing the replaced object. */
+    rowRefs: readonly ChatRow[]
     /** Job-status/toggle fingerprint (see below): job cards settle IN PLACE,
      *  and a settling run changes how — and whether — its members render. */
     jobsSig: number
+    /** Same contract for subagent runs: a worker settling in place — or the
+     *  reader opening a folded run — changes whether its members render. */
+    subagentsSig: number
     /** Turn-usage row toggle: flipping it adds/removes turn-summary rows
      *  from the visible window without touching the row array. */
     turnRowOn: boolean
@@ -587,6 +712,16 @@ export function MessageList({
       if (bits[i] !== (rows[i]!.streaming === true ? 1 : 0)) { streamBitsSame = false; break }
     }
   }
+  // Entry-replacement fingerprint: same array, same length, one row object
+  // swapped. Pointer compares only (no allocation per tick); the snapshot is
+  // copied once per rebuild.
+  let refsSame = visibleCache !== null && visibleCache.rowRefs.length === rows.length
+  if (refsSame) {
+    const refs = visibleCache!.rowRefs
+    for (let i = 0; i < rows.length; i++) {
+      if (refs[i] !== rows[i]) { refsSame = false; break }
+    }
+  }
   // Job-group fingerprint: job statuses land IN PLACE (`row.job` is
   // re-assigned by the projection, the row array never moves) and the expand
   // toggles live in a Set — none of that shows up in the rows identity or
@@ -599,15 +734,30 @@ export function MessageList({
     if (row.kind !== 'job' || row.job === undefined) continue
     jobsSig = (jobsSig * 33 + row.id + jobStatusCode(row.job.status) + (expandedRows.has(row.id) ? 7 : 0)) | 0
   }
+  // Subagent-run fingerprint: identical contract to jobsSig, because a
+  // worker settles in place and the group fold lives in `expandedRows` —
+  // neither moves the row array, yet both decide whether the run's members
+  // stay in the visible window. Without this the click that opens a folded
+  // run reads the cached slice (still folded) until something else changes.
+  let subagentsSig = expanded ? 1 : 0
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]!
+    if (row.kind !== 'subagent' || row.subagent === undefined) continue
+    subagentsSig = (subagentsSig * 33 + row.id + subagentStatusCode(row.subagent.status) +
+      (row.subagent.completedAt === undefined ? 0 : 11) + (expandedRows.has(row.id) ? 7 : 0)) | 0
+  }
   if (
     visibleCache === null ||
     visibleCache.rows !== rows ||
     visibleCache.rowsLength !== rows.length ||
     visibleCache.showAll !== (showAll || hiddenCount <= 0) ||
+    visibleCache.floor !== hiddenCount ||
     visibleCache.thinkingVisible !== thinkingVisible ||
     visibleCache.jobsSig !== jobsSig ||
+    visibleCache.subagentsSig !== subagentsSig ||
     visibleCache.turnRowOn !== turnUsageRow ||
-    !streamBitsSame
+    !streamBitsSame ||
+    !refsSame
   ) {
     const sliced = showAll || hiddenCount <= 0
       ? rows
@@ -753,6 +903,66 @@ export function MessageList({
       }
       i = end
     }
+    // --- consecutive-subagent groups -------------------------------------
+    // A fan-out lands as N adjacent `⑂` task cards. A run of ≥2 shares a
+    // header (and drops the blank line between cards, exactly like job
+    // groups); once every member has settled, a run of SUBAGENT_GROUP_MIN
+    // folds into that header. Live workers keep the run open — a subagent
+    // still running must never disappear into a summary. Same gestures as
+    // every other fold: header click, per-row toggle, or Ctrl+O.
+    for (let i = 0; i < out.length; i++) {
+      const head = out[i]!
+      if (head.kind !== 'subagent' || head.subagent === undefined) continue
+      let end = i
+      while (end + 1 < out.length) {
+        const next = out[end + 1]!
+        if (next.kind !== 'subagent' || next.subagent === undefined) break
+        end++
+      }
+      const count = end - i + 1
+      if (count < 2) {
+        i = end
+        continue
+      }
+      let live = 0
+      let completed = 0
+      let failed = 0
+      let startedAt = Number.POSITIVE_INFINITY
+      let endedAt: number | undefined
+      for (let k = i; k <= end; k++) {
+        const sub = out[k]!.subagent!
+        if (sub.status === 'starting' || sub.status === 'running') live++
+        else if (sub.status === 'completed') completed++
+        else if (sub.status === 'failed' || sub.status === 'cancelled') failed++
+        startedAt = Math.min(startedAt, sub.startedAt)
+        if (sub.completedAt !== undefined) endedAt = Math.max(endedAt ?? sub.completedAt, sub.completedAt)
+      }
+      // A live member means the run is not over: no duration to freeze.
+      if (live > 0) endedAt = undefined
+      const folded = count >= SUBAGENT_GROUP_MIN && live === 0 &&
+        !expanded && !expandedRows.has(head.id)
+      for (let k = i; k <= end; k++) {
+        // Copy-on-write, for the same frozen-row reason as job groups.
+        out[k] = {
+          ...(out[k]!),
+          subagentGroup: {
+            head: k === i,
+            last: k === end,
+            count,
+            folded,
+            live,
+            completed,
+            failed,
+            startedAt,
+            ...(endedAt === undefined ? {} : { endedAt }),
+          },
+        }
+      }
+      if (folded) {
+        for (let k = i + 1; k <= end; k++) foldedMembers.add(out[k]!.id)
+      }
+      i = end
+    }
     const visibleOut = foldedMembers.size === 0 ? out : out.filter(row => !foldedMembers.has(row.id))
     // Every rendered block gets a 1-row top margin except the first. Pre-pass
     // over the FULL list so a windowed row keeps the exact spacing it would
@@ -762,7 +972,8 @@ export function MessageList({
     {
       let prev: ChatRow['kind'] | undefined
       for (const row of visibleOut) {
-        const member = row.jobGroup !== undefined && !row.jobGroup.head
+        const member = (row.jobGroup !== undefined && !row.jobGroup.head) ||
+          (row.subagentGroup !== undefined && !row.subagentGroup.head)
         margins.set(row.id, prev !== undefined && !member)
         prev = row.kind
       }
@@ -773,11 +984,14 @@ export function MessageList({
       rows,
       rowsLength: rows.length,
       showAll: showAll || hiddenCount <= 0,
+      floor: hiddenCount,
       thinkingVisible,
       out: visibleOut,
       margins,
       streamBits,
+      rowRefs: rows.slice(),
       jobsSig,
+      subagentsSig,
       turnRowOn: turnUsageRow,
     }
     visGenRef.current++
@@ -904,7 +1118,7 @@ export function MessageList({
   // every scroll tick) allocates nothing. A joined string per row per
   // render was O(rows) garbage per tick (3200-row session ⇒ several MB/s
   // into minor GC; the GC share of the scroll profile).
-  const sigRef = React.useRef(new Map<number, Array<string | number | boolean>>())
+  const sigRef = React.useRef(new Map<number, SignaturePart[]>())
   let growingStreamNeedsMeasure = false
   {
     const sigs = sigRef.current
@@ -921,6 +1135,8 @@ export function MessageList({
         columns,
         expanded,
         expandedRows,
+        expandedCodePaths,
+        closedGlobalCodePaths,
         streamViewToggledRows,
         thinkingVisible,
         thinkingFold,
@@ -978,15 +1194,74 @@ export function MessageList({
   React.useEffect(() => {
     if (!scrollHandle) return
     const tick = (): void =>{
-      autoLoadArmedRef.current = true
+      // Wheel/page-key gestures are the only scroll mutations that carry
+      // pending debt (scrollBy accumulates it; seeks, sticky re-pins and
+      // anchor holds never do), so debt is the signal that the reader — not
+      // a rail jump — is browsing history. Releasing the seek settle here
+      // also keeps a failed seek from disabling projection forever: the
+      // reader's next scroll is exactly the gesture that should project.
+      if (seekSettleRef.current && scrollHandle.getPendingDelta() !== 0) seekSettleRef.current = false
+      if (!seekSettleRef.current) autoLoadArmedRef.current = true
       setScrollTick(t => t + 1)
     }
     return scrollHandle.subscribe(tick)
   }, [scrollHandle])
 
-  // Cached rail/header preview per user row (see the timeline block for why
-  // the length guard exists alongside the id key).
-  const previewCacheRef = React.useRef(new Map<number, { len: number; imageCount: number; lang: Lang; preview: string }>())
+  /** Wheel-up at the very top pages in the next TOP_PAGE_ROWS once the wheel
+   *  stops. An UP-NOTCH at scrollTop 0 (negative pending delta) is the only
+   *  thing that ARMS the clock: a programmatic `scrollTo(0)`, a sticky
+   *  re-pin or a rail seek land at 0 with no wheel debt and never page. The
+   *  renderer's drain then reports again at 0 with the debt consumed — that
+   *  mutation must not cancel the armed clock, it IS "the gesture
+   *  completed". The debounce supplies the rest: one page after the last
+   *  notch, never one page per notch in the middle of a flick. */
+  const topPageTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+  React.useEffect(() => {
+    if (!scrollHandle || showAll || hiddenCount <= 0) return
+    const cancel = (): void => {
+      if (topPageTimerRef.current === null) return
+      clearTimeout(topPageTimerRef.current)
+      topPageTimerRef.current = null
+    }
+    const arm = (): void => {
+      cancel()
+      topPageTimerRef.current = setTimeout(() => {
+        topPageTimerRef.current = null
+        setTopPaged(n => n + TOP_PAGE_ROWS)
+      }, TOP_PAGE_SETTLE_MS)
+    }
+    const onScroll = (): void => {
+      if (scrollHandle.getScrollTop() > 0) {
+        cancel()
+        return
+      }
+      const debt = scrollHandle.getPendingDelta()
+      if (debt > 0) {
+        cancel()
+        return
+      }
+      if (debt < 0) {
+        // A notch landed at the top edge: (re)start the settle clock so a
+        // flick commits one page after its LAST notch.
+        arm()
+        return
+      }
+      // debt === 0 at the top: the renderer drained the up-notch (the drain
+      // notifies again) or a programmatic landing reported in. Keep a clock
+      // the gesture already armed — that drain IS "the gesture completed";
+      // with no gesture armed this stays a no-op, so `scrollTo(0)` from a
+      // seek, a sticky re-pin or the rail never pages.
+    }
+    const unsubscribe = scrollHandle.subscribe(onScroll)
+    return () => {
+      unsubscribe()
+      cancel()
+    }
+  }, [scrollHandle, showAll, hiddenCount])
+
+  // Cache by target and exact prompt text, not just length: another session
+  // may reuse the same numeric ids and equally long but different prompts.
+  const previewCacheRef = React.useRef(new Map<number, { text: string; imageCount: number; lang: Lang; preview: string }>())
 
   const heightOf = (row: ChatRow): number =>
     heightsRef.current.get(row.id) ?? DEFAULT_ROW_HEIGHT
@@ -1017,15 +1292,33 @@ export function MessageList({
   const sticky = scrollHandle?.isSticky() ?? true
   const base = baseRef.current ?? DEFAULT_HEADER_LINES
   const prevAnchor = anchorRef.current
+  // The stored window index is only a HINT: a top-edge page-in, `showAll`,
+  // a fold pass or load-earlier all shift the prefix above the anchor without
+  // moving it on screen. Looking up the stale index anchored a different row
+  // (or, after the prefix grew past it, missed entirely) — that is the
+  // "load all messages jumps to the top" bug. Resolve by row id, then map
+  // back to the current window index.
+  let anchorIndex = -1
+  if (prevAnchor !== null) {
+    if (visibleRows[prevAnchor.index]?.id === prevAnchor.id) anchorIndex = prevAnchor.index
+    else anchorIndex = visibleRows.findIndex(row => row.id === prevAnchor.id)
+  }
+  // `scrollTop === 0` is the one position where no row's top can be <=
+  // scrollTop (the header occupies the top). A page-in above the floor still
+  // must keep the row under the header where it is, so the exception applies
+  // — but ONLY when the anchor row's window index shifted, i.e. content
+  // appeared or vanished ABOVE it. Header growth at Home keeps the index and
+  // must leave the header pinned at the top, not scroll it away.
+  const anchorOwnsTop = prevAnchor !== null && (
+    prevAnchor.top <= prevAnchor.scrollTop ||
+    (prevAnchor.scrollTop === 0 && anchorIndex >= 0 && anchorIndex !== prevAnchor.index)
+  )
   let anchorCorrection = 0
   if (
-    scrollHandle && prevAnchor !== null && prevAnchor.top <= prevAnchor.scrollTop &&
+    scrollHandle && prevAnchor !== null && anchorIndex >= 0 && anchorOwnsTop &&
     !sticky && pending === 0 && scrollTopRaw === prevAnchor.scrollTop
   ) {
-    const anchored = visibleRows[prevAnchor.index]
-    if (anchored !== undefined && anchored.id === prevAnchor.id) {
-      anchorCorrection = prevAnchor.top - (base + (offsets[prevAnchor.index] ?? 0))
-    }
+    anchorCorrection = prevAnchor.top - (base + (offsets[anchorIndex] ?? 0))
   }
   const scrollTop = Math.max(0, scrollTopRaw - anchorCorrection)
 
@@ -1203,8 +1496,17 @@ export function MessageList({
   if (forceMountRowId !== undefined && forceMountRowId !== null) {
     const idx = visibleRows.findIndex(row => row.id === forceMountRowId)
     if (idx !== -1) {
-      start = Math.min(start, idx)
-      end = Math.max(end, idx + 1)
+      // Bounded band around the target, never [target, tail]: the sticky
+      // tail walk above and a plain `end = len` mount every row in between,
+      // which is what turned a far rail click into a 187-row commit (and
+      // then the next frame tightened back to the tail, unmounting the row
+      // before the renderer read its top). The seek anchor only needs the
+      // target at the viewport top: rows ABOVE it are `topPad` and rows
+      // BELOW it are `bottomPad`, both pure spacers, so the landing stays
+      // exact without mounting a single one of them.
+      const band = Math.max(1, Math.min(viewport, termRows) + OVERSCAN_LINES)
+      start = Math.max(0, idx - 1)
+      end = Math.max(Math.min(visibleRows.length, idx + band), idx + 1)
     }
   }
   // The failure footnote is row content, not a seek request. Pinning its
@@ -1214,6 +1516,9 @@ export function MessageList({
   const topPad = offsets[start] ?? 0
   const mountedBottom = end < visibleRows.length ? offsets[end] : total
   const bottomPad = total - mountedBottom
+  // Same numbers, second consumer: the opt-in frame stats line reports the
+  // mount window that produced a slow frame (DSH_TUI_FRAME_STATS=1).
+  noteRowWindow(end - start, visibleRows.length)
   noteListGeometry({
     start,
     end,
@@ -1274,10 +1579,6 @@ export function MessageList({
   // would make ▼ repeat itself forever (the stuck-▼ bug). Reported
   // post-commit, only when the signature changes.
   let timelineTurns: TimelineTurn[] = []
-  let activeTurnIndex: number | null = null
-  let pinnedTurnIndex: number | null = null
-  let upTurnIndex: number | null = null
-  let downTurnIndex: number | null = null
   const timelineMemoRef = React.useRef<{ key: string; turns: TimelineTurn[] } | null>(null)
   {
     // Split into (a) a GEOMETRY-memoized turns list and (b) a per-frame
@@ -1297,81 +1598,62 @@ export function MessageList({
     if (memo === null || memo.key !== memoKey) {
       const previewCache = previewCacheRef.current
       if (previewCache.size > 2000) previewCache.clear()
-      // Measured tops for turns INSIDE the fold window (user rows are never
-      // filtered by the thinking toggle, so a user row absent from
-      // visibleRows is exactly a folded one).
+      // Include collapsed section tops as navigation proxies: after a jump
+      // to an old chunk, an unloaded section may be BELOW the viewport, not
+      // necessarily in the older fold-window prefix.
       const measuredTops = new Map<number, number>()
       for (let i = 0; i < visibleRows.length; i++) {
         const row = visibleRows[i]!
-        if (!isTurnRow(row)) continue
+        if (!isTurnRow(row) && row.collapsed !== true) continue
         measuredTops.set(row.id, base + offsets[i]! + (margins.get(row.id) === true ? 1 : 0))
       }
       // Walk ALL rows (not the fold window): the rail must cover the whole
       // conversation — a tool-heavy session packs 300 rows into a handful
       // of turns, and window-only turns made the rail show "2-3 nodes".
-      // Folded turns carry folded:true + top:-1; their tops are unknown
-      // until revealed (they are all ABOVE the viewport, so active/down
-      // over measured turns is unaffected; ▲ may name a folded turn — its
-      // click goes through the reveal path, not scrollTo).
+      // Unprojected turns come from their section's navigation metadata,
+      // not fake user rows. Their summary top is only a navigation proxy:
+      // ticks must still reveal the exact prompt before seeking it.
       const turns: TimelineTurn[] = []
-      for (const row of rows) {
-        if (!isTurnRow(row)) continue
-        let cached = previewCache.get(row.id)
-        const imageCount = row.images?.length ?? 0
-        if (cached === undefined || cached.len !== row.text.length || cached.imageCount !== imageCount || cached.lang !== lang) {
+      const previewOf = (id: number, text: string, imageCount: number): string => {
+        let cached = previewCache.get(id)
+        if (cached === undefined || cached.text !== text || cached.imageCount !== imageCount || cached.lang !== lang) {
           cached = {
-            len: row.text.length,
+            text,
             imageCount,
             lang,
-            preview: row.text === '' && imageCount > 0
+            preview: text === '' && imageCount > 0
               ? t('transcript-image-message', { count: imageCount })
-              : clipPreview(row.text),
+              : clipPreview(text),
           }
-          previewCache.set(row.id, cached)
+          previewCache.set(id, cached)
         }
+        return cached.preview
+      }
+      for (const row of rows) {
         const textTop = measuredTops.get(row.id)
-        if (textTop !== undefined) {
-          turns.push({ id: row.id, top: textTop, preview: cached.preview })
-        } else {
-          turns.push({ id: row.id, top: -1, preview: cached.preview, folded: true })
+        if (row.collapsed === true) {
+          for (const turn of row.collapsedTurns ?? []) {
+            turns.push({ id: turn.id, top: textTop ?? -1, preview: previewOf(turn.id, turn.text, turn.imageCount), folded: true })
+          }
+        } else if (isTurnRow(row)) {
+          turns.push({
+            id: row.id,
+            top: textTop ?? -1,
+            preview: previewOf(row.id, row.text, row.images?.length ?? 0),
+            ...(textTop === undefined ? { folded: true } : {}),
+          })
         }
       }
       timelineMemoRef.current = { key: memoKey, turns }
     }
     timelineTurns = timelineMemoRef.current!.turns
-    // (b) per-frame target scan — pure integer comparisons over the
-    // memoized list; viewTop is projected (scrollTop + pending) so
-    // boundary crossings register during wheel bursts, not one drain
-    // frame late. downId additionally requires top ≤ maxScroll: the
-    // renderer clamps scrollTop there, so a turn past it could never own
-    // the top row, and naming it would make ▼ repeat itself forever.
-    const viewTop = scrollTop + pending
-    const maxScroll = Math.max(0, (scrollHandle?.getScrollHeight() ?? 0) - viewport)
-    for (let i = 0; i < timelineTurns.length; i++) {
-      const t = timelineTurns[i]!
-      if (t.folded === true) {
-        // Above the fold ⇒ strictly above the viewport: a legal ▲ target.
-        upTurnIndex = i
-        continue
-      }
-      if (t.top <= viewTop) activeTurnIndex = i
-      if (t.top < viewTop) upTurnIndex = i
-      if (downTurnIndex === null && t.top > viewTop && t.top <= maxScroll) {
-        downTurnIndex = i
-      }
-    }
-    if (timelineTurns.length > 0 && activeTurnIndex === null) activeTurnIndex = 0
-    if (activeTurnIndex !== null) {
-      const active = timelineTurns[activeTurnIndex]!
-      if (active.folded === true || active.top < viewTop) pinnedTurnIndex = activeTurnIndex
-    }
   }
+  // (b) Per-frame navigation scan. Known summary proxies participate in
+  // geometry but still require reveal-and-seek; unknown folded prefixes do not
+  // override a measured active turn. Pending scroll is included during bursts.
   const timeline: TimelineSnapshot = {
     turns: timelineTurns,
-    activeId: activeTurnIndex === null ? null : timelineTurns[activeTurnIndex]!.id,
-    pinnedId: pinnedTurnIndex === null ? null : timelineTurns[pinnedTurnIndex]!.id,
-    upId: upTurnIndex === null ? null : timelineTurns[upTurnIndex]!.id,
-    downId: downTurnIndex === null ? null : timelineTurns[downTurnIndex]!.id,
+    ...timelineTargets(timelineTurns, scrollTop + pending, Math.max(0, (scrollHandle?.getScrollHeight() ?? 0) - viewport)),
   }
   const lastTimelineReportRef = React.useRef<TimelineSnapshot | null>(null)
   React.useEffect(() => {
@@ -1408,6 +1690,8 @@ export function MessageList({
   // mounted coverage so burst scrolls never show blank spacer.
   React.useLayoutEffect(() => {
     let changed = false
+    const seekTop = forceMountRowId == null ? undefined : localRefs.current.get(forceMountRowId)?.yogaNode?.getComputedTop()
+    let seekPrefixChanged = false
     // Mounted ⇒ painted: record rows eligible for window skipping.
     const paintedOnce = paintedOnceRef.current
     for (const id of localRefs.current.keys()) {
@@ -1420,6 +1704,7 @@ export function MessageList({
           const oldest = heightsRef.current.keys().next().value
           if (oldest !== undefined) heightsRef.current.delete(oldest)
         }
+        if (seekTop === undefined || (el.yogaNode?.getComputedTop() ?? 0) <= seekTop) seekPrefixChanged = true
         heightsRef.current.set(id, h)
         heightsVersionRef.current++
         changed = true
@@ -1434,6 +1719,7 @@ export function MessageList({
       if (baseRef.current !== measured) {
         baseRef.current = measured
         changed = true
+        seekPrefixChanged = true
       }
     }
     if (scrollHandle) {
@@ -1480,8 +1766,8 @@ export function MessageList({
       const anchorBase = baseRef.current ?? base
       let anchoredTop = scrollHandle.getScrollTop()
       if (
-        prevAnchor !== null && prevAnchor.top <= prevAnchor.scrollTop &&
-        visibleRows[prevAnchor.index]?.id === prevAnchor.id &&
+        prevAnchor !== null && anchorIndex >= 0 && anchorOwnsTop &&
+        visibleRows[anchorIndex]?.id === prevAnchor.id &&
         !scrollHandle.isSticky() && scrollHandle.getPendingDelta() === 0 &&
         anchoredTop === prevAnchor.scrollTop
       ) {
@@ -1517,7 +1803,7 @@ export function MessageList({
     // render-time offset estimate can be stale by the time the reader lands on
     // a band of digest rows, and expanding a chunk above the fold looks like
     // nothing happened.
-    if (autoLoadArmedRef.current) {
+    if (autoLoadArmedRef.current && !seekSettleRef.current) {
       const viewTop = scrollHandle?.getScrollTop()
       if (!sticky && viewTop !== undefined && onRevealCollapsed !== undefined) {
         const middle = viewTop + viewport / 2
@@ -1530,6 +1816,10 @@ export function MessageList({
           const top = yoga?.getComputedTop()
           const height = yoga?.getComputedHeight()
           if (top === undefined || height === undefined) continue
+          // Overscan mounts rows outside the viewport too. Only a digest the
+          // reader can actually see should trigger projection, not a nearby
+          // hidden section after a rail seek.
+          if (top + height <= viewTop || top >= viewTop + viewport) continue
           const distance = Math.abs(top + height / 2 - middle)
           if (distance >= bestDistance) continue
           bestDistance = distance
@@ -1549,6 +1839,12 @@ export function MessageList({
         noteFrameCause('measure')
         setMeasureTick(t => t + 1)
       }, 0)
+    }
+    // A streaming tail below the destination must not starve a historical
+    // seek. Only the destination/prefix geometry can move its text top.
+    const seekGeometrySettled = !changed || (seekTop !== undefined && !seekPrefixChanged)
+    if (seekGeometrySettled && (measureTimerRef.current === null || (!seekPrefixChanged && growingStreamNeedsMeasure)) && forceMountRowId != null) {
+      if (localRefs.current.has(forceMountRowId)) onSeekReady?.(forceMountRowId, margins.get(forceMountRowId) === true ? 1 : 0)
     }
     // History-paint continuation (main-screen open): more never-painted
     // batches remain — schedule the next slice on the macrotask queue so
@@ -1632,6 +1928,7 @@ export function MessageList({
           const subagent = row.kind === 'subagent' ? row.subagent : undefined
           const job = row.kind === 'job' ? row.job : undefined
           const jobGroup = row.kind === 'job' ? row.jobGroup : undefined
+          const subagentGroup = row.kind === 'subagent' ? row.subagentGroup : undefined
           const revealVersion = smoothStreaming && row.kind === 'tool' && row.fresh === true &&
             row.tool?.status === 'running' && row.tool.resultView === undefined
             ? getRevealVersion()
@@ -1674,12 +1971,16 @@ export function MessageList({
               marginTopOnTurn={marginTopOnTurn}
               isSelected={selectedId === row.id}
               isExpanded={expandedRows.has(row.id)}
+              expandedCodePaths={expandedCodePaths.get(row.id)}
+              closedGlobalCodePaths={closedGlobalCodePaths.get(row.id)}
+              onToggleCodePath={onToggleCodePath}
               expanded={expanded}
               model={model}
               diffLayout={diffLayout}
               thinkingFold={thinkingFold}
               toolBackground={toolBackground}
               foldTerminalCommand={foldTerminalCommand}
+              restoredRow={row.restored === true}
               smoothStreaming={smoothStreaming}
               fresh={row.fresh === true}
               revealVersion={revealVersion}
@@ -1706,6 +2007,9 @@ export function MessageList({
               subagent={subagent}
               job={job}
               jobGroup={jobGroup}
+              subagentGroup={subagentGroup}
+              collapsedDigest={row.collapsed === true}
+              onRevealCollapsed={onRevealCollapsed}
               onToggleRow={onToggleRow}
               onToggleStreamView={onToggleStreamView}
               streamViewToggled={streamViewToggledRows.has(row.id)}
@@ -1760,6 +2064,9 @@ type MemoRowProps = {
   marginTopOnTurn: boolean
   isSelected: boolean
   isExpanded: boolean
+  expandedCodePaths: ReadonlySet<string> | undefined
+  closedGlobalCodePaths: ReadonlySet<string> | undefined
+  onToggleCodePath: ((rowId: number, path: string, forceExpanded: boolean) => void) | undefined
   expanded: boolean
   model: string
   /** Edit/Write diff presentation preference (forwarded to tool cards). */
@@ -1774,6 +2081,12 @@ type MemoRowProps = {
   toolBackground: ToolBackground
   /** Terminal-card header folding (forwarded to tool cards). */
   foldTerminalCommand: boolean
+  /** Row restored from the session log (a revealed history chunk or a
+   *  window-cap restore). Historical rows read as a DIGEST by default: their
+   *  multi-line commands fold even when `foldTerminalCommand` is off, because
+   *  a revealed chunk mounts whole and 50 rounds of pasted scripts is exactly
+   *  the cheap content the default view should not lay out. */
+  restoredRow: boolean
   /** Working-activity preset name; drives the subagent card's running glyph. */
   activityFrames: string | undefined
   background: 'messageActionsBackground' | undefined
@@ -1814,6 +2127,14 @@ type MemoRowProps = {
   job: JobRow | undefined
   /** Group decoration for a run of consecutive job cards (see JobGroupRow). */
   jobGroup: JobGroupRow | undefined
+  /** Group decoration for a run of consecutive subagent cards (see
+   *  SubagentGroupRow): the fan-out header and its fold state. */
+  subagentGroup: SubagentGroupRow | undefined
+  /** True on a collapsed history chunk's digest line: the line is then the
+   *  load control for that chunk (see the 'notice' case). */
+  collapsedDigest: boolean
+  /** Project the chunk owning a digest row without leaving the reading spot. */
+  onRevealCollapsed: ((rowId: number) => void) | undefined
   onToggleRow: (rowId: number) => void
   /** 流式 reasoning 行在三行预览/全文间切换；落定行用 onToggleRow。 */
   onToggleStreamView: (rowId: number) => void
@@ -1831,11 +2152,12 @@ type MemoRowProps = {
 
 /** Load-earlier / show-previous divider row with a mouse hover tint — the
  *  clickability is otherwise invisible (audit C-04). */
-function ClickableDivider({ title, onClick }: { title: string; onClick?: () => void }): React.ReactNode {
+function ClickableDivider({ title, onClick, innerRef }: { title: string; onClick?: () => void; innerRef?: (el: DOMElement | null) => void }): React.ReactNode {
   const [hovered, setHovered] = useState(false)
   return (
     <Box
       marginTop={1}
+      ref={innerRef}
       onClick={onClick}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
@@ -1865,6 +2187,9 @@ function TranscriptRow({
   marginTopOnTurn,
   isSelected,
   isExpanded,
+  expandedCodePaths,
+  closedGlobalCodePaths,
+  onToggleCodePath,
   expanded,
   model,
   diffLayout,
@@ -1874,6 +2199,7 @@ function TranscriptRow({
   thinkingFold,
   toolBackground,
   foldTerminalCommand,
+  restoredRow,
   activityFrames,
   background,
   toolCallId,
@@ -1897,6 +2223,9 @@ function TranscriptRow({
   subagent,
   job,
   jobGroup,
+  subagentGroup,
+  collapsedDigest,
+  onRevealCollapsed,
   onToggleRow,
   onToggleStreamView,
   streamViewToggled,
@@ -1924,6 +2253,13 @@ function TranscriptRow({
     if (event.cellIsBlank) return
     onToggleRow(rowId)
   }, [onToggleRow, rowId])
+  const codeOnClick = React.useCallback((path: string, event: ClickEvent): void => {
+    if (event.cellIsBlank) return
+    // A long-line-folded assistant has a clickable ancestor; this gesture
+    // belongs to the fence, not that row. Drags never dispatch a click.
+    event.stopImmediatePropagation()
+    onToggleCodePath?.(rowId, path, expanded || isExpanded)
+  }, [onToggleCodePath, rowId, expanded, isExpanded])
   // 当前回合仍展开的 reasoning 行：点击在三行预览/全文间切换。它反转
   // thinkingFold 的默认值，回合落定后语义自动回到 foldOnClick。
   const streamViewOnClick = React.useCallback((event: ClickEvent): void => {
@@ -1933,6 +2269,10 @@ function TranscriptRow({
   // 任务组：点击组头行折叠/展开整组（与工具卡的折叠同一套手势：行点击 =
   // expandedRows 切换，Ctrl+O 展开全部）。
   const toggleJobGroup = React.useCallback((): void => {
+    onToggleRow(rowId)
+  }, [onToggleRow, rowId])
+  // 子代理组：组头行折叠/展开整组，与任务组同一套手势。
+  const toggleSubagentGroup = React.useCallback((): void => {
     onToggleRow(rowId)
   }, [onToggleRow, rowId])
   // 子代理卡：点击打开详情场景（不是折叠）。
@@ -1948,23 +2288,25 @@ function TranscriptRow({
   // frame. Ctrl+O (global) AND a row click (per-row, the same `expandedRows`
   // gesture message-selection mode uses) both paint the raw text again.
   // Reasoning rows are deliberately excluded: their preview is already a fixed
-  // three-row ticker. Tool cards fold inside their own header/body
-  // (AssistantToolUseMessage), whose text never rides this prop.
+  // three-row ticker. Tool cards fold inside their own header/body. Streaming
+  // assistant text skips this outer line fold; StreamingMarkdown still has a
+  // separate unstable-suffix limit that must be addressed independently.
   // `lang` is a dependency because the fold marker is localized: a row that
   // re-renders unchanged after /lang must not keep the previous language.
   const lang = getLang()
-  const foldable = kind !== 'reasoning' && kind !== 'tool'
+  const foldable = kind !== 'reasoning' && kind !== 'tool' && !(kind === 'assistant' && streaming)
   const folded = React.useMemo(
     () => (foldable ? foldLongLines(text) : { text, hiddenChars: 0, foldedLines: 0 }),
     [foldable, text, lang],
   )
   const displayText = expanded || isExpanded ? text : folded.text
-  // Mouse toggle: only a row that ACTUALLY hides something is clickable (an
-  // ordinary message stays inert so plain clicks and drag-selection keep
-  // working there). A streaming row is clickable too — the same contract the
-  // tool card has while running: the click paints the full ARRIVED text, and
-  // the reveal keeps growing it.
+  // Only a row that actually hides a long line gets the row-level toggle.
+  // Assistant streaming rows are excluded from the line fold above.
   const foldClickable = foldable && folded.hiddenChars > 0
+  // Historical rows (restored from the log: a revealed chunk, a window-cap
+  // restore) read as digests until the reader opens them — Ctrl+O or the
+  // card's own click. Live rows keep the reader's configured presentation.
+  const compactHistory = restoredRow && !isExpanded && !expanded
 
   switch (kind) {
     case 'user':
@@ -2044,6 +2386,12 @@ function TranscriptRow({
             marginTopOnTurn={marginTopOnTurn}
             isSelected={isSelected}
             isExpanded={isExpanded}
+            // Ctrl+O / row expansion temporarily exposes all fences; clicks
+            // otherwise change only this row's structural token path.
+            foldedCode={!expanded && !isExpanded}
+            expandedCodePaths={expandedCodePaths}
+            closedGlobalCodePaths={closedGlobalCodePaths}
+            onToggleCodePath={onToggleCodePath === undefined ? undefined : codeOnClick}
           />
           {images !== undefined && <TranscriptImages images={images} onPreview={onPreviewImage} suppressGraphics={suppressImageGraphics} />}
         </Box>
@@ -2115,7 +2463,11 @@ function TranscriptRow({
             smoothReveal={smoothStreaming}
             fresh={fresh}
             revealVersion={revealVersion}
-            foldTerminalCommand={foldTerminalCommand}
+            foldTerminalCommand={foldTerminalCommand || compactHistory}
+            // Restored rows read as one-line digests: the chunk reveal mounts
+            // the whole block at once, and the row click (below) is the
+            // expand gesture for the full body.
+            digestLines={compactHistory ? 1 : undefined}
             onClick={foldOnClick}
             onOpenFile={onOpenFile}
             images={images}
@@ -2128,6 +2480,20 @@ function TranscriptRow({
       )
     }
     case 'notice':
+      // A collapsed history chunk's digest line IS the load control for that
+      // chunk: the click projects the chunk in place (the same backend call a
+      // rail tick and load-on-sight make), so reading old history never needs
+      // scrolling to the top for the "load earlier" pager first. The hover
+      // tint is the only affordance a one-line divider can carry.
+      if (collapsedDigest && onRevealCollapsed !== undefined) {
+        return (
+          <ClickableDivider
+            title={` ${displayText} `}
+            innerRef={ref}
+            onClick={() => onRevealCollapsed(rowId)}
+          />
+        )
+      }
       return (
         <Box marginTop={1} ref={ref} onClick={foldClickable ? foldOnClick : undefined}>
           <Divider title={` ${displayText} `} />
@@ -2189,20 +2555,31 @@ function TranscriptRow({
           )}
         </Box>
       )
-    case 'subagent':
+    case 'subagent': {
       if (!subagent) return null
+      const groupHead = subagentGroup !== undefined && subagentGroup.head
       return (
-        <Box flexDirection="column" ref={ref}>
-          <SubagentMessage
-            subagent={subagent}
-            marginTopOnTurn={marginTopOnTurn}
-            activityFrames={activityFrames}
-            isExpanded={isExpanded}
-            onClick={openSubagent}
-            onOpenView={onOpenSubagentView === undefined ? undefined : () => onOpenSubagentView(subagent.agentId, rowId)}
-          />
+        <Box
+          flexDirection="column"
+          // The head's block margin moves UP to the group: the summary line
+          // is what separates the run from what precedes it.
+          marginTop={groupHead && marginTopOnTurn ? 1 : 0}
+          ref={ref}
+        >
+          {groupHead && <SubagentGroupHeader group={subagentGroup} onToggle={toggleSubagentGroup} />}
+          {groupHead && subagentGroup.folded ? null : (
+            <SubagentMessage
+              subagent={subagent}
+              marginTopOnTurn={groupHead ? false : marginTopOnTurn}
+              activityFrames={activityFrames}
+              isExpanded={isExpanded}
+              onClick={openSubagent}
+              onOpenView={onOpenSubagentView === undefined ? undefined : () => onOpenSubagentView(subagent.agentId, rowId)}
+            />
+          )}
         </Box>
       )
+    }
     case 'job': {
       if (!job) return null
       // A grouped run renders as ONE block: the head row carries the summary

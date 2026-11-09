@@ -4,8 +4,9 @@
  *
  * The replay cost of a long session is the per-event fold over hundreds of MB
  * of message and tool text (measured on an 89k-event / 447 MB record: 1,766 ms
- * to 27,907 rows), never the row count — rendering is already bounded by
- * `MAX_ROWS` / `RENDERED_ROW_CAP`, and dropping the rows saved 34 ms. So the
+ * to 27,907 rows), never the row count — the default rendered row window is
+ * bounded by `RENDERED_ROW_CAP`, and dropping the rows saved 34 ms. `MAX_ROWS`
+ * folds older text; it does not cap the number of row objects. So the
  * record is cut into round-aligned chunks and only the NEWEST chunk is
  * projected for the first paint. Every older chunk contributes exactly ONE
  * digest row (kind `notice`, `collapsed: true`: a plain text report, no tool
@@ -25,12 +26,15 @@
  * localized digest text.
  */
 
-import type { ChatRow } from '../../adapter/ports/channel-view.js'
+import type { ChatRow, CollapsedTurn } from '../../adapter/ports/channel-view.js'
 import type { AgentEvent } from '../../agent/events.js'
 
 /** Rounds in the newest chunk: small on purpose. It is the only chunk
- *  projected before the transcript opens, so its size is the open latency. */
-export const OPEN_ROUNDS = 10
+ *  projected before the transcript opens, so its size is the open latency.
+ *  Two rounds is the reading default — the reader lands on the newest
+ *  exchange. Every older turn is one rail tick / digest row away and loads
+ *  its own chunk on click (`revealRow`), so opening less loses nothing. */
+export const OPEN_ROUNDS = 2
 
 /** Characters in the newest chunk: same reason, for text-heavy rounds. */
 export const OPEN_CHARS = 200_000
@@ -97,7 +101,7 @@ function textChars(event: AgentEvent): number {
  *  message does, whatever its source — a human prompt, a goal continuation
  *  (`injected`) or a compaction boundary. Cutting at the invisible ones keeps
  *  a long goal-driven run from collapsing into one huge chunk, at no cost to
- *  the transcript: a collapsed chunk paints only its digest and its prompts. */
+ *  the transcript: a collapsed chunk paints only its digest. */
 function startsRound(event: AgentEvent): boolean {
   return event.type === 'user.message'
 }
@@ -211,6 +215,21 @@ export function chunkForRow(chunks: readonly HistoryChunk[], rowId: number): His
 export function placeholderRows(
   chunk: HistoryChunk,
   digest: (chunk: HistoryChunk) => string,
+  entries: readonly AgentEvent[],
 ): ChatRow[] {
-  return [{ id: chunk.idBase, kind: 'notice', text: digest(chunk), restored: true, collapsed: true }]
+  const collapsedTurns: CollapsedTurn[] = []
+  // A separate namespace below EVERY chunk row, not guessed projected ids:
+  // tool cards and hidden inputs make an event offset differ from a row offset.
+  // The global entry index makes handles unique across chunks; loading can
+  // resolve them by durable seq, even if a stale tick is clicked after loading.
+  const oldestIdBase = chunk.idBase - chunk.index * ID_STRIDE
+  for (let index = chunk.start; index < chunk.end; index += 1) {
+    const event = entries[index]!
+    if (event.type !== 'user.message' || event.source !== 'user') continue
+    const imageCount = event.images?.length ?? 0
+    // Match the shared projector's visible human-prompt predicate exactly.
+    if (event.text === '' && imageCount === 0) continue
+    collapsedTurns.push({ id: oldestIdBase - index - 1, seq: event.seq, text: event.text, imageCount })
+  }
+  return [{ id: chunk.idBase, kind: 'notice', text: digest(chunk), restored: true, collapsed: true, collapsedTurns }]
 }

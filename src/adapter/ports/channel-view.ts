@@ -96,6 +96,17 @@ export interface WorkingActivityView {
   readonly lang: 'zh' | 'en'
 }
 
+/** Navigation-only user prompt behind a collapsed history section. Not a
+ *  transcript row: `id` is a reveal handle, resolved to the real prompt row
+ *  when its section loads. Keeping these on the section preserves the full
+ *  turn rail without projecting old answers or painting prompt stand-ins. */
+export interface CollapsedTurn {
+  readonly id: number
+  readonly seq: number
+  readonly text: string
+  readonly imageCount: number
+}
+
 /**
  * One rendered transcript row. The DSH session log is the source of truth:
  * rows are derived from `session/event` records (and the initial
@@ -133,6 +144,11 @@ export interface ChatRow {
    *  (rows may arrive frozen from the session projection), never by the
    *  projection and never on the shared row objects. */
   jobGroup?: JobGroupRow
+  /** Present on `subagent` rows that share a run of ≥3 consecutive cards:
+   *  the fan-out fold decoration. Same render-derived contract as
+   *  {@link jobGroup}: written only onto shallow copies in the transcript's
+   *  row pre-pass, never by the projection. */
+  subagentGroup?: SubagentGroupRow
   /** Event wall-clock time (transcript-mode metadata, assistant rows). */
   time?: number
   /** Present on `reasoning` rows once settled: thinking wall-clock duration. */
@@ -162,6 +178,10 @@ export interface ChatRow {
    *  this row reaches the viewport, so the flag tells the list which rows are
    *  load-on-sight and marks the line as a collapsed section, not a message. */
   collapsed?: boolean
+  /** Rail entries for the human prompts behind this collapsed section. They
+   *  never render as transcript messages; loading replaces the whole section
+   *  (and this metadata) with real rows. */
+  collapsedTurns?: readonly CollapsedTurn[]
   /** True on rows created by LIVE event handling (not replay/resume/fold
    *  restore) — the smooth-streaming reveal animates freshly-arrived
    *  content only; replayed history must paint complete. Set when a live row
@@ -439,6 +459,34 @@ export interface JobGroupRow {
   completed: number
   failed: number
   killed: number
+  /** Earliest member start. */
+  startedAt: number
+  /** Latest member finish; absent while any member is still live. */
+  endedAt?: number
+}
+
+/**
+ * Consecutive subagent cards (`⑂` task cards): a settled fan-out of three or
+ * more adjacent cards folds into one header so a dozen parallel workers
+ * cannot bury the conversation. Render-derived, exactly like
+ * {@link JobGroupRow}: written only onto shallow copies in the transcript's
+ * row pre-pass. The fold defaults on and reopens via the header click, a
+ * per-row toggle, or Ctrl+O.
+ */
+export interface SubagentGroupRow {
+  /** Group header row: the only member rendering the summary/fold line. */
+  head: boolean
+  /** Last member: closes the group (kept for symmetry and future rails). */
+  last: boolean
+  /** Members in the run (≥2). */
+  count: number
+  /** Whole group folded into the header line (meaningful on the head). */
+  folded: boolean
+  /** Members still booting / live. */
+  live: number
+  completed: number
+  /** failed + cancelled (both paint in the error color). */
+  failed: number
   /** Earliest member start. */
   startedAt: number
   /** Latest member finish; absent while any member is still live. */

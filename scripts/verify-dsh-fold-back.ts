@@ -7,8 +7,8 @@
  *
  * This pins the fix — one bounded pass builds `seq → tool/call` and the
  * assistant/message cursor, every lookup is a map hit or a binary search —
- * and proves it restores EXACTLY what the per-row scan did, including the
- * cases that scan got wrong on purpose:
+ * and proves it preserves the per-row scan's assistant/tool behavior, with
+ * exact-seq, preview-verified user restoration added separately:
  *
  *  - a tool row whose call event is absent stays folded, and a non-call event
  *    sharing its seq does NOT shadow a real call elsewhere in the window (the
@@ -25,6 +25,8 @@
  * Run: node --import tsx/esm scripts/verify-dsh-fold-back.ts
  */
 import assert from 'node:assert/strict'
+import { withoutTeammateReminder } from '../src/dsh-adapter/compat/agent-team-0.2.0.js'
+import { preview } from '../src/channel/transcript.js'
 
 const { foldBack } = await import('../src/dsh-adapter/channel/transcript.js')
 type SessionEvent = import('@deepseek-ai/dsh-session').SessionEvent
@@ -41,7 +43,7 @@ function check(label: string, ok: boolean, detail?: unknown): void {
   console.log(`  ✓ ${label}`)
 }
 
-/** The previous implementation, kept verbatim as the oracle. */
+/** Linear oracle for the original assistant/tool behavior and the new user contract. */
 function foldBackOracle(rows: ChatRow[], events: readonly SessionEvent[], views?: ToolViewPresenter): number {
   const folded = rows.filter(row => row.folded)
   if (folded.length === 0) return 0
@@ -57,6 +59,18 @@ function foldBackOracle(rows: ChatRow[], events: readonly SessionEvent[], views?
   for (const row of folded) {
     const rowSeq = row.seq
     if (rowSeq === undefined) continue
+    if (row.kind === 'user') {
+      const event = events.find(event => event.seq === rowSeq && event.type === 'user/message')
+      if (event === undefined || event.type !== 'user/message' || event.data.source?.kind !== 'user' || row.label === 'team-message') continue
+      const firstText = (content: typeof event.data.content): string => content.find(block => block.type === 'text')?.text.trim() ?? ''
+      const candidates = new Set([firstText(event.data.content), firstText(withoutTeammateReminder(event.data).content)]
+        .filter(text => preview(text, 200) === row.text))
+      if (candidates.size !== 1) continue
+      row.text = candidates.values().next().value!
+      row.folded = false
+      restored += 1
+      continue
+    }
     if (row.kind === 'tool' && row.tool !== undefined) {
       const call = restoreEvents.find(event => event.seq === rowSeq && event.type === 'tool/call')
       if (call === undefined || call.type !== 'tool/call') continue
@@ -123,7 +137,7 @@ const ev = {
       },
     }) as unknown as SessionEvent,
   user: (seq: number, text: string) =>
-    ({ seq, type: 'user/message', data: { content: [{ type: 'text', text }] } }) as unknown as SessionEvent,
+    ({ seq, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text }] } }) as unknown as SessionEvent,
 }
 
 /** Run both implementations on identical inputs and diff the outcome. */
@@ -155,6 +169,14 @@ function same(label: string, makeRows: () => ChatRow[], makeEvents: () => Sessio
 }
 
 // ── behaviour the oracle's linear scan defines ────────────────────────────────
+
+same('a user row restores only its matching prompt', () => [
+  { id: nextId++, kind: 'user', seq: 1, text: preview('prompt '.repeat(50), 200), folded: true },
+], () => [ev.user(1, 'prompt '.repeat(50)), ev.message(2, 'answer')])
+
+same('a user row with a mismatched preview stays folded', () => [
+  { id: nextId++, kind: 'user', seq: 1, text: 'wrong preview', folded: true },
+], () => [ev.user(1, 'prompt'), ev.message(2, 'answer')])
 
 same('a tool row takes the call event at its own seq, and its result by callId', () => [
   toolRow(4, 'c1'),

@@ -435,6 +435,13 @@ export interface AgentEventMeta {
    * carries its source's wake.
    */
   readonly wake?: 'sync' | 'frame' | 'none'
+  /**
+   * `true` for a throwaway projection (an older-history slice painted into
+   * scratch rows): the resulting state is dropped, so context-bar accounting
+   * that only the live state reads is skipped. Without it, revealing a chunk
+   * pays a full token estimate over every result/assistant body in it.
+   */
+  readonly scratch?: boolean
 }
 
 /** Shared empty batch (translators return it when an input maps to nothing). */

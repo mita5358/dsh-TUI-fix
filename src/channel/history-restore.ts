@@ -178,7 +178,8 @@ export function projectHistorySlice(events: readonly AgentEvent[], thinkingFold:
     activity,
   })
   try {
-    projector.apply(events, { replay: true })
+    // Scratch state: skip context-bar accounting (see AgentEventMeta.scratch).
+    projector.apply(events, { replay: true, scratch: true })
     projector.settleStreaming()
   } finally {
     activity.dispose()

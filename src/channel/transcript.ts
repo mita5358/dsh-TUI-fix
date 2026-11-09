@@ -11,16 +11,27 @@ export const LOCAL_OUTPUT_LIMIT = 240
 /**
  * In-memory transcript window cap. Older rows beyond this count are folded:
  * their full-text fields (assistant/reasoning text, tool args/results) are
- * dropped and only the preview/status metadata kept, so a long merge/deploy
- * turn cannot grow the TUI's RAM without bound. The session log still holds
- * everything (`/export` reads it, `/resume` replays it); the
+ * dropped and only the preview/status metadata kept. This limits the full
+ * text retained by this pass, not the number of rows or total process memory:
+ * previews, raw session data and indices may still grow. The session log
+ * remains the source of truth (`/export` reads it, `/resume` replays it); the
  * folded row keeps its kind/id so scrolling and selection stay stable.
  */
 export const MAX_ROWS = 600
 
 export function preview(text: string, limit: number): string {
-  const flat = text.replace(/\s+/g, ' ').trim()
-  return flat.length <= limit ? flat : `${flat.slice(0, limit)}…`
+  // Read a bounded prefix only. Tool results can be megabytes; flattening the
+  // whole string (one regex pass plus a full-size allocation) just to cut
+  // `limit` characters back out dominated chunk reveal, at ~30 ms per big
+  // result. The window doubles when whitespace swallowed the whole prefix, so
+  // an indented/empty head still finds content instead of returning nothing.
+  let window = Math.min(text.length, Math.max(limit * 4, 256))
+  for (;;) {
+    const flat = text.slice(0, window).replace(/\s+/g, ' ').trim()
+    if (flat.length > limit) return `${flat.slice(0, limit)}…`
+    if (window >= text.length) return flat
+    window = Math.min(text.length, window * 2)
+  }
 }
 
 /**

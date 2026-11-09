@@ -12,7 +12,7 @@
  */
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import type { AgentEvent } from '../src/agent/events.js'
+import type { AgentEvent, AgentEventOf } from '../src/agent/events.js'
 import {
   CHUNK_CHARS,
   CHUNK_ROUNDS,
@@ -26,7 +26,7 @@ import { projectHistorySlice } from '../src/channel/history-restore.js'
 
 const digest = (chunk: HistoryChunk): string => `⏸ rounds ${chunk.fromRound}–${chunk.toRound}`
 
-const prompt = (seq: number, text: string, source: 'user' | 'team-message' = 'user'): AgentEvent => ({
+const prompt = (seq: number, text: string, source: AgentEventOf<'user.message'>['source'] = 'user'): AgentEventOf<'user.message'> => ({
   type: 'user.message',
   id: `m${seq}`,
   anchor: String(seq),
@@ -150,7 +150,7 @@ assert.ok(hugeChunks.every((chunk, index) => chunk.start === (index === 0 ? 0 : 
 // projects the chunk on sight. No prompt stand-ins and no projected content —
 // a collapsed chunk must never look like a conversation whose answers are gone.
 for (const chunk of chunks) {
-  const rows = placeholderRows(chunk, digest)
+  const rows = placeholderRows(chunk, digest, entries)
   assert.equal(rows.length, 1, 'an unloaded chunk contributes exactly one row')
   const row = rows[0]!
   assert.equal(row.id, chunk.idBase, 'the section line owns idBase')
@@ -165,11 +165,42 @@ for (const chunk of chunks) {
 // The bug this replaced: a collapsed chunk must not claim to be user rows.
 for (const chunk of chunks) {
   assert.deepEqual(
-    placeholderRows(chunk, digest).filter(row => row.kind === 'user'),
+    placeholderRows(chunk, digest, entries).filter(row => row.kind === 'user'),
     [],
     'no prompt stand-in rows remain in the collapsed form',
   )
 }
+
+// ── navigation is complete without painting fake prompt rows ─────────────
+const indexed = chunks.flatMap(chunk => placeholderRows(chunk, digest, entries)[0]!.collapsedTurns ?? [])
+const humanRows = projectHistorySlice(entries, 'preview').filter(row => row.kind === 'user' && row.label !== 'team-message')
+assert.deepEqual(indexed.map(turn => turn.seq), humanRows.map(row => row.seq), 'the index covers every real human prompt in record order')
+assert.equal(new Set(indexed.map(turn => turn.id)).size, indexed.length, 'handles are unique across all chunks')
+assert.ok(indexed.every(turn => turn.id < chunks[0]!.idBase), 'virtual handles never collide with real chunk or live rows')
+assert.ok(indexed.every(turn => chunkForRow(chunks, turn.id) === undefined), 'a virtual handle cannot accidentally reveal another chunk')
+for (const chunk of chunks) {
+  const meta = placeholderRows(chunk, digest, entries)[0]!.collapsedTurns ?? []
+  const real = projectHistorySlice(entries.slice(chunk.start, chunk.end), 'preview')
+  for (const turn of meta) {
+    const row = real.find(row => row.kind === 'user' && row.label !== 'team-message' && row.seq === turn.seq)
+    assert.equal(row?.text, turn.text, 'every handle resolves to the exact projected prompt by seq')
+  }
+}
+// Empty inputs and background sources do not create human ticks. Whitespace
+// and image-only human prompts DO, exactly like the shared projector.
+const edgeEntries: AgentEvent[] = [
+  prompt(20_000, ''),
+  prompt(20_001, '   '),
+  { ...prompt(20_002, ''), images: [{ id: 'image', width: 1, height: 1, read: async () => new Uint8Array() }] },
+  prompt(20_003, 'peer', 'team-message'),
+  prompt(20_004, 'goal', 'injected'),
+  prompt(20_005, 'checkpoint', 'compaction'),
+  prompt(20_006, 'command output', 'command-output'),
+]
+const edgeChunk = planChunks(edgeEntries)[0]!
+const edgeIndex = placeholderRows(edgeChunk, digest, edgeEntries)[0]!.collapsedTurns!
+assert.deepEqual(edgeIndex.map(turn => turn.seq), [20_001, 20_002], 'the index uses the projector visibility/source predicate')
+assert.deepEqual(edgeIndex.map(turn => turn.imageCount), [0, 1], 'image-only prompts retain their preview count')
 
 // ── which chunk owns a row ────────────────────────────────────────────────
 for (const chunk of chunks) {

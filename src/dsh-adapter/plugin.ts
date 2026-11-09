@@ -116,6 +116,7 @@ import { cursorMove, DISABLE_KITTY_KEYBOARD, DISABLE_MODIFY_OTHER_KEYS, DISABLE_
 import { DBP, DFE, DISABLE_MOUSE_TRACKING, ESU, EXIT_ALT_SCREEN, SHOW_CURSOR } from '../ink/termio/dec.js'
 import { CLEAR_ITERM2_PROGRESS, CLEAR_TAB_STATUS, supportsTabStatus, wrapForMultiplexer } from '../ink/termio/osc.js'
 import { addProcessErrorAbsorber, fatalReasonForExit, registerProcessGuardFatalSink } from '../ink/update-overflow-guard.js'
+import { frameStatsEnabled, noteFrameStats } from '../ink/frame-stats.js'
 import { CHANNEL_UI_LIFETIME_ENDED } from '../adapter/channel/ui.js'
 import { markBoot } from '../utils/bootTrace.js'
 import type { EntrySlot } from './entry-slot.js'
@@ -3202,6 +3203,11 @@ export async function apply(ctx: Context, runtimeConfig: RuntimeConfig<Config>, 
     exitOnCtrlC: false,
     terminalImages: bootedTerminalImages,
     ...(awaitsFirstFrame ? { onFrame: () => { frameFlushed() } } : {}),
+    // Opt-in frame/memory statistics (DSH_TUI_FRAME_STATS=1): one stderr line
+    // every ~2 s. Diagnostics only — the reported stress is "flicking through
+    // history repeatedly kills the process", which a single gesture
+    // measurement cannot answer.
+    ...(frameStatsEnabled() ? { onFrame: noteFrameStats } : {}),
   })
   markBoot('render-done')
   const isRecompose = lastBootedFullscreen !== undefined

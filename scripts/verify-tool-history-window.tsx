@@ -14,9 +14,9 @@ import type { ChatRow } from '../src/dsh-adapter/channel.js'
 import type { DOMElement } from '../src/ink/dom.js'
 import { settled } from './lib/term-test.mjs'
 
-const [React, { AlternateScreen, Box, render, ScrollBox, Text }, { MessageList }, { Chat }, { QuestionStore }] = await Promise.all([
+const [React, { AlternateScreen, Box, render, ScrollBox, Text }, { MessageList }, { Chat }, { QuestionStore }, { nodeCache }] = await Promise.all([
   import('react'), import('../src/ui.js'), import('../src/components/MessageList.js'),
-  import('../src/screens/Chat.js'), import('../src/dsh-adapter/questions.js'),
+  import('../src/screens/Chat.js'), import('../src/dsh-adapter/questions.js'), import('../src/ink/node-cache.js'),
 ])
 
 class Input extends PassThrough {
@@ -50,6 +50,8 @@ for (const fullscreen of [true, false]) {
   let handle: ScrollBoxHandle | null = null
   let latestFrame: number[] = []
   let frameCount = 0
+  let seekTarget: DOMElement | undefined
+  let seekPaint: { frame: number; target: DOMElement; y: number; height: number; viewportTop: number; viewportHeight: number; scrollTop: number; yogaTop: number } | undefined
   let revision = 0
   let hintRow = 1
   let forced: number | null = null
@@ -79,6 +81,17 @@ for (const fullscreen of [true, false]) {
       latestFrame = [...mounted.keys()]
       for (const id of latestFrame) painted.add(id)
       frameCount++
+      const scroll = handle as ScrollBoxHandle | null
+      const target = seekTarget
+      if (scroll !== null && target !== undefined && mounted.get(1) === target) {
+        const rect = nodeCache.get(target)
+        const yogaTop = target.yogaNode?.getComputedTop()
+        if (rect !== undefined && yogaTop !== undefined) {
+          seekPaint = { frame: frameCount, target, y: rect.y, height: rect.height,
+            viewportTop: scroll.getViewportTop(), viewportHeight: scroll.getViewportHeight(),
+            scrollTop: scroll.getScrollTop(), yogaTop }
+        }
+      }
     },
   })
   try {
@@ -99,8 +112,18 @@ for (const fullscreen of [true, false]) {
     app.rerender(<Harness />)
     assert.ok(await settled(() => latestFrame.includes(1)))
     const first = mounted.get(1)!
+    seekTarget = first
+    const frameBeforeSeek = frameCount
     handle!.scrollToElement(first)
     assert.ok(await settled(() => !handle!.isSticky()))
+    // isSticky flips synchronously, before a render can consume the anchor.
+    // Require a new paint with the same target at the actual viewport top.
+    assert.ok(await settled(() => {
+      const sample = seekPaint
+      return sample !== undefined && sample.frame > frameBeforeSeek && sample.frame === frameCount && sample.target === first &&
+        mounted.get(1) === first && latestFrame.includes(1) && sample.height > 0 && sample.viewportHeight > 0 &&
+        Math.abs(sample.y - sample.viewportTop) <= 1 && Math.abs(sample.scrollTop - sample.yogaTop) <= 1
+    }), `seek did not land in a new painted frame: ${JSON.stringify(seekPaint && { ...seekPaint, target: '<target>' })}`)
     forced = null
     app.rerender(<Harness />)
     assert.ok(await settled(() => latestFrame.includes(1) && latestFrame.length < 30))
