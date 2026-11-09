@@ -752,7 +752,7 @@ The logical budget does not eliminate physical JSON/frame parsing or validation.
 Resuming a DSH session still pays the host's full restore (frame decode, JSON
 parse, v4 validation) — that cost is linear in record size and lives outside this
 package. What this package controls is projection: the first screen projects only
-the newest chunk (the last 10 turns, under 200k characters), older chunks are cut
+the newest chunk (the last 2 turns, under 200k characters), older chunks are cut
 every 50 turns / 1M characters and projected when loaded, so first-screen work
 stops growing with the record. On a 139 MB / 93k-event record the interactive
 first screen went from 16.7–17.3 s to ~13.0 s: ~7.5 s host restore, ~4.1 s process

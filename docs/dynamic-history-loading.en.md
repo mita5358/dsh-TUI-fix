@@ -136,11 +136,13 @@ These are old measurements from different snapshots/builds, **not proof that thi
 round's index and seek changes pass**. They do not establish a 2 s startup. Use
 `DSH_TUI_BOOT_TRACE` to separate the phases.
 
-**Loaded chunks currently have no LRU eviction.** Browsing more chunks accumulates
-real projected rows. Render virtualization bounds mounting, not retention of body
-rows, the source log, translated events or directory. Do not describe this as
-“end-to-end constant memory”; adding cache or host architectures is outside this
-round's scope.
+**At most six loaded chunks stay resident** (`MAX_LOADED_CHUNKS`, evicted least
+recently touched first): beyond that the oldest touched chunk folds back to its
+digest line and re-projects when its line is clicked; the newest chunk and the one
+just requested are never evicted. Until a chunk is folded back its projected rows,
+source-log slice, translated events and directory stay resident, and render
+virtualization bounds mounting rather than retention. Do not describe this as
+“end-to-end constant memory”.
 
 ### 6.1 What an index click actually costs, and three fixes
 
