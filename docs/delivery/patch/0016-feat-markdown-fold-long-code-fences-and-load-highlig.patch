@@ -1,0 +1,3443 @@
+From fa5904ce791cb48344954793f0b1a56f903794ab Mon Sep 17 00:00:00 2001
+From: mita5358 <kafitcohr@outlook.com>
+Date: Mon, 9 Nov 2026 13:00:50 +0800
+Subject: [PATCH 16/20] feat(markdown): fold long code fences and load
+ highlighting on demand
+
+---
+ scripts/run-streaming-unfolded.mjs            | 104 +++++
+ scripts/verify-code-fence-chat.tsx            | 201 +++++++++
+ scripts/verify-code-fence-lru.tsx             | 248 +++++++++++
+ scripts/verify-ellipsis-expand.tsx            | 386 ++++++++++++++++++
+ scripts/verify-file-target-linear.ts          | 266 ++++++++++++
+ scripts/verify-file-target-no-separator.ts    | 166 ++++++++
+ .../verify-file-target-slash-performance.ts   |  92 +++++
+ scripts/verify-folded-code-summary.ts         |  86 ++++
+ scripts/verify-long-line-fold.tsx             |  28 +-
+ scripts/verify-long-prose-ansi.tsx            | 237 +++++++++++
+ scripts/verify-markdown-filelink-ansi.ts      |  22 +
+ scripts/verify-markdown-lazy-highlight.tsx    | 359 ++++++++++++++++
+ scripts/verify-streaming-markdown-blocks.tsx  |  42 +-
+ scripts/verify-streaming-suffix-identity.mjs  |  42 ++
+ scripts/verify-streaming-tail-boundary.mjs    |  98 +++++
+ scripts/verify-streaming-unfolded.tsx         | 184 +++++++++
+ scripts/verify-transcript-images.tsx          |   1 +
+ src/components/Markdown.tsx                   | 238 +++++++++--
+ src/components/StreamingMarkdown.tsx          |  21 +-
+ src/components/SyntaxText.tsx                 |   6 +-
+ src/utils/fileTarget.ts                       |  44 +-
+ src/utils/fold-long-lines.ts                  |  56 ++-
+ src/utils/pathSpan.ts                         |  78 ++++
+ 23 files changed, 2922 insertions(+), 83 deletions(-)
+ create mode 100644 scripts/run-streaming-unfolded.mjs
+ create mode 100644 scripts/verify-code-fence-chat.tsx
+ create mode 100644 scripts/verify-code-fence-lru.tsx
+ create mode 100644 scripts/verify-ellipsis-expand.tsx
+ create mode 100644 scripts/verify-file-target-linear.ts
+ create mode 100644 scripts/verify-file-target-no-separator.ts
+ create mode 100644 scripts/verify-file-target-slash-performance.ts
+ create mode 100644 scripts/verify-folded-code-summary.ts
+ create mode 100644 scripts/verify-long-prose-ansi.tsx
+ create mode 100644 scripts/verify-markdown-lazy-highlight.tsx
+ create mode 100644 scripts/verify-streaming-suffix-identity.mjs
+ create mode 100644 scripts/verify-streaming-tail-boundary.mjs
+ create mode 100644 scripts/verify-streaming-unfolded.tsx
+ create mode 100644 src/utils/pathSpan.ts
+
+diff --git a/scripts/run-streaming-unfolded.mjs b/scripts/run-streaming-unfolded.mjs
+new file mode 100644
+index 00000000..2546de2a
+--- /dev/null
++++ b/scripts/run-streaming-unfolded.mjs
+@@ -0,0 +1,104 @@
++/**
++ * Run the streaming regression without shell fd syntax or GNU timeout/nice.
++ *
++ *   node scripts/run-streaming-unfolded.mjs
++ *
++ * Child fd 1 is drained and discarded: the renderer may write terminal reset
++ * bytes there during teardown. The regression's independent fd 3 is forwarded
++ * to our stdout, and child stderr is forwarded to stderr. The child has no real
++ * HOME/DSH/XDG settings or credentials in its environment. Its own script
++ * creates and checks its private temporary directory before application imports.
++ *
++ * The wrapper uses Node rather than shell fd syntax, but the extra fd and
++ * terminal behavior have not yet been verified on Windows.
++ * A normal child exit is propagated unchanged; a timeout is reported as 124.
++ */
++import { spawn } from 'node:child_process'
++import { constants as osConstants, tmpdir } from 'node:os'
++import { dirname, join } from 'node:path'
++import { randomUUID } from 'node:crypto'
++import { fileURLToPath } from 'node:url'
++
++const root = dirname(dirname(fileURLToPath(import.meta.url)))
++const test = join(root, 'scripts', 'verify-streaming-unfolded.tsx')
++// Deliberately nonexistent: the child creates its own checked temp root.
++// This avoids exposing the caller's real home even to the tsx loader.
++const unavailableHome = join(tmpdir(), `dsh-stream-loader-nohome-${randomUUID()}`)
++const env = {
++  PATH: process.env.PATH ?? '',
++  NODE_ENV: 'production',
++  HOME: unavailableHome,
++  USERPROFILE: unavailableHome,
++  TMPDIR: tmpdir(),
++  TMP: tmpdir(),
++  TEMP: tmpdir(),
++  XDG_CONFIG_HOME: join(unavailableHome, 'config'),
++  XDG_CACHE_HOME: join(unavailableHome, 'cache'),
++  XDG_DATA_HOME: join(unavailableHome, 'data'),
++  XDG_STATE_HOME: join(unavailableHome, 'state'),
++  DSH_HOME: join(unavailableHome, 'dsh'),
++  TSX_DISABLE_CACHE: '1',
++}
++// Windows process creation and Node tooling can need these OS paths. None is a
++// user session or credential; no other inherited variables reach the loader.
++for (const key of ['SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT']) {
++  if (process.env[key] !== undefined) env[key] = process.env[key]
++}
++
++const child = spawn(process.execPath, ['--import', 'tsx/esm', test], {
++  cwd: root,
++  env,
++  stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
++  windowsHide: true,
++})
++child.stdout.resume()
++child.stderr.pipe(process.stderr, { end: false })
++child.stdio[3].pipe(process.stdout, { end: false })
++
++const timeoutMs = 90_000
++let timedOut = false
++let externalSignal = null
++let forceTimer
++let spawnError = null
++function terminate() {
++  if (child.exitCode !== null || child.signalCode !== null) return
++  child.kill('SIGTERM')
++  if (!forceTimer) {
++    forceTimer = setTimeout(() => {
++      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
++    }, 5_000)
++  }
++}
++const timeout = setTimeout(() => {
++  timedOut = true
++  process.stderr.write(`streaming-unfolded: timed out after ${timeoutMs}ms; terminating child\n`)
++  terminate()
++}, timeoutMs)
++const onSignal = signal => {
++  externalSignal ??= signal
++  terminate()
++}
++const onInt = () => onSignal('SIGINT')
++const onTerm = () => onSignal('SIGTERM')
++process.on('SIGINT', onInt)
++process.on('SIGTERM', onTerm)
++child.on('error', error => { spawnError = error })
++// close, not exit: the fd 3 reporter has also drained before returning.
++child.on('close', (code, signal) => {
++  clearTimeout(timeout)
++  if (forceTimer) clearTimeout(forceTimer)
++  process.off('SIGINT', onInt)
++  process.off('SIGTERM', onTerm)
++  if (spawnError) {
++    process.stderr.write(`streaming-unfolded: child spawn error: ${spawnError.message}\n`)
++    process.exitCode = 1
++  } else if (timedOut) {
++    process.exitCode = 124
++  } else if (externalSignal) {
++    process.exitCode = 128 + (osConstants.signals[externalSignal] ?? 1)
++  } else if (code !== null) {
++    process.exitCode = code
++  } else {
++    process.exitCode = 128 + (osConstants.signals[signal] ?? 1)
++  }
++})
+diff --git a/scripts/verify-code-fence-chat.tsx b/scripts/verify-code-fence-chat.tsx
+new file mode 100644
+index 00000000..f3e6a92d
+--- /dev/null
++++ b/scripts/verify-code-fence-chat.tsx
+@@ -0,0 +1,201 @@
++/** Real Chat + headless xterm SGR fence disclosure regression. No real backend.
++ * Run: node --import tsx/esm scripts/verify-code-fence-chat.tsx
++ */
++import assert from 'node:assert/strict'
++import { closeSync, mkdtempSync, openSync, realpathSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { basename, dirname, join } from 'node:path'
++import { PassThrough, Writable } from 'node:stream'
++
++// Never inherit harness trace/session paths or a temporary root pointing at
++// user data. Every DSH/XDG path below belongs to this synthetic fixture.
++for (const key of Object.keys(process.env)) if (key.startsWith('DSH_') || key.startsWith('XDG_')) delete process.env[key]
++delete process.env.TMPDIR
++delete process.env.TMP
++delete process.env.TEMP
++const tempRoot = realpathSync(tmpdir())
++const home = realpathSync(mkdtempSync(join(tempRoot, 'code-fence-chat-')))
++let cleaned = false
++const cleanupHome = (): void => {
++  if (cleaned) return
++  // Re-resolve immediately before deletion, and reject any replaced path.
++  const actual = realpathSync(home)
++  assert.equal(actual, home, 'refuse to clean a replaced fixture path')
++  assert.equal(dirname(actual), tempRoot, 'refuse to clean outside the temporary root')
++  assert.ok(basename(actual).startsWith('code-fence-chat-'), 'refuse to clean a non-fixture directory')
++  rmSync(actual, { recursive: true, force: true })
++  cleaned = true
++}
++// Covers import/setup failures too; the normal finally cleans up first.
++process.once('exit', cleanupHome)
++process.env.HOME = home
++process.env.USERPROFILE = home
++process.env.DSH_HOME = join(home, '.dsh')
++process.env.XDG_CONFIG_HOME = join(home, '.config')
++process.env.XDG_CACHE_HOME = join(home, '.cache')
++process.env.XDG_DATA_HOME = join(home, '.local', 'share')
++process.env.XDG_STATE_HOME = join(home, '.local', 'state')
++process.env.DSH_TUI_LANG = 'en'
++process.env.FORCE_COLOR = '3'
++const [React, { Terminal }, { render, AlternateScreen }, { Chat }, { QuestionStore }, { LOCAL_COMMANDS }, { settled, sleep }, { default: inkInstances }] = await Promise.all([
++  import('react'), import('@xterm/headless'), import('../src/ui.js'),
++  import('../src/screens/Chat.js'), import('../src/dsh-adapter/questions.js'),
++  import('../src/commands.js'), import('./lib/term-test.mjs'), import('../src/ink/instances.js'),
++])
++const COLS = 100, ROWS = 45
++const term = new Terminal({ cols: COLS, rows: ROWS, scrollback: 0, allowProposedApi: true })
++const ttyFd = openSync(join(home, 'tty-output'), 'w')
++let pendingWrites = 0
++let parsedWrites = 0
++let frames = 0
++let requiredFrame = -1
++class Stdout extends Writable {
++  columns = COLS; rows = ROWS; isTTY = true; fd = ttyFd
++  _write(chunk: unknown, _encoding: BufferEncoding, done: () => void) {
++    pendingWrites++
++    term.write(String(chunk), () => { pendingWrites--; parsedWrites++; done() })
++  }
++}
++class Stdin extends PassThrough {
++  isTTY = true
++  setRawMode() { return this }
++  ref() { return this }
++  unref() { return this }
++}
++const stdout = new Stdout(), stdin = new Stdin()
++const stderr = Object.assign(new Writable({ write(_chunk, _encoding, done) { done() } }), { isTTY: true })
++const body = ['INTRO', '```js', 'BLOCK_A_HEAD', 'BLOCK_A_BODY', '```', '~~~mermaid', 'graph LR', 'MERM_START-->MERM_END', '~~~'].join('\n')
++const listeners = new Set<() => void>()
++const channel = {
++  version: 0, rows: [{ id: 1, kind: 'assistant', text: body, streaming: false }],
++  agentId: 'agent-a', sessionId: 'session-a', whaleIdle: false,
++  status: 'idle', sessionTitle: 'fixture', model: 'model', provider: 'fixture',
++  tokens: { input: 0, output: 0 }, cwd: home, displayCwd: home, gitBranch: '',
++  working: false, spinnerMode: 'requesting', mode: { plan: false }, responseChars: 0,
++  activeToolCount: 0, turnStart: 0, lastUserText: '', pending: [],
++  commandList: LOCAL_COMMANDS, commandCompletions: () => [], notifications: [],
++  contextSegments: { system: 0, prompt: 0, assistant: 0, thinking: 0, tools: 0 },
++  subscribe(fn: () => void) { listeners.add(fn); return () => listeners.delete(fn) },
++  submit() {}, steer() {}, cancel() {}, clear() { this.rows = []; this.emit() }, notify() {},
++  listModels: async () => [], listSessions: () => [], setResumeTarget() {},
++  emit() { requiredFrame = frames; this.version++; for (const fn of listeners) fn() },
++}
++const lines = () => Array.from({ length: ROWS }, (_, y) => term.buffer.active.getLine(term.buffer.active.baseY + y)?.translateToString(true) ?? '')
++const has = (s: string) => lines().some(line => line.includes(s))
++const diagnostics = () => JSON.stringify({ frames, requiredFrame, pendingWrites, parsedWrites, queuedBytes: stdout.writableLength })
++const writeInput = (input: string): void => { requiredFrame = frames; stdin.write(input) }
++const drain = async (): Promise<void> => {
++  // The sentinel queues after prior writes; another frame may be queued
++  // during parsing, so repeat until the writable and xterm are both idle.
++  for (let attempt = 0; attempt < 20; attempt++) {
++    await new Promise<void>((resolve, reject) => stdout.write('', error => error ? reject(error) : resolve()))
++    if (pendingWrites === 0 && stdout.writableLength === 0) return
++  }
++  assert.fail(`xterm output did not drain: ${diagnostics()}`)
++}
++const waitScreen = async (name: string, predicate: () => boolean): Promise<void> => {
++  assert.ok(await settled(() => frames > requiredFrame && pendingWrites === 0 && stdout.writableLength === 0 && predicate(), { timeoutMs: 15000 }), `${name}\n${diagnostics()}\n${lines().join('\n')}`)
++  await drain()
++  assert.ok(predicate(), `${name} after xterm drain\n${diagnostics()}\n${lines().join('\n')}`)
++}
++const click = async (s: string) => {
++  await waitScreen(`missing click target ${s}`, () => has(s))
++  const y = lines().findIndex(line => line.includes(s))
++  const x = lines()[y]!.indexOf(s) + 1
++  writeInput(`\x1b[<0;${x};${y + 1}M\x1b[<0;${x};${y + 1}m`)
++}
++const check = async (name: string, predicate: () => boolean) => {
++  await waitScreen(name, predicate)
++  console.log(`PASS: ${name}`)
++}
++let app: Awaited<ReturnType<typeof render>> | undefined
++try {
++  app = await render(<AlternateScreen><Chat channel={channel as never} questionStore={new QuestionStore()} fullscreen trajectorySeen /></AlternateScreen>, {
++    stdout: stdout as never, stdin: stdin as never, stderr: stderr as never, patchConsole: false, exitOnCtrlC: false,
++    onFrame: () => { frames++ },
++  })
++  await check('ordinary and Mermaid fences start folded', () => has('BLOCK_A_HEAD') && has('⌁ mermaid') && !has('BLOCK_A_BODY') && !has('MERM_END'))
++  await drain()
++  const dragRow = lines().findIndex(line => line.includes('BLOCK_A_HEAD')) + 1
++  const dragCol = lines()[dragRow - 1]!.indexOf('BLOCK_A_HEAD') + 1
++  writeInput(`\x1b[<0;${dragCol};${dragRow}M\x1b[<32;${dragCol + 5};${dragRow}M\x1b[<0;${dragCol + 5};${dragRow}m`)
++  await waitScreen('selection drag reaches a fresh parsed frame', () => true)
++  await sleep(250) // 固定窗:探针 selection drag must not dispatch a delayed click
++  await drain()
++  assert.ok(!has('BLOCK_A_BODY') && has('⌁ mermaid'), 'selection drag must not open a fence')
++  console.log('PASS: selection drag does not toggle a fence')
++  writeInput('\x1b') // clear selection before the click
++  await sleep(600) // 固定窗:墙钟 mouse double-click recognition window
++  await click('BLOCK_A_HEAD')
++  await check('open A without opening Mermaid', () => has('BLOCK_A_BODY') && has('⌁ mermaid') && !has('MERM_END'))
++  writeInput('\x0c')
++  // Chat's Ctrl+L lookup uses process.stdout, not the isolated fake stream.
++  // Force its own Ink instance to redraw so this assertion observes a real
++  // new frame rather than claiming the unchanged old buffer is a redraw.
++  const ink = inkInstances.get(stdout as never)
++  assert.ok(ink, 'fake stdout must own an Ink instance')
++  ink.forceRedraw()
++  await check('redraw preserves individual state', () => has('BLOCK_A_BODY') && has('⌁ mermaid'))
++  writeInput('\x0f')
++  await check('Ctrl+O temporarily opens both from A-open B-closed', () => has('BLOCK_A_BODY') && !has('⌁ mermaid') && (has('MERM_START') || has('graph LR')))
++  await sleep(600) // 固定窗:墙钟 mouse double-click recognition window
++  await drain()
++  await click(has('MERM_START') ? 'MERM_START' : 'graph LR')
++  await check('global mode can close B without changing A', () => has('BLOCK_A_BODY') && has('⌁ mermaid'))
++  writeInput('\x0f')
++  await check('leaving global mode restores A-open B-closed', () => has('BLOCK_A_BODY') && has('⌁ mermaid'))
++  // Consecutive clicks at a nearby location are interpreted as double-clicks.
++  await sleep(600) // 固定窗:墙钟 mouse double-click recognition window
++  await click('⌁ mermaid')
++  await check('Mermaid expands independently', () => has('BLOCK_A_BODY') && !has('⌁ mermaid') && (has('MERM_START') || has('graph LR')))
++  await sleep(600) // 固定窗:墙钟 mouse double-click recognition window
++  await click('BLOCK_A_BODY')
++  await check('closing A keeps Mermaid expanded', () => !has('BLOCK_A_BODY') && has('BLOCK_A_HEAD') && !has('⌁ mermaid'))
++  writeInput('\x0f')
++  await check('Ctrl+O expands both', () => has('BLOCK_A_BODY') && !has('⌁ mermaid'))
++  writeInput('\x0f')
++  await check('Ctrl+O restores individual states', () => !has('BLOCK_A_BODY') && !has('⌁ mermaid'))
++  channel.rows = []; channel.emit()
++  await check('row is actually unmounted', () => !has('BLOCK_A_HEAD'))
++  channel.rows = [{ id: 1, kind: 'assistant', text: body, streaming: false }]; channel.emit()
++  await check('remount preserves the open Mermaid path', () => has('BLOCK_A_HEAD') && !has('BLOCK_A_BODY') && !has('⌁ mermaid'))
++  writeInput('/clear')
++  await check('clear command reaches composer', () => has('/clear'))
++  writeInput('\r')
++  await check('/clear removes old rows', () => !has('BLOCK_A_HEAD'))
++  channel.rows = [{ id: 1, kind: 'assistant', text: body, streaming: false }]; channel.emit()
++  await check('/clear prevents row-id reuse from inheriting disclosure', () => has('⌁ mermaid') && !has('BLOCK_A_BODY'))
++  await sleep(600) // 固定窗:墙钟 mouse double-click recognition window
++  await click('⌁ mermaid')
++  await check('open a fence before session switch', () => !has('⌁ mermaid') && (has('MERM_START') || has('graph LR')))
++  channel.agentId = 'agent-b'; channel.sessionId = 'session-b'; channel.emit()
++  await check('new session with reused row id has no old disclosure', () => has('⌁ mermaid') && !has('BLOCK_A_BODY'))
++  channel.rows = [{ id: 1, kind: 'assistant', text: body, streaming: true }]; channel.emit()
++  await check('streaming fences are not folded', () => has('BLOCK_A_BODY') && !has('⌁ mermaid'))
++  const longCode = `LONG_CODE_HEAD${'x'.repeat(1200)}LONG_CODE_TAIL`
++  channel.rows = [{ id: 1, kind: 'assistant', text: `PLAIN_PROSE\n\n\`\`\`text\n${longCode}\n\`\`\`\n\n~~~py\nOTHER_CODE_BODY\n~~~`, streaming: false }]; channel.emit()
++  await check('long fence alone does not fold surrounding prose', () => has('PLAIN_PROSE') && has('⌁ text') && has('⌁ py'))
++  await sleep(600) // 固定窗:墙钟 mouse double-click recognition window
++  await click('PLAIN_PROSE')
++  await sleep(250) // 固定窗:探针 prose click must not unfold either fence
++  await drain()
++  assert.ok(has('⌁ text') && has('⌁ py') && !has('LONG_CODE_TAIL'), `ordinary prose click must not toggle fences\n${lines().join('\n')}`)
++  console.log('PASS: ordinary prose click does not unfold long fence or sibling')
++  const longProse = `LONG_PROSE_HEAD${'p'.repeat(1200)}LONG_PROSE_TAIL`
++  channel.rows = [{ id: 1, kind: 'assistant', text: `${longProse}\n\n\`\`\`text\n${longCode}\n\`\`\``, streaming: false }]; channel.emit()
++  await check('long prose retains its independent fold', () => has('chars folded') && has('⌁ text') && !has('LONG_PROSE_TAIL'))
++  await sleep(600) // 固定窗:墙钟 mouse double-click recognition window
++  await click('⌁ text')
++  await check('long code opens to its real tail without opening parent prose', () => has('LONG_CODE_TAIL') && has('chars folded') && !has('LONG_PROSE_TAIL'))
++  channel.rows = [{ id: 1, kind: 'assistant', text: `${'s'.repeat(1200)}STREAM_LONG_TAIL`, streaming: true }]; channel.emit()
++  await check('streaming long line is not clipped', () => has('STREAM_LONG_TAIL') && !has('chars folded'))
++} finally {
++  try {
++    if (app) await app.unmount()
++    await drain()
++  } finally {
++    term.dispose()
++    closeSync(ttyFd)
++    cleanupHome()
++  }
++}
+diff --git a/scripts/verify-code-fence-lru.tsx b/scripts/verify-code-fence-lru.tsx
+new file mode 100644
+index 00000000..334522e9
+--- /dev/null
++++ b/scripts/verify-code-fence-lru.tsx
+@@ -0,0 +1,248 @@
++/**
++ * Real channel history LRU + Chat/xterm fence-state regression. The target is
++ * opened by SGR mouse; unrelated chunks are materialized via channel.revealRow
++ * solely to force eviction. Synthetic records, no real sessions or credentials.
++ * Run: node --import tsx/esm scripts/verify-code-fence-lru.tsx
++ */
++import assert from 'node:assert/strict'
++import { closeSync, mkdtempSync, openSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join, resolve } from 'node:path'
++import { PassThrough, Writable } from 'node:stream'
++
++// Ignore inherited harness paths and temp overrides: the fixture owns every
++// DSH/XDG destination and never writes a real terminal fd.
++for (const key of Object.keys(process.env)) if (key.startsWith('DSH_')) delete process.env[key]
++delete process.env.TMPDIR
++delete process.env.TMP
++delete process.env.TEMP
++const prefix = join(tmpdir(), 'code-fence-lru-')
++const home = mkdtempSync(prefix)
++process.env.HOME = home
++process.env.USERPROFILE = home
++process.env.DSH_HOME = join(home, '.dsh')
++process.env.XDG_CONFIG_HOME = join(home, '.config')
++process.env.XDG_CACHE_HOME = join(home, '.cache')
++process.env.XDG_DATA_HOME = join(home, '.local', 'share')
++process.env.XDG_STATE_HOME = join(home, '.local', 'state')
++process.env.DSH_TUI_LANG = 'en'
++process.env.FORCE_COLOR = '3'
++const [React, { Terminal }, { render, AlternateScreen }, { Chat }, { QuestionStore }, { createChannel }, { mountChannelUi }, { registerTuiChannel }, { settled, sleep }, { default: inkInstances }] = await Promise.all([
++  import('react'), import('@xterm/headless'), import('../src/ui.js'), import('../src/screens/Chat.js'),
++  import('../src/dsh-adapter/questions.js'), import('../src/dsh-adapter/channel.js'),
++  import('../src/dsh-adapter/channel-ui.js'), import('../src/adapter/channel/host-registry.js'),
++  import('./lib/term-test.mjs'), import('../src/ink/instances.js'),
++])
++type RawEvent = { type: string; seq: number; time: number; data: Record<string, unknown> }
++const events: RawEvent[] = []
++const append = (type: string, data: Record<string, unknown>) => {
++  const seq = events.length + 1
++  events.push({ type, seq, time: seq, data })
++}
++for (let n = 1; n <= 8; n++) {
++  append('user/message', { id: `user-${n}`, source: { kind: 'user' }, content: [{ type: 'text', text: `LRU-PROMPT-${n}` }] })
++  append('tool/call', { turn: n, step: 1, callId: `weight-${n}`, name: 'ask_user_question', arguments: JSON.stringify({ unused: 'x'.repeat(1_010_000) }) })
++  const text = `answer ${n}\n\n\`\`\`js\nA_HEAD_${n}\nA_BODY_${n}\n\`\`\`\n\n~~~py\nB_HEAD_${n}\nB_BODY_${n}\n~~~`
++  append('assistant/message', { turn: n, step: 1, message: { role: 'assistant', content: [{ type: 'text', text }] } })
++}
++const cleanups: Array<() => void> = []
++const agent = { id: 'lru-test', status: 'idle', session: { id: 'lru-session', seq: events.length, events, header: { cwd: home } }, ctx: { on: () => () => undefined }, followup() {}, steer() {}, cancel() {}, inbox: { remove: () => true } }
++const services: Record<string, unknown> = {
++  settings: { describe: () => [{ ns: 'llm-pi-ai', revision: 1, user: {}, value: {} }, { ns: 'dsh-tui', revision: 1, user: {}, value: { recapOnOpen: false } }], get: () => ({}), mutate: async () => undefined },
++  credentials: { resolve: async () => undefined, set: async () => undefined, unset: async () => undefined },
++  llm: { listConfigurableProviders: () => [], discoverModels: async () => [] },
++  agents: {},
++}
++const ctx = { on: () => () => undefined, effect(setup: () => () => void) { cleanups.push(setup()) }, get: (name: string) => services[name], logger: { warn() {} } }
++const raw = createChannel(ctx as never, agent as never, { model: 'model', provider: 'provider', cwd: home, activity: false, whale: false, whaleIdle: false, minimalUi: true, smoothStreaming: false })
++const unregister = registerTuiChannel(ctx, raw)
++const mount = mountChannelUi(ctx, raw, undefined, 'new')
++const summaries = () => mount.channel.rows.filter(row => row.collapsed === true)
++const targetSummary = summaries().find(row => row.collapsedTurns?.some(turn => turn.text === 'LRU-PROMPT-2'))
++const target = targetSummary?.collapsedTurns?.find(turn => turn.text === 'LRU-PROMPT-2')
++assert.ok(targetSummary && target, 'must seed seven independently evictable old chunks')
++assert.ok(summaries().length >= 7, 'each heavy round must occupy its own chunk')
++const COLS = 100, ROWS = 45
++const term = new Terminal({ cols: COLS, rows: ROWS, scrollback: 0, allowProposedApi: true })
++const ttyFd = openSync(join(home, 'tty-output'), 'w')
++let pendingWrites = 0
++let parsedWrites = 0
++let frames = 0
++class Stdout extends Writable {
++  columns = COLS; rows = ROWS; isTTY = true; fd = ttyFd
++  _write(chunk: unknown, _encoding: BufferEncoding, done: () => void) {
++    pendingWrites++
++    term.write(String(chunk), () => { pendingWrites--; parsedWrites++; done() })
++  }
++}
++class Stdin extends PassThrough {
++  isTTY = true
++  setRawMode() { return this }
++  ref() { return this }
++  unref() { return this }
++}
++const stdout = new Stdout(), stdin = new Stdin()
++const stderr = Object.assign(new Writable({ write(_chunk, _encoding, done) { done() } }), { isTTY: true })
++const lines = () => Array.from({ length: ROWS }, (_, y) => term.buffer.active.getLine(term.buffer.active.baseY + y)?.translateToString(true) ?? '')
++const has = (s: string) => lines().some(line => line.includes(s))
++type ProbeNode = {
++  nodeName?: string
++  nodeValue?: string
++  childNodes?: ProbeNode[]
++  scrollTop?: number
++  scrollHeight?: number
++  scrollViewportHeight?: number
++  scrollViewportTop?: number
++  stickyScroll?: boolean
++  yogaNode?: { getComputedTop(): number; getComputedHeight(): number }
++}
++const root = (): ProbeNode | undefined => (inkInstances.get(stdout as never) as unknown as { rootNode?: ProbeNode } | undefined)?.rootNode
++const walk = (node: ProbeNode | undefined, visit: (node: ProbeNode) => void): void => {
++  if (!node) return
++  visit(node)
++  for (const child of node.childNodes ?? []) walk(child, visit)
++}
++const textNode = (text: string): ProbeNode | undefined => {
++  let result: ProbeNode | undefined
++  walk(root(), node => { if (node.nodeValue?.includes(text)) result = node })
++  return result
++}
++const pathToText = (text: string): ProbeNode[] | undefined => {
++  const search = (node: ProbeNode | undefined, parents: ProbeNode[]): ProbeNode[] | undefined => {
++    if (!node) return undefined
++    const path = [...parents, node]
++    if (node.nodeValue?.includes(text)) return path
++    for (const child of node.childNodes ?? []) {
++      const found = search(child, path)
++      if (found) return found
++    }
++    return undefined
++  }
++  return search(root(), [])
++}
++// The LCA of the two code texts is Markdown's column; the four containing
++// boxes are Markdown's host, the bullet row, AssistantTextMessage, then the
++// settled TranscriptRow Box whose ref is registered with MessageList.
++const assistantRowRef = (): ProbeNode => {
++  const a = pathToText('A_BODY_2'), b = pathToText('B_HEAD_2')
++  assert.ok(a && b, 'both blocks must have mounted DOM nodes')
++  let common = 0
++  while (common < a.length && common < b.length && a[common] === b[common]) common++
++  const row = a[common - 1 - 4]
++  assert.ok(row?.nodeName === 'ink-box', `expected TranscriptRow Box at the shared Markdown path: ${a.map(node => node.nodeName).join(' > ')}`)
++  return row
++}
++const containsNode = (target: ProbeNode): boolean => {
++  let found = false
++  walk(root(), node => { if (node === target) found = true })
++  return found
++}
++const geometry = () => {
++  let scroll: ProbeNode | undefined
++  walk(root(), node => { if (node.scrollViewportHeight !== undefined) scroll = node })
++  return scroll && { top: scroll.scrollTop, height: scroll.scrollHeight, viewport: scroll.scrollViewportHeight, viewportTop: scroll.scrollViewportTop, sticky: scroll.stickyScroll }
++}
++const diagnostic = () => JSON.stringify({ frames, parsedWrites, pendingWrites, queuedBytes: stdout.writableLength, geometry: geometry(), mountedBody: textNode('A_BODY_2') !== undefined, summaries: summaries().map(row => row.id) })
++// A sentinel queues behind every earlier stdout write. The write callback
++// fires only after xterm's own parse callback, not merely after enqueueing.
++const drain = async (): Promise<void> => {
++  // Rendering may queue another write while the sentinel is being parsed.
++  // Drain those too; otherwise the screen can still be partway through a
++  // subsequent frame when the sentinel callback resolves.
++  for (let attempt = 0; attempt < 20; attempt++) {
++    await new Promise<void>((resolve, reject) => stdout.write('', error => error ? reject(error) : resolve()))
++    if (pendingWrites === 0 && stdout.writableLength === 0) return
++  }
++  assert.fail(`xterm output did not drain: ${diagnostic()}`)
++}
++const wait = async (name: string, predicate: () => boolean) => {
++  assert.ok(await settled(() => pendingWrites === 0 && stdout.writableLength === 0 && predicate(), { timeoutMs: 15000 }), `${name}\n${diagnostic()}\n${lines().join('\n')}`)
++  await drain()
++  assert.ok(predicate(), `${name} after xterm drain\n${diagnostic()}\n${lines().join('\n')}`)
++  console.log(`PASS: ${name}`)
++}
++const click = async (text: string) => {
++  await wait(`mouse target ${text}`, () => has(text))
++  const y = lines().findIndex(line => line.includes(text))
++  const x = lines()[y]!.indexOf(text) + 1
++  stdin.write(`\x1b[<0;${x};${y + 1}M\x1b[<0;${x};${y + 1}m`)
++}
++// Home edits the prompt; fullscreen Chat pages the transcript with PgUp.
++// Wait for an actual new frame and viewport motion after every page, rather
++// than guessing when scrolling/virtualization has converged.
++const pageUpTo = async (present: () => boolean): Promise<void> => {
++  for (let attempts = 0; attempts < 8 && !present(); attempts++) {
++    const before = geometry()?.top
++    assert.notEqual(before, undefined, `missing scroll geometry: ${diagnostic()}`)
++    assert.ok(before! > 0, `target absent at transcript top\n${diagnostic()}\n${lines().join('\n')}`)
++    const beforeFrame = frames
++    stdin.write('\x1b[5~')
++    await wait('PgUp paints actual transcript movement', () => frames > beforeFrame && ((geometry()?.top ?? before!) < before! || present()))
++  }
++  assert.ok(present(), `target must be reachable after bounded PgUp navigation\n${diagnostic()}\n${lines().join('\n')}`)
++}
++let app: Awaited<ReturnType<typeof render>> | undefined
++let rerenderCommitFrame: number | undefined
++const questionStore = new QuestionStore()
++function RerenderProbe({ generation }: { generation: number }): React.ReactNode {
++  React.useLayoutEffect(() => {
++    if (generation === 1) rerenderCommitFrame = frames
++  }, [generation])
++  return <AlternateScreen><Chat channel={mount.channel as never} questionStore={questionStore} fullscreen trajectorySeen /></AlternateScreen>
++}
++const tree = (generation = 0) => <RerenderProbe generation={generation} />
++try {
++  // Direct channel projection is used for setup, not to toggle disclosure.
++  mount.channel.revealRow(target.id)
++  const assistant = mount.channel.rows.find(row => row.kind === 'assistant' && row.text.includes('A_HEAD_2'))
++  assert.ok(assistant, 'target assistant must materialize')
++  app = await render(tree(), {
++    stdout: stdout as never, stdin: stdin as never, stderr: stderr as never, patchConsole: false, exitOnCtrlC: false,
++    onFrame: () => { frames++ },
++  })
++  await wait('initial Chat frame is ready', () => has('LRU-PROMPT-8'))
++  await pageUpTo(() => has('A_HEAD_2') && has('B_HEAD_2'))
++  await wait('target shows two independently folded blocks', () => has('A_HEAD_2') && has('B_HEAD_2') && !has('A_BODY_2') && !has('B_BODY_2'))
++  await click('A_HEAD_2')
++  await wait('SGR opens A only', () => has('A_BODY_2') && has('B_HEAD_2') && !has('B_BODY_2'))
++  const oldRowRef = assistantRowRef()
++  assert.ok(containsNode(oldRowRef), 'the original assistant row ref must actually be mounted')
++  const beforeEvictionFrame = frames
++  for (const summary of summaries().filter(row => row.id !== targetSummary.id)) mount.channel.revealRow(summary.id)
++  assert.ok(summaries().some(row => row.id === targetSummary.id), 'target chunk must actually be evicted by the LRU')
++  console.log('PASS: real channel LRU evicted target chunk')
++  await wait('eviction paints a new frame and unmounts the original row ref', () => frames > beforeEvictionFrame && !containsNode(oldRowRef) && !has('A_BODY_2'))
++  console.log(`EVICTED ${diagnostic()}`)
++  const beforeRematerializeFrame = frames
++  mount.channel.revealRow(target.id)
++  assert.ok(mount.channel.rows.some(row => row.id === assistant.id && row.kind === 'assistant'), 'rematerialized row must keep its id')
++  console.log('PASS: rematerialized row retains its id')
++  await wait('rematerialization schedules a fresh frame', () => frames > beforeRematerializeFrame)
++  await pageUpTo(() => (has('A_BODY_2') || has('A_HEAD_2')) && has('B_HEAD_2'))
++  await wait('real LRU rematerialization keeps A open and B closed', () => textNode('A_BODY_2') !== undefined && has('A_BODY_2') && has('B_HEAD_2') && !has('B_BODY_2'))
++  assert.notEqual(assistantRowRef(), oldRowRef, 'rematerialization must mount a new assistant row ref')
++  console.log(`RESTORED ${diagnostic()}`)
++  app.rerender(tree(1))
++  await wait('independent React rerender commits and produces a later frame', () => rerenderCommitFrame !== undefined && frames > rerenderCommitFrame)
++  assert.ok(has('A_BODY_2') && has('B_HEAD_2') && !has('B_BODY_2'), `rerender must preserve A open / B closed\n${diagnostic()}\n${lines().join('\n')}`)
++  const ink = inkInstances.get(stdout as never)
++  assert.ok(ink, 'the fake stdout must own an Ink instance')
++  const beforeRedrawFrame = frames
++  ink.forceRedraw()
++  await wait('independent full redraw produces a new parsed frame', () => frames > beforeRedrawFrame)
++  assert.ok(has('A_BODY_2') && has('B_HEAD_2') && !has('B_BODY_2'), `full redraw must preserve A open / B closed\n${diagnostic()}\n${lines().join('\n')}`)
++  console.log(`REDRAWN ${diagnostic()}`)
++  await sleep(200) // 固定窗:探针 no delayed layout update may undo the fresh redraw
++  await drain()
++  assert.ok(has('A_BODY_2') && has('B_HEAD_2') && !has('B_BODY_2'), `restored state must remain stable after redraw\n${diagnostic()}\n${lines().join('\n')}`)
++  console.log(`PASS: restored state stays stable after redraw ${diagnostic()}`)
++} finally {
++  if (app) await app.unmount()
++  await drain()
++  mount.dispose(); unregister(); raw.releaseContributions()
++  for (const cleanup of cleanups.reverse()) cleanup()
++  term.dispose()
++  closeSync(ttyFd)
++  assert.ok(resolve(home).startsWith(resolve(prefix)))
++  rmSync(home, { recursive: true, force: true })
++}
+diff --git a/scripts/verify-ellipsis-expand.tsx b/scripts/verify-ellipsis-expand.tsx
+new file mode 100644
+index 00000000..16bf8ccf
+--- /dev/null
++++ b/scripts/verify-ellipsis-expand.tsx
+@@ -0,0 +1,386 @@
++/**
++ * 静默省略号可展开回归（用户需求：被省略号折叠的文字点一下看全文，再点
++ * 回到折叠态）。
++ *
++ * 主转录里带「点击展开」提示的折叠（长行/代码围栏/工具卡正文/思考摘要）
++ * 已有点击链路；这里守的是**没有提示、只有 hover 才能看全**的那一类：
++ *  1. 工具卡头部在窄终端被 `truncate-end` 截断的标题；
++ *  2. 无标题卡的头部参数被 `clipHeaderArgs`（480 字符）截断。
++ * 两者都在头部行里，省略号是唯一的提示。展开态（verbose）必须把被省掉的
++ * 内容完整换行画出，再点一次回到折叠态——复用同一个 verbose 状态机，不
++ * 引入第二套展开状态。
++ *
++ * 断言（两张卡各自独立渲染，避免整屏溢出干扰定位）：
++ *  A. 折叠态：头部有省略号，尾串不在屏上，正文尾行也不在；
++ *  B. 点卡面展开：尾串与正文尾行都出现；再点一次都消失；
++ *  C. 冷渲染（verbose=true）与点击展开的整屏完全一致。
++ *
++ * Run: `node --import tsx/esm scripts/verify-ellipsis-expand.tsx`
++ */
++import { mkdtempSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++
++const dataDir = mkdtempSync(join(tmpdir(), 'verify-ellipsis-expand-'))
++process.env.HOME = dataDir
++process.env.USERPROFILE = dataDir
++process.env.DSH_TUI_LANG = 'en'
++
++const [
++  { PassThrough, Writable },
++  React,
++  { Terminal: XTerm },
++  { render, Box, AlternateScreen, useInput },
++  { AssistantToolUseMessage },
++  { SubagentDetailScene },
++  termTest,
++] = await Promise.all([
++  import('node:stream'),
++  import('react'),
++  import('@xterm/headless'),
++  import('../src/ui.js'),
++  import('../src/components/messages/AssistantToolUseMessage.js'),
++  import('../src/components/SubagentDetailScene.js'),
++  import('./lib/term-test.mjs'),
++])
++
++const { sleep, settled, findText } = termTest as unknown as {
++  sleep: (ms: number) => Promise<void>
++  settled(pred: () => boolean, opts?: { timeoutMs?: number }): Promise<boolean>
++  findText(term: InstanceType<typeof XTerm>, needle: string): { col: number; row: number } | null
++}
++
++let failed = 0
++function check(name: string, ok: boolean, extra = ''): void {
++  console.log(`${ok ? 'PASS' : 'FAIL'}: ${name}${extra ? `  (${extra})` : ''}`)
++  if (!ok) failed++
++}
++
++const COLS = 72
++const ROWS = 30
++const TITLE_HEAD = 'TITLEHEAD'
++const TITLE_TAIL = 'TITLETAIL'
++const ARGS_HEAD = 'ARGSHEAD'
++const ARGS_TAIL = 'ARGSTAIL'
++const BODY_TAIL = 'BODYTAIL'
++
++const packed = (screen: string): string => screen.replace(/\s+/g, '')
++const digest = (screen: string): string => {
++  const rows = screen.split('\n').filter(row => row.trim() !== '')
++  return `${rows.length} rows, first=${JSON.stringify((rows[0] ?? '').slice(0, 40))}`
++}
++
++class FakeStdout extends Writable {
++  columns = COLS
++  rows = ROWS
++  isTTY = true
++  constructor(private term: InstanceType<typeof XTerm>) { super() }
++  _write(chunk: unknown, _e: BufferEncoding, cb: () => void): void {
++    this.term.write(String(chunk), cb)
++  }
++}
++class FakeStderr extends Writable {
++  isTTY = true
++  _write(_c: unknown, _e: BufferEncoding, cb: () => void): void { cb() }
++}
++class FakeStdin extends PassThrough {
++  isTTY = true
++  setRawMode(): this { return this }
++  ref(): this { return this }
++  unref(): this { return this }
++}
++
++/** 鼠标 SGR 左键 press+release（1 起坐标）；press/release 分帧，否则一次
++ *  点击可能被两个处理器各算一遍。 */
++async function click(stdin: PassThrough, col: number, row: number): Promise<void> {
++  stdin.write(`\x1b[<0;${col};${row}M`)
++  await sleep(30) // 固定窗:pacing press→release
++  stdin.write(`\x1b[<0;${col};${row}m`)
++}
++
++/** Chat 常驻 PromptInput 才接鼠标解析；rig 里挂一个空 useInput。 */
++function KeySink(): React.ReactNode {
++  useInput(() => {})
++  return null
++}
++
++const bodyLines = Array.from({ length: 8 }, (_, i) => `body line ${i}`)
++const LONG_PATH = `/tmp/${'d'.repeat(120)}-${TITLE_HEAD}-${TITLE_TAIL}`
++const bodyText = [...bodyLines.slice(0, -1), BODY_TAIL].join('\n')
++
++/** 有标题的工具卡：标题超出 72 列，被 truncate-end 截断。 */
++function titledFixture(): Record<string, unknown> {
++  return {
++    callId: 'read-call',
++    name: 'read',
++    argsText: '{}',
++    status: 'done',
++    callView: { card: 'read', title: `Read ${LONG_PATH}`, path: LONG_PATH },
++    resultView: {
++      card: 'read',
++      title: `Read ${LONG_PATH}`,
++      path: LONG_PATH,
++      content: [{ type: 'text', text: bodyText }],
++    },
++    startedAt: Date.now() - 1_000,
++    durationMs: 1_000,
++  }
++}
++
++/** 无标题的工具卡：参数就是头部，480 字符预算处被 clipHeaderArgs 截断。 */
++function untitledFixture(): Record<string, unknown> {
++  return {
++    callId: 'custom-call',
++    name: 'mytool',
++    argsText: JSON.stringify({ query: `${ARGS_HEAD}${'a'.repeat(540)}${ARGS_TAIL}` }),
++    argsFull: JSON.stringify({ query: `${ARGS_HEAD}${'a'.repeat(540)}${ARGS_TAIL}${'b'.repeat(200)}` }),
++    status: 'done',
++    callView: { card: 'generic' },
++    resultView: { card: 'generic', content: [{ type: 'text', text: bodyText }] },
++    startedAt: Date.now() - 1_000,
++    durationMs: 1_000,
++  }
++}
++
++interface Frame {
++  term: InstanceType<typeof XTerm>
++  stdin: FakeStdin
++  screen(): string
++  clickText(needle: string): Promise<boolean>
++  opened(): number
++  unmount(): Promise<void>
++}
++
++/** 有状态卡：onClick 走 React state 再渲染 verbose（与 Chat 的
++ *  expandedRows → verbose 同构）。 */
++function Card({ tool, initial, onOpenFile }: {
++  tool: Record<string, unknown>
++  initial: boolean
++  onOpenFile: () => void
++}): React.ReactNode {
++  const [verbose, setVerbose] = React.useState(initial)
++  return (
++    <AssistantToolUseMessage
++      tool={tool as never}
++      marginTopOnTurn={false}
++      verbose={verbose}
++      onClick={() => setVerbose(previous => !previous)}
++      onOpenFile={onOpenFile}
++    />
++  )
++}
++
++async function mount(tool: Record<string, unknown>, verbose: boolean): Promise<Frame> {
++  const term = new XTerm({ cols: COLS, rows: ROWS, scrollback: 0, allowProposedApi: true })
++  const stdout = new FakeStdout(term)
++  const stderr = new FakeStderr()
++  const stdin = new FakeStdin()
++  let opened = 0
++  const onOpenFile = (): void => { opened += 1 }
++  const instance = await render(
++    <AlternateScreen>
++      <KeySink />
++      <Box flexDirection="column" width={COLS}>
++        <Card tool={tool} initial={verbose} onOpenFile={onOpenFile} />
++      </Box>
++    </AlternateScreen>,
++    {
++      stdout: stdout as unknown as NodeJS.WriteStream,
++      stderr: stderr as unknown as NodeJS.WriteStream,
++      stdin: stdin as unknown as NodeJS.ReadStream,
++      exitOnCtrlC: false,
++      patchConsole: false,
++    },
++  )
++  await sleep(200) // 固定窗:pacing 首次布局无单一可观测锚点
++  const screen = (): string =>
++    Array.from({ length: ROWS }, (_, y) => term.buffer.active.getLine(y)?.translateToString(true) ?? '').join('\n')
++  return {
++    term,
++    stdin,
++    screen,
++    opened: () => opened,
++    async clickText(needle: string): Promise<boolean> {
++      const hit = findText(term, needle)
++      if (hit === null) return false
++      await click(stdin, hit.col + 1, hit.row + 1)
++      return true
++    },
++    async unmount(): Promise<void> {
++      await instance.unmount()
++      term.dispose()
++    },
++  }
++}
++
++interface Case {
++  label: string
++  tool: Record<string, unknown>
++  /** 折叠态下在屏上的头部片段（点击目标）。 */
++  headNeedle: string
++  /** 展开后出现、折叠时被省掉的尾串。 */
++  tailNeedle: string
++}
++
++const CASES: Case[] = [
++  { label: 'titled', tool: titledFixture(), headNeedle: '/tmp/dddd', tailNeedle: TITLE_TAIL },
++  { label: 'untitled', tool: untitledFixture(), headNeedle: 'Mytool', tailNeedle: ARGS_TAIL },
++]
++
++// ---------------------------------------------------------------------------
++// A — 折叠态：只有省略号，没有全文
++// ---------------------------------------------------------------------------
++console.log('--- A: silent ellipsis hides the tail ---')
++for (const c of CASES) {
++  const frame = await mount(c.tool, false)
++  try {
++    const text = frame.screen()
++    check(`A ${c.label}: collapsed header shows the head`,
++      packed(text).includes(packed(c.headNeedle)), digest(text))
++    check(`A ${c.label}: collapsed header hides the tail`,
++      !packed(text).includes(c.tailNeedle), digest(text))
++    check(`A ${c.label}: collapsed header shows an ellipsis`, text.includes('…'), digest(text))
++    check(`A ${c.label}: body tail is folded away`,
++      !packed(text).includes(BODY_TAIL), digest(text))
++  } finally {
++    await frame.unmount()
++  }
++}
++
++// ---------------------------------------------------------------------------
++// B — 点一下看全文，再点回到折叠态
++// ---------------------------------------------------------------------------
++console.log('--- B: click expands, click again folds ---')
++for (const c of CASES) {
++  const frame = await mount(c.tool, false)
++  try {
++    check(`B ${c.label}: header is on screen to click`,
++      await frame.clickText(c.headNeedle), digest(frame.screen()))
++    check(`B ${c.label}: click paints the full tail`,
++      await settled(() => packed(frame.screen()).includes(c.tailNeedle)), digest(frame.screen()))
++    check(`B ${c.label}: click also opens the body tail`,
++      packed(frame.screen()).includes(BODY_TAIL), digest(frame.screen()))
++    check(`B ${c.label}: the expanded tail is on screen to click back`,
++      await frame.clickText(c.tailNeedle), digest(frame.screen()))
++    check(`B ${c.label}: second click hides the tail again`,
++      await settled(() => !packed(frame.screen()).includes(c.tailNeedle)), digest(frame.screen()))
++    check(`B ${c.label}: collapsing click did not open the file menu`,
++      frame.opened() === 0, String(frame.opened()))
++    check(`B ${c.label}: second click folds the body tail away`,
++      !packed(frame.screen()).includes(BODY_TAIL), digest(frame.screen()))
++    check(`B ${c.label}: the ellipsis is back`, frame.screen().includes('…'), digest(frame.screen()))
++  } finally {
++    await frame.unmount()
++  }
++}
++
++// ---------------------------------------------------------------------------
++// C — 冷渲染（verbose=true）与点击展开同屏
++// ---------------------------------------------------------------------------
++console.log('--- C: cold verbose render equals the clicked one ---')
++for (const c of CASES) {
++  let clicked = ''
++  {
++    const frame = await mount(c.tool, false)
++    try {
++      await frame.clickText(c.headNeedle)
++      await settled(() => packed(frame.screen()).includes(c.tailNeedle))
++      clicked = packed(frame.screen())
++    } finally {
++      await frame.unmount()
++    }
++  }
++  const cold = await mount(c.tool, true)
++  try {
++    const text = packed(cold.screen())
++    check(`C ${c.label}: cold expanded paints the tail`, text.includes(c.tailNeedle), digest(cold.screen()))
++    check(`C ${c.label}: cold and clicked expanded screens agree`, text === clicked,
++      `${text.length} vs ${clicked.length} chars`)
++  } finally {
++    await cold.unmount()
++  }
++}
++
++
++// ---------------------------------------------------------------------------
++// D — 详情页转录里的思考摘要：落定后同样只是省略号，点一下必须能看全
++// ---------------------------------------------------------------------------
++console.log('--- D: detail transcript thinking leaf expands on click ---')
++{
++  const THINK_HEAD = 'THINKHEAD'
++  const THINK_TAIL = 'THINKTAIL'
++  const thinkingText = `${THINK_HEAD} ${'y'.repeat(200)} ${THINK_TAIL}`
++  const events = [{
++    type: 'assistant.message',
++    anchor: 'a-think',
++    time: Date.now(),
++    blocks: [{ type: 'reasoning', text: thinkingText }, { type: 'text', text: 'after thinking' }],
++  }]
++  const detail = {
++    agentId: 'agent-child-0001',
++    description: 'research the spec',
++    status: 'completed',
++    startedAt: Date.now() - 60_000,
++    completedAt: Date.now() - 10_000,
++    mode: 'continuable',
++    output: [],
++    outputEvents: [],
++    toolCalls: [],
++  }
++  const term = new XTerm({ cols: COLS, rows: ROWS, scrollback: 0, allowProposedApi: true })
++  const stdout = new FakeStdout(term)
++  const stdoutCast = stdout as unknown as NodeJS.WriteStream
++  const stdin = new FakeStdin()
++  const instance = await render(
++    <AlternateScreen>
++      <KeySink />
++      <SubagentDetailScene
++        subagent={detail as never}
++        onBack={() => {}}
++        loadTranscript={async () => ({
++          events, parentAgentId: 'parent', uuids: [], hasOlder: false, skippedFromStart: 0,
++        }) as never}
++      />
++    </AlternateScreen>,
++    {
++      stdout: stdoutCast,
++      stderr: new FakeStderr() as unknown as NodeJS.WriteStream,
++      stdin: stdin as unknown as NodeJS.ReadStream,
++      exitOnCtrlC: false,
++      patchConsole: false,
++    },
++  )
++  const screen = (): string =>
++    Array.from({ length: ROWS }, (_, y) => term.buffer.active.getLine(y)?.translateToString(true) ?? '').join('\n')
++  const clickText = async (needle: string): Promise<boolean> => {
++    const hit = findText(term, needle)
++    if (hit === null) return false
++    await click(stdin, hit.col + 1, hit.row + 1)
++    return true
++  }
++  try {
++    // 固定窗:pacing 详情场景首帧没有单一可轮询锚点，等一次布局落定
++    await sleep(200)
++    check('D detail: the transcript tab is on screen', await clickText('Transcript'), digest(screen()))
++    check('D detail: the thinking summary is up', await settled(() => packed(screen()).includes(THINK_HEAD), { timeoutMs: 5000 }), digest(screen()))
++    check('D detail: collapsed summary hides the tail', !packed(screen()).includes(THINK_TAIL), digest(screen()))
++    check('D detail: collapsed summary advertises the click',
++      /click|expand/i.test(screen()), digest(screen()))
++    check('D detail: the summary is clickable', await clickText(THINK_HEAD), digest(screen()))
++    check('D detail: click paints the full thinking text',
++      await settled(() => packed(screen()).includes(THINK_TAIL), { timeoutMs: 5000 }), digest(screen()))
++    check('D detail: click again folds it back', await clickText(THINK_TAIL), digest(screen()))
++    check('D detail: the tail is folded away again',
++      await settled(() => !packed(screen()).includes(THINK_TAIL), { timeoutMs: 5000 }), digest(screen()))
++  } finally {
++    await instance.unmount()
++    term.dispose()
++  }
++}
++
++console.log('')
++if (failed > 0) {
++  console.error(`verify-ellipsis-expand: ${failed} FAILURE(S)`)
++  process.exit(1)
++}
++console.log('verify-ellipsis-expand: all checks passed')
+diff --git a/scripts/verify-file-target-linear.ts b/scripts/verify-file-target-linear.ts
+new file mode 100644
+index 00000000..dd7e37f2
+--- /dev/null
++++ b/scripts/verify-file-target-linear.ts
+@@ -0,0 +1,266 @@
++/**
++ * Path-span and file-link differential against the original regex semantics.
++ * Run: node --import tsx/esm scripts/verify-file-target-linear.ts
++ */
++import assert from 'node:assert/strict'
++import { scanPathSpans as scanSpans, trailingPathPunctuationStart, type PathSpan as Span } from '../src/utils/pathSpan.js'
++import { looksLikeFilePath, linkifyFilePaths as integratedLinkifier, fileLinkUrl } from '../src/utils/fileTarget.js'
++import { createHyperlink } from '../src/terminal-utils/hyperlink.js'
++
++const pattern = /(?:\.{1,2}[\\/]|[\\/]|~[\\/]|[A-Za-z]:[\\/])[^\s<>"'`|?#]*|(?:[^\s<>"'`|?#]*[\\/][^\s<>"'`|?#]*\.[A-Za-z0-9]{1,6})/gu
++
++// Legacy matcher/trim oracle, using the real path validation and wrap.
++function linkifyFilePaths(text: string, wrap: Wrap): string {
++  if (!text.includes('/') && !text.includes('\\')) return text
++  return text.replace(pattern, (match: string, offset: number, full: string) => {
++    if (offset > 0 && !/[\s<>"'`|([{=]/u.test(full[offset - 1]!)) return match
++    const display = match.replace(/[.,;:!?]+$/u, '')
++    if (display === '' || !looksLikeFilePath(display)) return match
++    return wrap(display, display) + match.slice(display.length)
++  })
++}
++
++const forbidden = (c: string) => c === '' || /[\s<>"'`|?#]/u.test(c)
++const slash = (c: string | undefined) => c === '/' || c === '\\'
++const letter = (c: string | undefined) => c !== undefined && /^[A-Za-z]$/.test(c)
++const alphaNum = (c: string | undefined) => c !== undefined && /^[A-Za-z0-9]$/.test(c)
++const anchored = (s: string, i: number) => slash(s[i]) || (s[i] === '~' && slash(s[i + 1])) || (s[i] === '.' && (slash(s[i + 1]) || (s[i + 1] === '.' && slash(s[i + 2])))) || (letter(s[i]) && s[i + 1] === ':' && slash(s[i + 2]))
++// Previous next-slash table algorithm, with Uint32Array. 0 is sentinel;
++// stored slash positions are relative to run start plus 1. No path cutoff.
++function tableSpans(full: string): Span[] {
++  const result: Span[] = []
++  let start = 0
++  while (start < full.length) {
++    if (forbidden(full[start]!)) { start++; continue }
++    let end = start
++    while (end < full.length && !forbidden(full[end]!)) end++
++    const next = new Uint32Array(end - start + 1)
++    let lastDot = -1
++    for (let i = end - 1; i >= start; i--) {
++      next[i - start] = slash(full[i]) ? i - start + 1 : next[i - start + 1]!
++      if (lastDot < 0 && full[i] === '.' && i + 1 < end && alphaNum(full[i + 1])) lastDot = i
++    }
++    for (let i = start; i < end;) {
++      let matchEnd = -1
++      if (anchored(full, i)) matchEnd = end
++      else {
++        const slot = next[i - start]!
++        const nextSlash = slot === 0 ? -1 : start + slot - 1
++        if (nextSlash >= 0 && nextSlash < lastDot) {
++          matchEnd = lastDot + 1
++          for (let n = 0; n < 6 && matchEnd < end && alphaNum(full[matchEnd]); n++) matchEnd++
++        }
++      }
++      if (matchEnd < 0) { i++; continue }
++      result.push({ offset: i, end: matchEnd }); i = matchEnd
++    }
++    start = end
++  }
++  return result
++}
++function regexSpans(s: string): Span[] {
++  return [...s.matchAll(pattern)].map(m => ({ offset: m.index!, end: m.index! + m[0].length }))
++}
++type Wrap = (path: string, display: string) => string
++function replacement(s: string, spans: Iterable<Span>, wrap: Wrap): string {
++  let output = ''
++  let previous = 0
++  for (const { offset, end } of spans) {
++    output += s.slice(previous, offset)
++    const match = s.slice(offset, end)
++    previous = end
++    if (offset > 0 && !/[\s<>"'`|([{=]/u.test(s[offset - 1]!)) { output += match; continue }
++    const display = match.replace(/[.,;:!?]+$/u, '')
++    if (display === '' || !looksLikeFilePath(display)) { output += match; continue }
++    output += wrap(display, display) + match.slice(display.length)
++  }
++  return output + s.slice(previous)
++}
++function candidate(s: string, wrap: Wrap): string { return replacement(s, scanSpans(s), wrap) }
++function observe(fn: (s: string, w: Wrap) => string, s: string, osc: boolean) {
++  const calls: string[][] = []
++  let nested = false
++  const wrap: Wrap = (path, display) => {
++    calls.push(['before', path, display])
++    if (!nested) {
++      nested = true
++      calls.push(['nested-before'])
++      const inner = fn('open ./src/文件.ts then C:\\work\\x.ts', (p, d) => {
++        calls.push(['inner-before', p, d]); const v = `<${p}|${d}>`; calls.push(['inner-after', v]); return v
++      })
++      calls.push(['nested-after', inner])
++    }
++    const value = osc ? createHyperlink(fileLinkUrl(path), display, { supportsHyperlinks: true, style: x => x }) : `{${path}|${display}}`
++    calls.push(['after', value])
++    return value
++  }
++  try { return { ok: true, value: fn(s, wrap), calls } }
++  catch (error) { return { ok: false, type: error instanceof Error ? error.constructor.name : typeof error, name: error instanceof Error ? error.name : '', message: error instanceof Error ? error.message : String(error), calls } }
++}
++function compareTail(match: string): void {
++  const oldDisplay = match.replace(/[.,;:!?]+$/u, '')
++  const stats = { inspected: 0 }
++  const end = trailingPathPunctuationStart(match, stats)
++  assert.equal(match.slice(0, end), oldDisplay)
++  assert.equal(match.slice(end), match.slice(oldDisplay.length))
++  assert.ok(stats.inspected <= match.length)
++}
++function compare(s: string): void {
++  compareTail(s)
++  const stats = { steps: 0 }
++  const constant = [...scanSpans(s, stats)]
++  const original = regexSpans(s)
++  assert.deepEqual(constant, original, `O(1) scanner spans differ: ${JSON.stringify(s)}`)
++  assert.deepEqual(tableSpans(s), original, `Uint32 scanner spans differ: ${JSON.stringify(s)}`)
++  assert.ok(stats.steps <= 4 * s.length + 8, `linear scan operation bound: ${stats.steps}/${s.length}`)
++  // Also verify replacement callback's exact raw matched text, offset and full.
++  const reMatches: Array<[string, number, string]> = []
++  s.replace(pattern, (match: string, offset: number, full: string) => { reMatches.push([match, offset, full]); return match })
++  assert.deepEqual(constant.map(({ offset, end }) => [s.slice(offset, end), offset, s]), reMatches)
++  for (const osc of [false, true]) {
++    const originalResult = observe(linkifyFilePaths, s, osc)
++    assert.deepEqual(observe(candidate, s, osc), originalResult, `standalone wrap effects/OSC8 differ: ${JSON.stringify(s)}`)
++    assert.deepEqual(observe(integratedLinkifier, s, osc), originalResult, `integrated wrap effects/OSC8 differ: ${JSON.stringify(s)}`)
++  }
++}
++for (const s of [
++  '', 'abc/z.a/y.b', 'abc/z.a/y_without_dot', 'a/b.cdefghi/z', 'a/b.x/y.zfooquux',
++  '.../file.ts', '.../..//a', '/a', '/a/b', './a.ts,', '../x.ts', '~/.config/x',
++  'C:\\dir\\x.ts', 'x\\y.z', 'x/y.ts!a/z.js', 'x/y.tsabcdefg/z', 'x/y.a..a',
++  'https://example.com/src/file.ts', 'owner/repo#123456789', 'a?b/c.ts',
++  'a\u00a0b/c.ts', 'a\u2028b/c.ts', 'a\ufeffb/c.ts', '🐋/file.ts',
++  'a\ud800/b.ts', 'a\udc00/b.ts', './src/文件.ts', './src/🐋.ts',
++]) compare(s)
++// Exhaustive 11-character alphabet, strings of length 0..5, includes both
++// separators, dot, extension, drive, tilde, excluded character and whitespace.
++const alphabet = ['a', 'A', '1', '.', '/', '\\', ':', '~', ' ', '#', '!']
++let exhaustiveCases = 0
++function enumerate(prefix: string, remaining: number): void {
++  compare(prefix); exhaustiveCases++
++  if (remaining === 0) return
++  for (const c of alphabet) enumerate(prefix + c, remaining - 1)
++}
++enumerate('', 5)
++assert.equal(exhaustiveCases, 1 + 11 + 121 + 1331 + 14641 + 161051)
++// Independently retain the punctuation oracle's complete 11-symbol sweep.
++const tailAlphabet = ['a', '.', ',', ';', ':', '!', '?', '/', '🐋', '\ud800', '\n']
++let tailCases = 0
++function enumerateTail(prefix: string, remaining: number): void {
++  compareTail(prefix); tailCases++
++  if (remaining === 0) return
++  for (const c of tailAlphabet) enumerateTail(prefix + c, remaining - 1)
++}
++enumerateTail('', 5)
++assert.equal(tailCases, 1 + 11 + 121 + 1331 + 14641 + 161051)
++// Sweep every UTF-16 code unit against the exact /u regex to detect a wrong
++// \s/excluded-character table, including both classes of lone surrogate.
++for (let unit = 0; unit <= 0xffff; unit++) {
++  const s = 'a' + String.fromCharCode(unit) + '/b.ts'
++  assert.deepEqual([...scanSpans(s)], regexSpans(s), `code-unit mismatch U+${unit.toString(16).padStart(4, '0')}`)
++  compareTail('x' + String.fromCharCode(unit) + '!')
++}
++// Focused greediness extension lengths, and unicode BMP/astral/lone-surrogate.
++for (const n of [1, 2, 5, 6, 7, 8, 12]) for (const s of [`a/b.${'x'.repeat(n)}`, `a/b.${'x'.repeat(n)}/c`, `🐋/a.${'x'.repeat(n)}`]) compare(s)
++// Additional composite scanner + tail cases; original exhaustive/random
++// oracle and all original cases above remain unchanged.
++for (const n of [1, 16, 64, 128, 256]) {
++  for (const mark of ['.', '!']) {
++    compare('/' + mark.repeat(n) + 'x')
++    compare('./src/文件.ts' + mark.repeat(n))
++  }
++}
++let seed = 0x9e3779b9
++function random(): number { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; return seed >>> 0 }
++const varied = [...alphabet, '漢', '🐋', '\ud800', '\udc00', '\u1680', '\u2000', '\u2028', '\u202f', '\u205f', '\u3000', '\ufeff', '\t', '\n', '"', "'", '`', '|', '?', '<', '>', '=']
++for (let n = 0; n < 20000; n++) {
++  const size = random() % 100
++  let s = ''
++  for (let i = 0; i < size; i++) s += varied[random() % varied.length]
++  compare(s)
++}
++// Throw behavior and visible callback prefix: no blanket catch.
++const marker = new Error('wrap marker')
++for (const fn of [linkifyFilePaths, candidate, integratedLinkifier]) {
++  const calls: string[] = []
++  assert.throws(() => fn('./src/file.ts /other/file.ts', (p: string) => {
++    calls.push(`outer-before:${p}`)
++    const inner = fn('./nested/文件.ts', (q: string) => { calls.push(`inner:${q}`); return `inner(${q})` })
++    calls.push(`outer-after-inner:${inner}`)
++    throw marker
++  }), error => error === marker)
++  assert.deepEqual(calls, ['outer-before:./src/file.ts', 'inner:./nested/文件.ts', 'outer-after-inner:inner(./nested/文件.ts)'])
++}
++for (const path of ['./src/文件.ts', './src/🐋.ts']) {
++  for (const fn of [candidate, integratedLinkifier]) {
++    const actual = observe(fn, path, true)
++    assert.equal(actual.ok, true)
++    if (actual.ok) assert.ok(actual.value?.includes(fileLinkUrl(path)), 'real Unicode OSC8 target required')
++  }
++}
++for (const text of ['a\ud800/b.ts', 'a\udc00/b.ts']) {
++  for (const fn of [candidate, integratedLinkifier]) {
++    const result = observe(fn, text, true)
++    assert.equal(result.ok, true)
++    if (result.ok) assert.equal(result.value, text)
++    assert.deepEqual(result.calls, [])
++  }
++}
++// No huge quadratic baseline execution; only candidate known spans & step
++// counts, including slash-bearing adversaries absent from the earlier probe.
++for (const n of [1000, 4000, 8000, 100000]) {
++  for (const [s, expected] of [
++    ['a'.repeat(n), []],
++    ['a'.repeat(n) + '/', [{ offset: n, end: n + 1 }]],
++    ['/' + 'a'.repeat(n), [{ offset: 0, end: n + 1 }]],
++    ['a'.repeat(n) + '/x.ts', [{ offset: 0, end: n + 5 }]],
++  ] as Array<[string, Span[]]>) {
++    const stats = { steps: 0 }
++    assert.deepEqual([...scanSpans(s, stats)], expected)
++    assert.ok(stats.steps <= 4 * s.length + 8)
++  }
++  // Old matcher is intentionally NOT invoked on the known quadratic 100k
++  // failed-tail shape. The real combined linkifier must preserve it verbatim.
++  const failedTail = '/' + '.'.repeat(n) + 'x'
++  let wrapped = false
++  assert.equal(integratedLinkifier(failedTail, () => { wrapped = true; return 'wrong' }), failedTail)
++  assert.equal(wrapped, false)
++  const failedStats = { inspected: 0 }
++  assert.equal(trailingPathPunctuationStart(failedTail, failedStats), failedTail.length)
++  assert.equal(failedStats.inspected, 1)
++  const longSuffix = './src/文件.ts' + '!'.repeat(n)
++  const suffixStats = { inspected: 0 }
++  assert.equal(trailingPathPunctuationStart(longSuffix, suffixStats), './src/文件.ts'.length)
++  assert.equal(suffixStats.inspected, n + 1)
++}
++// A very long successful punctuation suffix must not hide an otherwise
++// linkable short path, change its OSC8 target, or discard the suffix.
++const longPath = './src/文件.ts'
++const longPunctuation = '!,;:.'.repeat(20000)
++const longInput = 'open ' + longPath + longPunctuation + ' done'
++// Keep 100k input candidate-only; the bounded cases above compare legacy.
++const longActual = observe(integratedLinkifier, longInput, true)
++assert.equal(longActual.ok, true)
++if (longActual.ok && typeof longActual.value === 'string') {
++  const targets = [...longActual.value.matchAll(/\x1b\]8;[^;]*;([^\x07\x1b]*)(?:\x07|\x1b\\)/g)].map(match => match[1]!).filter(Boolean)
++  assert.deepEqual(targets, [fileLinkUrl(longPath)])
++  assert.ok(longActual.value.includes(longPunctuation + ' done'))
++} else throw new Error('long valid path did not produce rendered output')
++// RegExp.replace obtains global matches before callback execution. A callback
++// may replace public builtins; later lazy scans must remain semantically stable.
++const savedCharCodeAt = String.prototype.charCodeAt
++const patchProbe = (fn: (s: string, wrap: Wrap) => string) => {
++  const calls: string[] = []
++  try {
++    const value = fn('./src/a.ts ./src/b.ts', (path: string) => {
++      calls.push(path)
++      if (calls.length === 1) String.prototype.charCodeAt = function (_index: number) { return 35 }
++      return `<${path}>`
++    })
++    return { value, calls }
++  } finally { String.prototype.charCodeAt = savedCharCodeAt }
++}
++const baselinePatchProbe = patchProbe(linkifyFilePaths)
++assert.deepEqual(baselinePatchProbe.calls, ['./src/a.ts', './src/b.ts'])
++assert.deepEqual(patchProbe(candidate), baselinePatchProbe, 'standalone wrap side effects must not change later scanner matches')
++assert.deepEqual(patchProbe(integratedLinkifier), baselinePatchProbe, 'integrated wrap side effects must not change later scanner matches')
++console.log(`PASS scanner differential and bounded operation counts, exhaustive=${exhaustiveCases}`)
+diff --git a/scripts/verify-file-target-no-separator.ts b/scripts/verify-file-target-no-separator.ts
+new file mode 100644
+index 00000000..e3b5f907
+--- /dev/null
++++ b/scripts/verify-file-target-no-separator.ts
+@@ -0,0 +1,166 @@
++/**
++ * File-path linkification: compare the real source with the previous matcher
++ * on synthetic text, including OSC8 targets and callback/reentrancy behavior.
++ * A bounded relative check catches quadratic work on words without separators;
++ * paths containing separators are intentionally not covered by that budget.
++ * Run serially: node --import tsx/esm scripts/verify-file-target-no-separator.ts
++ */
++import assert from 'node:assert/strict'
++import { performance } from 'node:perf_hooks'
++
++process.env.TERM_PROGRAM = 'kitty'
++process.env.FORCE_COLOR = '3'
++const sourceModule = await import('../src/utils/fileTarget.js')
++const { looksLikeFilePath, fileLinkUrl } = sourceModule
++// This is the actual production export under test, not a hand-written guard.
++const sourceFn: (text: string, wrap: Wrap) => string = sourceModule.linkifyFilePaths
++assert.equal(typeof sourceFn, 'function')
++assert.equal(sourceFn, sourceModule.linkifyFilePaths)
++const { createHyperlink } = await import('../src/terminal-utils/hyperlink.js')
++type Wrap = (path: string, display: string) => string
++const oldPattern = /(?:\.{1,2}[\\/]|[\\/]|~[\\/]|[A-Za-z]:[\\/])[^\s<>"'`|?#]*|(?:[^\s<>"'`|?#]*[\\/][^\s<>"'`|?#]*\.[A-Za-z0-9]{1,6})/gu
++// Literal legacy algorithm and regex, but the real source looksLikeFilePath:
++// the oracle does not speculate about current path acceptance rules.
++function legacy(text: string, wrap: Wrap): string {
++  return text.replace(oldPattern, (match: string, offset: number, full: string) => {
++    if (offset > 0 && !/[\s<>"'`|([{=]/u.test(full[offset - 1]!)) return match
++    const display = match.replace(/[.,;:!?]+$/u, '')
++    if (display === '' || !looksLikeFilePath(display)) return match
++    return wrap(display, display) + match.slice(display.length)
++  })
++}
++type Outcome =
++  | { ok: true; value: string; calls: string[][] }
++  | { ok: false; errorType: string; errorName: string; errorMessage: string; calls: string[][] }
++function observe(fn: (s: string, wrap: Wrap) => string, text: string, osc: boolean): Outcome {
++  const calls: string[][] = []
++  let nested = false
++  const wrap: Wrap = (path, display) => {
++    calls.push(['outer-before', path, display])
++    if (!nested) {
++      nested = true
++      calls.push(['nested-before'])
++      const inner = fn('nested ./src/file.ts and C:\\dir\\file.txt', (p, d) => {
++        calls.push(['inner-before', p, d])
++        const value = `<${p}|${d}>`
++        calls.push(['inner-after', p, d, value])
++        return value
++      })
++      calls.push(['nested-after', inner])
++    }
++    // If a callback unexpectedly throws, preserve the preceding callback
++    // side effects and absence of outer-after for differential comparison.
++    const value = osc
++      ? createHyperlink(fileLinkUrl(path), display, { supportsHyperlinks: true, style: s => s })
++      : `{${path}|${display}}`
++    calls.push(['outer-after', path, display, value])
++    return value
++  }
++  try {
++    return { ok: true, value: fn(text, wrap), calls }
++  } catch (error) {
++    return {
++      ok: false,
++      errorType: error instanceof Error ? error.constructor.name : typeof error,
++      errorName: error instanceof Error ? error.name : '',
++      errorMessage: error instanceof Error ? error.message : String(error),
++      calls,
++    }
++  }
++}
++function compare(text: string): void {
++  for (const osc of [false, true]) {
++    const actual = observe(sourceFn, text, osc)
++    const expected = observe(legacy, text, osc)
++    assert.deepEqual(actual, expected, `${osc ? 'real OSC8' : 'replacement'} result/error/callback order mismatch: ${JSON.stringify(text)}`)
++    if (!text.includes('/') && !text.includes('\\')) assert.deepEqual(actual.calls, [], 'no-separator text must not call wrap')
++  }
++}
++// Malformed UTF-16 must remain the exact original JS string, never enter
++// wrap or become any OSC8 target. Real UTF-8 transport displays U+FFFD.
++for (const bad of ['a\ud800/b.ts', 'a\udc00/b.ts']) {
++  assert.equal(looksLikeFilePath(bad), false, 'malformed UTF-16 must not be accepted as a file target')
++  const source = observe(sourceFn, bad, true)
++  const expected = observe(legacy, bad, true)
++  assert.deepEqual(source, expected)
++  assert.equal(source.ok, true, 'malformed UTF-16 must not throw')
++  if (source.ok) {
++    assert.equal(source.value, bad, 'the original JS string must be preserved')
++    assert.ok(!source.value.includes('\x1b]8;'), 'no malformed path may become a hyperlink')
++    assert.equal(Buffer.from(source.value, 'utf8').toString('utf8'), 'a\ufffd/b.ts', 'UTF-8 transport must leave readable replacement text')
++  }
++  assert.deepEqual(source.calls, [], 'malformed path must not invoke wrap')
++  console.log(`PASS malformed UTF-16 preserved without wrap: ${JSON.stringify(bad)}`)
++}
++// A valid Unicode path must really reach the real OSC8 writer; equivalent
++// exceptions or empty/plain output are not accepted as a passing test.
++for (const unicodePath of ['./src/文件.ts', './src/🐋.ts']) {
++  assert.equal(looksLikeFilePath(unicodePath), true, 'valid Unicode path must remain eligible')
++  for (const fn of [sourceFn, legacy]) {
++    const result = observe(fn, unicodePath, true)
++    assert.equal(result.ok, true, 'valid Unicode path must render successfully')
++    if (result.ok) {
++      const hrefs = [...result.value.matchAll(/\x1b\]8;[^;]*;([^\x07\x1b]*)(?:\x07|\x1b\\)/g)].map(match => match[1]!).filter(Boolean)
++      assert.deepEqual(hrefs, [fileLinkUrl(unicodePath)], 'valid Unicode OSC8 target must be exact')
++      assert.ok(result.value.includes(unicodePath), 'valid Unicode path label must remain visible')
++    }
++  }
++}
++for (const text of [
++  '', 'ordinary prose 🐋', '汉\u00a0字\u2028x\ufeffy', 'x'.repeat(256),
++  './src/file.ts-backup', 'src/index.ts.', '../x', '.../a.b', 'abc/z.a/y.b',
++  '/a/b', '~/.config/a', 'C:\\dir\\file.txt', '\\server\\share\\a.ts', 'x\\y.z',
++  'owner/repo#123456789', 'https://example.com/src/file.ts', 'www.example.org/a/b.ts',
++  '(./src/foo.ts),', '=src/file.js;', 'prefix./a/file.ts',
++  'a\ud800/b.ts', 'a\udc00/b.ts', '🐋/file.ts', '字/文件.ts',
++]) compare(text)
++let seed = 0x4e6f6465
++const random = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed }
++const alphabet = ['a','Z','0','.','/','\\','~',':','#','?','!',',',';','=','(',')','[',']','"',"'",'`','|','*','@',' ','\t','\n','\u00a0','\u2028','\ufeff','🐋','汉','\ud800','\udc00']
++for (let n = 0; n < 6000; n++) {
++  let text = ''
++  const size = random() % 100
++  for (let i = 0; i < size; i++) text += alphabet[random() % alphabet.length]
++  compare(text)
++}
++const marker = new Error('callback marker')
++for (const fn of [sourceFn, legacy]) {
++  const calls: string[] = []
++  assert.throws(() => fn('./src/file.ts', (path: string) => {
++    calls.push(path)
++    fn('no separators 🐋', () => { throw new Error('unexpected nested callback') })
++    throw marker
++  }), error => error === marker)
++  assert.deepEqual(calls, ['./src/file.ts'])
++}
++console.log('PASS file-path semantic and OSC8 differential')
++
++// Same 8k fixture, same process, alternating order. 3 raw samples each;
++// timings are diagnostic only until all semantic checks passed. The fixed-size
++// fixture runs as a serial gate. It deliberately does NOT benchmark any
++// slash-containing text or claim its complexity improved.
++const input = 'q'.repeat(8000)
++const noWrap: Wrap = () => { throw new Error('no-slash word must not invoke wrap') }
++for (const size of [128, 256]) { assert.equal(sourceFn(input.slice(0, size), noWrap), input.slice(0, size)); assert.equal(legacy(input.slice(0, size), noWrap), input.slice(0, size)) }
++const raw: Record<'source' | 'legacy', number[]> = { source: [], legacy: [] }
++const run = (name: 'source' | 'legacy', fn: typeof sourceFn) => {
++  const start = performance.now()
++  const result = fn(input, noWrap)
++  const ms = performance.now() - start
++  assert.equal(result, input)
++  raw[name].push(ms)
++}
++for (let i = 0; i < 3; i++) {
++  if (i % 2 === 0) { run('legacy', legacy); run('source', sourceFn) }
++  else { run('source', sourceFn); run('legacy', legacy) }
++}
++const median = (v: number[]) => [...v].sort((a, b) => a - b)[1]!
++const sourceMedian = median(raw.source)
++const legacyMedian = median(raw.legacy)
++console.log(`PERF raw_ms=${JSON.stringify(raw)} source_median_ms=${sourceMedian} legacy_median_ms=${legacyMedian} ratio=${sourceMedian / legacyMedian}`)
++assert.ok(Number.isFinite(legacyMedian) && legacyMedian > 0, 'legacy timing is unmeasurable; report inconclusive')
++// Intentionally loose relative gate, not an absolute machine-specific budget.
++// On the current unguarded source sourceFn should perform like legacy and fail;
++// after the actual guard is applied to production source it should pass.
++assert.ok(sourceMedian < legacyMedian * 0.5, 'source no-slash path is not substantially faster than same-process legacy oracle')
++console.log('PASS real-source no-separator relative performance')
+diff --git a/scripts/verify-file-target-slash-performance.ts b/scripts/verify-file-target-slash-performance.ts
+new file mode 100644
+index 00000000..1db30687
+--- /dev/null
++++ b/scripts/verify-file-target-slash-performance.ts
+@@ -0,0 +1,92 @@
++/**
++ * Focused slash and punctuation regression. The timing check compares the
++ * actual fileTarget export to the same-process legacy oracle; deterministic
++ * operation-count and output/OSC8 checks are independent hard requirements.
++ * Run serially: nice -n 10 node --import tsx/esm scripts/verify-file-target-slash-performance.ts
++ */
++import assert from 'node:assert/strict'
++import { performance } from 'node:perf_hooks'
++import { fileLinkUrl, linkifyFilePaths, looksLikeFilePath } from '../src/utils/fileTarget.js'
++import { createHyperlink } from '../src/terminal-utils/hyperlink.js'
++
++type Wrap = (path: string, display: string) => string
++const pattern = /(?:\.{1,2}[\\/]|[\\/]|~[\\/]|[A-Za-z]:[\\/])[^\s<>"'`|?#]*|(?:[^\s<>"'`|?#]*[\\/][^\s<>"'`|?#]*\.[A-Za-z0-9]{1,6})/gu
++function legacy(text: string, wrap: Wrap): string {
++  if (!text.includes('/') && !text.includes('\\')) return text
++  return text.replace(pattern, (match: string, offset: number, full: string) => {
++    if (offset > 0 && !/[\s<>"'`|([{=]/u.test(full[offset - 1]!)) return match
++    const display = match.replace(/[.,;:!?]+$/u, '')
++    if (display === '' || !looksLikeFilePath(display)) return match
++    return wrap(display, display) + match.slice(display.length)
++  })
++}
++// Keep the old-version run meaningful: missing candidate module is recorded,
++// not substituted with a hand-written guard or silently skipped. Raw legacy
++// and actual-source timings are still reported before the gate fails.
++let scanner: typeof import('../src/utils/pathSpan.js') | undefined
++let missingScanner: unknown
++try { scanner = await import('../src/utils/pathSpan.js') }
++catch (error) {
++  if (!(error instanceof Error) || !('code' in error) || error.code !== 'ERR_MODULE_NOT_FOUND' || !error.message.includes('pathSpan')) throw error
++  missingScanner = error
++}
++const noWrap: Wrap = () => { throw new Error('adversarial input must not invoke wrap') }
++const fixtures = [
++  { name: 'trailing-slash', value: 'a'.repeat(8000) + '/' },
++  { name: 'failed-punctuation-tail', value: '/' + '.'.repeat(4000) + 'x' },
++]
++const samples: Record<string, { source: number[]; legacy: number[] }> = {}
++for (const { name, value } of fixtures) {
++  const raw = samples[name] = { source: [], legacy: [] }
++  for (const size of [64, 128]) {
++    const input = value.slice(0, size)
++    assert.equal(linkifyFilePaths(input, noWrap), legacy(input, noWrap), `${name} warmup`)
++  }
++  const sample = (label: 'source' | 'legacy', fn: (text: string, wrap: Wrap) => string) => {
++    const start = performance.now()
++    const output = fn(value, noWrap)
++    const elapsed = performance.now() - start
++    assert.equal(output, value, `${name} ${label} must preserve output`)
++    raw[label].push(elapsed)
++  }
++  for (let round = 0; round < 5; round++) {
++    if (round % 2 === 0) { sample('legacy', legacy); sample('source', linkifyFilePaths) }
++    else { sample('source', linkifyFilePaths); sample('legacy', legacy) }
++  }
++}
++const median = (values: number[]) => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)]!
++for (const [name, raw] of Object.entries(samples)) {
++  const source = median(raw.source)
++  const reference = median(raw.legacy)
++  console.log(`PERF ${name} raw_ms=${JSON.stringify(raw)} source_median=${source} legacy_median=${reference} ratio=${source / reference}`)
++  assert.ok(reference > 0 && Number.isFinite(reference), `${name}: legacy timing is not measurable`)
++  // A noisy runner can fail this relative gate and must be investigated.
++  assert.ok(source < reference * 0.5, `${name}: source is not substantially faster than same-process legacy`)
++}
++
++// Deterministic gates measure the SAME exported scanner/trim helpers used by
++// fileTarget, not a test-side scanner. The old checkout lacks these exports.
++assert.ok(scanner, `candidate scan helpers unavailable: ${String(missingScanner)}`)
++for (const n of [1000, 4000, 8000, 100000]) {
++  for (const input of ['a'.repeat(n) + '/', '/' + 'a'.repeat(n), '/' + '.'.repeat(n) + 'x']) {
++    const stats = { steps: 0 }
++    const found = [...scanner.scanPathSpans(input, stats)]
++    assert.ok(stats.steps <= 4 * input.length + 8, `scanner step bound ${stats.steps}/${input.length}`)
++    assert.ok(found.length >= 1, 'slash adversary must exercise actual path-span matching')
++    assert.equal(linkifyFilePaths(input, noWrap), input, 'candidate must preserve adversarial content')
++  }
++  const failed = '/' + '.'.repeat(n) + 'x'
++  const failedStats = { inspected: 0 }
++  assert.equal(scanner.trailingPathPunctuationStart(failed, failedStats), failed.length)
++  assert.equal(failedStats.inspected, 1)
++  const validPath = './src/文件.ts'
++  const suffix = '!'.repeat(n)
++  const suffixStats = { inspected: 0 }
++  assert.equal(scanner.trailingPathPunctuationStart(validPath + suffix, suffixStats), validPath.length)
++  assert.equal(suffixStats.inspected, n + 1)
++  const out = linkifyFilePaths(validPath + suffix, (path, display) => createHyperlink(fileLinkUrl(path), display, { supportsHyperlinks: true, style: s => s }))
++  const targets = [...out.matchAll(/\x1b\]8;[^;]*;([^\x07\x1b]*)(?:\x07|\x1b\\)/g)].map(match => match[1]!).filter(Boolean)
++  assert.deepEqual(targets, [fileLinkUrl(validPath)])
++  assert.ok(out.endsWith(suffix), 'long punctuation suffix must remain visible')
++}
++console.log('PASS slash/punctuation operation, semantics, OSC8 and relative-speed checks')
+diff --git a/scripts/verify-folded-code-summary.ts b/scripts/verify-folded-code-summary.ts
+new file mode 100644
+index 00000000..4dd97f7e
+--- /dev/null
++++ b/scripts/verify-folded-code-summary.ts
+@@ -0,0 +1,86 @@
++/**
++ * Folded fence summary equivalence and allocation regression.
++ * Run: node --expose-gc --import tsx/esm scripts/verify-folded-code-summary.ts
++ */
++import assert from 'node:assert/strict'
++import { summarizeFoldedCode } from '../src/components/Markdown.js'
++
++function original(text: string): { lineCount: number; preview: string } {
++  const lines = text.split('\n')
++  if (lines.at(-1) === '') lines.pop()
++  const lineCount = text === '' ? 0 : lines.length
++  for (const line of text.split('\n')) {
++    const trimmed = line.trim()
++    if (trimmed !== '') return { lineCount, preview: trimmed.length > 160 ? `${trimmed.slice(0, 160)}…` : trimmed }
++  }
++  return { lineCount, preview: '' }
++}
++
++const fixtures = [
++  '', '\n', '\n\n', 'a', 'a\n', 'a\n\n', '\r\n\r\n  x  \r\n',
++  '\u00a0\ufeff\u2028\u2029\n\t字😀  \r\nsecond', '\u0085\nnext',
++  '  ' + 'a'.repeat(159) + '  ', 'a'.repeat(160), 'a'.repeat(161),
++  'a'.repeat(159) + '😀' + '  \n', ' '.repeat(100_000) + '\n  tail  ',
++  ('x\n').repeat(200_000), '  ' + 'x'.repeat(1_000_000) + '  ',
++  'x' + ' '.repeat(1_000_000) + '\nnext',
++  ' '.repeat(4095) + '😀' + '\u2028\u2029\nnext',
++  '😀' + ' '.repeat(4095) + '\nsecond',
++  '\u2028'.repeat(4096) + '\u2029\r\n' + 'first' + '\nlast',
++  'x'.repeat(4095) + '😀' + ' '.repeat(4095),
++]
++for (const text of fixtures) assert.deepEqual(summarizeFoldedCode(text), original(text))
++
++// Check the trim classification of every UTF-16 code unit, not just examples.
++for (let code = 0; code <= 0xffff; code++) {
++  const unit = String.fromCharCode(code)
++  for (const text of [unit + 'x', 'x' + unit, unit + '\n' + 'x']) {
++    assert.deepEqual(summarizeFoldedCode(text), original(text), `UTF-16 unit ${code.toString(16)}`)
++  }
++}
++
++// Deterministic differential fuzz includes lone surrogates and every trim whitespace.
++let seed = 0x12345678
++const units = ['a', ' ', '\n', '\r', '\t', '\v', '\f', '\u00a0', '\u1680', '\u2000', '\u200a', '\u2028', '\u2029', '\u202f', '\u205f', '\u3000', '\ufeff', '\u0085', '\ud83d', '\ude00', '中']
++for (let trial = 0; trial < 10_000; trial++) {
++  seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0
++  const length = seed % 300
++  let text = ''
++  for (let i = 0; i < length; i++) {
++    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0
++    text += units[seed % units.length]
++  }
++  assert.deepEqual(summarizeFoldedCode(text), original(text), `trial ${trial}`)
++}
++
++assert.ok(global.gc, 'run with --expose-gc')
++// Input is flattened before measuring; only generation allocation is measured.
++const large = ('line contents for summary\n').repeat(200_000)
++large.charCodeAt(large.length - 1)
++global.gc()
++const beforeGeneration = process.memoryUsage().heapUsed
++const result = summarizeFoldedCode(large)
++const generationDelta = process.memoryUsage().heapUsed - beforeGeneration
++assert.deepEqual(result, { lineCount: 200_000, preview: 'line contents for summary' })
++assert.ok(generationDelta < 4 * 1024 * 1024, `generation allocated ${generationDelta} bytes`)
++
++// Keep only summaries, not the synthetic input strings; a substring backed by
++// even one full input would retain megabytes after GC. Each input is unique.
++global.gc()
++const beforeRetention = process.memoryUsage().heapUsed
++function makeSummaries(): Array<{ lineCount: number; preview: string }> {
++  const summaries: Array<{ lineCount: number; preview: string }> = []
++  for (let i = 0; i < 12; i++) {
++    const text = `${String(i).padStart(3, '0')}${'x'.repeat(3_000_000)}\n`
++    summaries.push(summarizeFoldedCode(text))
++  }
++  return summaries
++}
++const summaries = makeSummaries()
++// Let V8 clear transient stack roots from the producer before measuring.
++await new Promise<void>(resolve => setImmediate(resolve))
++global.gc()
++const retainedDelta = process.memoryUsage().heapUsed - beforeRetention
++assert.equal(summaries.length, 12)
++assert.ok(summaries.every((value, i) => value.lineCount === 1 && value.preview === `${String(i).padStart(3, '0')}${'x'.repeat(157)}…`))
++assert.ok(retainedDelta < 2 * 1024 * 1024, `summaries retained ${retainedDelta} bytes`)
++console.log(`folded summary: ${fixtures.length} fixtures + 65536 UTF-16 units x 3 + 10000 differential cases; generation delta ${generationDelta} bytes, retained delta ${retainedDelta} bytes`)
+diff --git a/scripts/verify-long-line-fold.tsx b/scripts/verify-long-line-fold.tsx
+index ba469108..2c1e62a8 100644
+--- a/scripts/verify-long-line-fold.tsx
++++ b/scripts/verify-long-line-fold.tsx
+@@ -378,20 +378,28 @@ console.log('--- E: mouse click toggles the fold ---')
+   )
+ }
+ 
+-// 流式 assistant 行：折叠态同样要能点开（走的是独立的 streaming 分支，
+-// 状态与落定行分开，接线漏掉就会出现「显示折叠标记却点不动」）。
++// 流式 assistant 行：**不折叠**（需求契约：流式期间说话不能突然断掉，
++// 落定后才允许长行折叠）。StreamingMarkdown 只封印稳定前缀/裁不稳定后缀，
++// 它从不显示 long-line 折叠标记，这里守的就是「流式帧里没有折叠标记，
++// 已到达的尾巴真的在屏上」。
+ {
+   const rows: Row[] = [{ id: 1, kind: 'assistant', text: `${HEAD}-stream-${'s'.repeat(60_000)}-${TAIL}`, streaming: true }]
+   await withMessageList(
+     () => <AlternateScreen><KeySink /><FoldList rows={rows} /></AlternateScreen>,
+-    async ({ screen, term, stdin }) => {
+-      check('E9 streaming row folds and shows the marker', packed(screen()).includes(MARKER_PACKED), digest(screen()))
+-      const head = findText(term, `${HEAD}-stream-`)
+-      check('E10 the streaming row is on screen to click', head !== null, digest(screen()))
+-      if (head === null) return
+-      click(stdin, head.col + 1, head.row + 1)
+-      check('E11 a click on the streaming row expands the arrived text',
+-        await settled(() => packed(screen()).includes(TAIL)), digest(screen()))
++    async ({ screen, term }) => {
++      check('E9 streaming row paints no long-line fold marker',
++        !packed(screen()).includes(MARKER_PACKED) && !packed(screen()).includes('chars folded'), digest(screen()))
++      // 60k 的单行让 HEAD 滚出视口，能验证「在屏」的锚点是尾巴本身。
++      check('E10 the arrived tail is already painted without a click',
++        findText(term, TAIL) !== null, digest(screen()))
++    },
++  )
++  // 落定后同一条长行才允许折叠：这是 E9 的另一半契约。
++  await withMessageList(
++    () => <AlternateScreen><KeySink /><FoldList rows={[{ id: 1, kind: 'assistant', text: `${HEAD}-stream-${'s'.repeat(60_000)}-${TAIL}` }]} /></AlternateScreen>,
++    async ({ screen }) => {
++      check('E12 the same row folds once the turn settles',
++        packed(screen()).includes(MARKER_PACKED), digest(screen()))
+     },
+   )
+ }
+diff --git a/scripts/verify-long-prose-ansi.tsx b/scripts/verify-long-prose-ansi.tsx
+new file mode 100644
+index 00000000..28e2a0ba
+--- /dev/null
++++ b/scripts/verify-long-prose-ansi.tsx
+@@ -0,0 +1,237 @@
++/**
++ * Real event -> channel -> Chat/MessageList -> terminal stream regression.
++ * No real session, credential, profile or terminal is used.
++ * Run serially: nice -n 10 node --import tsx/esm scripts/verify-long-prose-ansi.tsx
++ */
++import assert from 'node:assert/strict'
++import { closeSync, mkdtempSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, writeSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { basename, dirname, join, resolve } from 'node:path'
++import { PassThrough, Writable } from 'node:stream'
++
++const tmpBase = realpathSync(tmpdir())
++const scratch = mkdtempSync(join(tmpBase, 'dsh-long-prose-ansi-'))
++const scratchReal = realpathSync(scratch)
++const envBefore = { ...process.env }
++// No inherited application paths, secrets or user configuration reach imports.
++for (const key of Object.keys(process.env)) {
++  if (/^(DSH|XDG|HOME|.*(?:TOKEN|SECRET|CREDENTIAL|API_KEY|PASSWORD))/i.test(key)) delete process.env[key]
++}
++process.env.HOME = join(scratch, 'home')
++process.env.DSH_HOME = join(scratch, 'dsh')
++process.env.XDG_CONFIG_HOME = join(scratch, 'config')
++process.env.XDG_CACHE_HOME = join(scratch, 'cache')
++process.env.XDG_DATA_HOME = join(scratch, 'data')
++process.env.XDG_STATE_HOME = join(scratch, 'state')
++process.env.FORCE_COLOR = '3'
++process.env.DSH_TUI_THEME = 'dark'
++process.env.DSH_TUI_LANG = 'en'
++process.env.TERM = 'xterm-256color'
++process.env.TERM_PROGRAM = 'kitty' // Explicitly exercise OSC8 rather than the URL-only fallback.
++mkdirSync(process.env.HOME, { recursive: true })
++
++const [React, { Terminal }, { render, AlternateScreen }, { Chat }, { QuestionStore }, { createChannel }, { mountChannelUi }, { registerTuiChannel }, { bindChannelCommands }, { settled }, { marked }, { formatToken, configureMarked }] = await Promise.all([
++  import('react'), import('@xterm/headless'), import('../src/ui.js'), import('../src/screens/Chat.js'),
++  import('../src/dsh-adapter/questions.js'), import('../src/dsh-adapter/channel.js'),
++  import('../src/dsh-adapter/channel-ui.js'), import('../src/adapter/channel/host-registry.js'),
++  import('../src/dsh-adapter/channel/commands.js'), import('./lib/term-test.mjs'),
++  import('marked'), import('../src/terminal-utils/markdown.js'),
++])
++
++const COLS = 100
++const ROWS = 55
++const short = '[go](https://example.com) ' + '**x** '.repeat(145)
++configureMarked()
++const formatted = marked.lexer(short).map(token => formatToken(token, 0, null, null, null)).join('')
++assert.ok(short.length < 1000 && formatted.length > 1000, `fixture lengths ${short.length}/${formatted.length}`)
++console.log(`fixture: raw=${short.length}, markdown ANSI=${formatted.length}`)
++
++// Parse the *concatenated* terminal stream, never individual writes/frames.
++// The renderer legitimately splits cursor/SGR restoration across writes.
++function validateStream(stream: string): void {
++  let state: 'ground' | 'esc' | 'csi' | 'osc' | 'oscEsc' = 'ground'
++  let osc = ''
++  let linkOpen = false
++  const finishOsc = () => {
++    if (!osc.startsWith('8;')) return
++    assert.match(osc, /^8;[^;]*;[^\x00-\x1f]*$/)
++    linkOpen = osc.slice(osc.indexOf(';', 2) + 1) !== ''
++  }
++  for (let i = 0; i < stream.length; i++) {
++    const c = stream[i]!
++    const n = c.charCodeAt(0)
++    if (state === 'ground') { if (c === '\x1b') state = 'esc'; continue }
++    if (state === 'esc') {
++      if (c === '[') state = 'csi'
++      else if (c === ']') { state = 'osc'; osc = '' }
++      else if (n >= 0x30 && n <= 0x7e) state = 'ground'
++      else throw new Error(`invalid ESC at byte ${i}`)
++    } else if (state === 'csi') {
++      if (n >= 0x40 && n <= 0x7e) state = 'ground'
++      else if (n < 0x20 || n > 0x3f) throw new Error(`incomplete CSI before byte ${i}`)
++    } else if (state === 'osc') {
++      if (c === '\x07') { finishOsc(); state = 'ground' }
++      else if (c === '\x1b') state = 'oscEsc'
++      else if (n < 0x20) throw new Error(`incomplete OSC before byte ${i}`)
++      else osc += c
++    } else {
++      if (c !== '\\') throw new Error(`incomplete OSC/ST before byte ${i}`)
++      finishOsc()
++      state = 'ground'
++    }
++  }
++  assert.equal(state, 'ground', `terminal stream ends inside ${state}`)
++  assert.equal(linkOpen, false, 'OSC8 hyperlink left open at end of terminal stream')
++}
++// A restore can cross writes; an unfinished or interrupted control sequence
++// cannot. Self-check the validator against both without inventing frame cuts.
++validateStream(['\x1b[38;2;', '1;2;3m', '\x1b]8;;https://example.com', '\x07x', '\x1b]8;;\x07', '\x1b[0', 'm'].join(''))
++assert.throws(() => validateStream('\x1b[38;2;1'))
++assert.throws(() => validateStream('\x1b]8;;https://example.com\x1b[0m'))
++
++const longUrl = 'https://example.com/' + 'u'.repeat(1100) + 'URLTAIL'
++const longLabel = 'L'.repeat(1100) + 'LABELTAIL'
++const longBold = 'B'.repeat(1100) + 'BOLDTAIL'
++const issue = 'owner/repo#123456789'
++const issueTarget = 'https://github.com/owner/repo/issues/123456789'
++const filePath = './src/file.ts-backup'
++const fileTarget = 'dsh-file:' + encodeURIComponent(filePath)
++// Put the truncation boundary inside the meaningful token, not in padding.
++const boundaryPrefix = (partial: string) => 'p'.repeat(999 - partial.length) + ' '
++// Both BEL and ST terminate OSC; parameters (including optional ids) vary.
++const osc8Hrefs = (stream: string): string[] =>
++  [...stream.matchAll(/\x1b\]8;[^;]*;([^\x07\x1b]*)(?:\x07|\x1b\\)/g)].map(match => match[1]!)
++const cases = [
++  { name: 'short formatted prose', source: short, kind: 'short' },
++  { name: 'long Markdown URL', source: `[go](${longUrl})`, kind: 'url', target: longUrl, prefix: 'https://example.com/u', tail: 'go' },
++  { name: 'bare long URL', source: longUrl, kind: 'bare-url', target: longUrl, prefix: 'https://example.com/u', tail: 'URLTAIL' },
++  { name: 'issue reference boundary', source: boundaryPrefix('owner/repo#12') + issue, kind: 'issue', target: issueTarget, prefix: 'https://github.com/owner/repo/issues/', tail: issue },
++  { name: 'file reference boundary', source: boundaryPrefix('./src/file.ts') + filePath, kind: 'file', target: fileTarget, prefix: 'dsh-file:', tail: filePath },
++  { name: 'Markdown reference URL', source: `[go][ref]\n\n[ref]: ${longUrl}`, kind: 'reference', target: longUrl, prefix: 'https://example.com/u', tail: 'go' },
++  { name: 'long label', source: `[${longLabel}](https://example.com)`, kind: 'label', tail: 'LABELTAIL' },
++  { name: 'long bold', source: `**${longBold}**`, kind: 'bold', tail: 'BOLDTAIL' },
++] as const
++let failures = 0
++try {
++  for (const item of cases) {
++    const events = [
++      { type: 'user/message', seq: 1, time: 1, data: { id: 'prompt', source: { kind: 'user' }, content: [{ type: 'text', text: 'TEST PROMPT' }] } },
++      { type: 'assistant/message', seq: 2, time: 2, data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: item.source + '\n\nAFTER_SENTINEL' }] } } },
++    ]
++    const callbacks = new Map<string, Set<(...args: unknown[]) => unknown>>()
++    const cleanups: (() => void)[] = []
++    const agent = { id: 'isolated', status: 'idle', session: { id: 'isolated-session', seq: 2, events, header: { cwd: scratch } }, ctx: { on: () => () => undefined }, followup() {}, steer() {}, cancel() {}, inbox: { remove: () => true } }
++    const services: Record<string, unknown> = {
++      settings: { describe: () => [{ ns: 'dsh-tui', revision: 1, user: {}, value: { recapOnOpen: false } }], get: () => ({}), mutate: async () => undefined },
++      credentials: { resolve: async () => undefined, set: async () => { throw new Error('credential write forbidden') }, unset: async () => { throw new Error('credential write forbidden') } },
++      llm: { listConfigurableProviders: () => [], discoverModels: async () => [] },
++    }
++    const ctx = { on(name: string, listener: (...args: unknown[]) => unknown) { const set = callbacks.get(name) ?? new Set(); set.add(listener); callbacks.set(name, set); return () => { set.delete(listener) } }, effect(setup: () => () => void) { cleanups.push(setup()) }, get(name: string) { return services[name] }, logger: { warn() {} } }
++    const raw = createChannel(ctx as never, agent as never, { model: 'model', provider: 'provider', cwd: scratch, activity: false, whale: false, whaleIdle: false, minimalUi: true, smoothStreaming: false })
++    const unregister = registerTuiChannel(ctx, raw)
++    const mount = mountChannelUi(ctx, raw, undefined, 'new')
++    bindChannelCommands(raw, mount.channel)
++    const term = new Terminal({ cols: COLS, rows: ROWS, scrollback: 0, allowProposedApi: true })
++    // Ink writes shutdown restoration directly to stdout.fd. Capture those
++    // synchronous writes AND stream writes in the same owned file, preserving
++    // their actual ordering; neither ever targets the user's fd 1.
++    const capturePath = join(scratch, `terminal-${item.kind}`)
++    const fd = openSync(capturePath, 'wx+')
++    let output = ''
++    let pending = 0
++    class FakeOut extends Writable {
++      columns = COLS; rows = ROWS; isTTY = true; fd = fd
++      _write(chunk: Buffer, _encoding: BufferEncoding, done: () => void) { writeSync(fd, chunk); output += chunk.toString(); pending++; term.write(chunk.toString(), () => { pending--; done() }) }
++    }
++    class FakeIn extends PassThrough { isTTY = true; setRawMode() { return this }; ref() { return this }; unref() { return this } }
++    const stdout = new FakeOut()
++    const stdin = new FakeIn()
++    const stderr = Object.assign(new Writable({ write(_chunk, _encoding, done) { done() } }), { isTTY: false, fd })
++    const lines = () => Array.from({ length: ROWS }, (_, y) => term.buffer.active.getLine(term.buffer.active.baseY + y)?.translateToString(true) ?? '')
++    const text = () => lines().join('\n')
++    const message = () => {
++      const screen = lines()
++      const begin = screen.findIndex(line => line.includes('● '))
++      const end = screen.findIndex((line, index) => index > begin && line.includes('AFTER_SENTINEL'))
++      assert.ok(begin >= 0 && end > begin, 'assistant and trailing sentinel must be visible')
++      return screen.slice(begin, end).join('\n')
++    }
++    const assertSentinelNotBold = () => {
++      const sentinelRow = lines().findIndex(line => line.includes('AFTER_SENTINEL'))
++      assert.ok(sentinelRow >= 0, 'following paragraph must remain visible')
++      const sentinelCol = lines()[sentinelRow]!.indexOf('AFTER_SENTINEL')
++      assert.equal(Boolean(term.buffer.active.getLine(term.buffer.active.baseY + sentinelRow)?.getCell(sentinelCol)?.isBold()), false, 'bold must not leak into the following paragraph')
++    }
++    let app: Awaited<ReturnType<typeof render>> | undefined
++    try {
++      assert.ok(mount.channel.rows.some(row => row.kind === 'assistant' && row.text.includes(item.source)), 'real event must project into assistant row')
++      app = await render(<AlternateScreen><Chat channel={mount.channel} questionStore={new QuestionStore()} fullscreen trajectorySeen /></AlternateScreen>, { stdout: stdout as never, stdin: stdin as never, stderr: stderr as never, patchConsole: false, exitOnCtrlC: false })
++      assert.ok(await settled(() => pending === 0 && text().includes('AFTER_SENTINEL')), 'initial terminal paint did not settle')
++      assertSentinelNotBold()
++      if (item.kind === 'short') {
++        assert.doesNotMatch(text(), /chars folded/i, 'short raw prose must not be folded due to ANSI expansion')
++        assert.ok(message().includes('go'), 'link label must remain visible')
++        assert.ok(osc8Hrefs(output).includes('https://example.com'), 'actual output must preserve the hyperlink destination')
++        assert.equal((message().match(/x/g) ?? []).length, 145, 'every formatted x must be painted')
++        let boldX = 0
++        const screen = lines()
++        const begin = screen.findIndex(line => line.includes('● '))
++        const end = screen.findIndex((line, index) => index > begin && line.includes('AFTER_SENTINEL'))
++        assert.ok(begin >= 0 && end > begin, 'assistant text must be bounded on screen')
++        for (let y = begin; y < end; y++) for (let x = 0; x < COLS; x++) {
++          const cell = term.buffer.active.getLine(term.buffer.active.baseY + y)?.getCell(x)
++          if (cell?.getChars() === 'x' && cell.isBold()) boldX++
++        }
++        assert.equal(boldX, 145, 'all x cells must actually be bold in xterm')
++      } else {
++        assert.match(text(), /chars folded/i, 'long input must offer expansion')
++        if ('target' in item) {
++          // The capture is the real sequence of terminal writes, not the
++          // formatted model. A complete href or no href is safe; a clipped
++          // or otherwise changed destination is not.
++          const hrefs = osc8Hrefs(output)
++          const wrong = hrefs.filter(href => href.startsWith(item.prefix) && href !== item.target)
++          if (wrong.length) {
++            failures++
++            console.error(`FAIL: ${item.name} folded paint emits wrong OSC8 href(s): ${JSON.stringify(wrong.map(href => href.slice(0, 100)))} lengths=${wrong.map(href => href.length).join(',')}`)
++          } else console.log(`PASS: ${item.name} folded paint has no incorrect target`)
++        }
++        const before = output.length
++        stdin.write('\x0f') // actual Chat key event, not a model toggle
++        assert.ok(await settled(() => pending === 0 && output.length > before && !/chars folded/i.test(text()) && text().replace(/\s/g, '').includes(item.tail)), 'Ctrl+O must reveal preserved content')
++        if ('target' in item) assert.ok(output.slice(before).includes(item.target), 'expanded real terminal output must contain the complete hyperlink target')
++        if (item.kind === 'label') assert.equal((message().match(/L/g) ?? []).length, (longLabel.match(/L/g) ?? []).length, 'the complete expanded label must be visible')
++        if (item.kind === 'bold') assert.equal((message().match(/B/g) ?? []).length, (longBold.match(/B/g) ?? []).length, 'the complete expanded bold content must be visible')
++        assertSentinelNotBold()
++      }
++      console.log(`PASS: ${item.name}${item.kind === 'short' ? '' : ' expansion'}`)
++    } catch (error) {
++      failures++
++      console.error(`FAIL: ${item.name}:`, error, '\nSCREEN:\n' + text())
++    } finally {
++      if (app) await app.unmount()
++      // unmount may leave stream writes queued even though its own cleanup is
++      // synchronous. End/finish waits for every _write/xterm callback before
++      // inspecting the stream, disposing the terminal or closing its fd.
++      await new Promise<void>((resolve, reject) => {
++        stdout.once('error', reject)
++        stdout.end(() => resolve())
++      })
++      assert.equal(pending, 0, 'xterm output must drain before closing its fd')
++      try { validateStream(readFileSync(capturePath, 'utf8')) } catch (error) { failures++; console.error(`FAIL: ${item.name} terminal stream:`, error) }
++      mount.dispose(); unregister(); raw.releaseContributions(); for (const cleanup of cleanups.reverse()) cleanup()
++      term.dispose(); closeSync(fd)
++    }
++  }
++} finally {
++  for (const key of Object.keys(process.env)) delete process.env[key]
++  Object.assign(process.env, envBefore)
++  const actual = realpathSync(scratch)
++  assert.equal(actual, scratchReal, 'temporary directory identity changed')
++  assert.equal(dirname(actual), tmpBase, 'temporary directory escaped its parent')
++  assert.ok(basename(actual).startsWith('dsh-long-prose-ansi-'), 'refuse to delete non-test directory')
++  assert.equal(resolve(scratch), actual, 'temporary path must not traverse symlinks')
++  rmSync(actual, { recursive: true })
++}
++if (failures) process.exitCode = 1
++else console.log('Long prose ANSI regression passed')
+diff --git a/scripts/verify-markdown-filelink-ansi.ts b/scripts/verify-markdown-filelink-ansi.ts
+index 4e9d76a7..a4620868 100644
+--- a/scripts/verify-markdown-filelink-ansi.ts
++++ b/scripts/verify-markdown-filelink-ansi.ts
+@@ -17,6 +17,7 @@ process.env.TERM_PROGRAM = 'kitty'
+ const { default: chalk } = await import('chalk')
+ const { applyMarkdown } = await import('../src/terminal-utils/markdown.js')
+ const { createHyperlink } = await import('../src/terminal-utils/hyperlink.js')
++const { default: stripAnsi } = await import('strip-ansi')
+ const React = await import('react')
+ const { Markdown } = await import('../src/components/Markdown.js')
+ const { StreamingMarkdown } = await import('../src/components/StreamingMarkdown.js')
+@@ -55,6 +56,27 @@ try {
+     JSON.stringify(explicit),
+   )
+ 
++  // Malformed UTF-16 cannot be encoded as a file URL. Keep the text visible
++  // through the terminal's UTF-8 transport, without inventing another target.
++  const targets = (text: string): string[] =>
++    [...text.matchAll(/\x1b\]8;[^;]*;([^\x07\x1b]*)(?:\x07|\x1b\\)/g)].map(match => match[1]!).filter(Boolean)
++  for (const form of ['plain', 'code'] as const) {
++    for (const [part, invalid] of [['high', 'a\ud800/b.ts'], ['low', 'a\udc00/b.ts']] as const) {
++      try {
++        const out = applyMarkdown(form === 'plain' ? `open ${invalid} now` : `open \`${invalid}\` now`)
++        const visible = Buffer.from(stripAnsi(out), 'utf8').toString('utf8')
++        check(`${form} ${part} surrogate stays visible without a link`,
++          visible.includes('open a\ufffd/b.ts now') && targets(out).length === 0, JSON.stringify(out))
++      } catch (error) {
++        check(`${form} ${part} surrogate renders without throwing`, false, String(error))
++      }
++    }
++    const path = './src/文件.ts'
++    const out = applyMarkdown(form === 'plain' ? `open ${path} now` : `open \`${path}\` now`)
++    check(`${form} valid Unicode path keeps its exact target`,
++      targets(out).includes('dsh-file:.%2Fsrc%2F%E6%96%87%E4%BB%B6.ts') && stripAnsi(out).includes(path), JSON.stringify(out))
++  }
++
+   const source = 'working/idle/needs-input state,\n\nsrc/utils/fileTarget.ts'
+   for (const [name, Component] of [['Markdown', Markdown], ['StreamingMarkdown', StreamingMarkdown]] as const) {
+     for (const width of [24, 80]) {
+diff --git a/scripts/verify-markdown-lazy-highlight.tsx b/scripts/verify-markdown-lazy-highlight.tsx
+new file mode 100644
+index 00000000..3c8b6a8a
+--- /dev/null
++++ b/scripts/verify-markdown-lazy-highlight.tsx
+@@ -0,0 +1,359 @@
++/**
++ * Cold Markdown highlighter regression. Run from the repository root:
++ *   node --import tsx/esm scripts/verify-markdown-lazy-highlight.tsx
++ *   node --import tsx/esm scripts/verify-markdown-lazy-highlight.tsx --syntax
++ *
++ * Each case runs in a fresh Node process with a real cli-highlight module
++ * cache, a synthetic Ink root and headless xterm. A node:module.registerHooks
++ * preload observes the cli-highlight specifier and delegates to nextResolve;
++ * it does not replace or mock the loader. A later sibling passive effect
++ * imports a sentinel module before the no-load assertions. The control case
++ * calls the real loader and proves the same barrier observes that request.
++ *
++ * Children get NODE_ENV=production before importing React, an environment
++ * whitelist and a private HOME/DSH/XDG/TMP tree. No user session, account,
++ * credential or network is used. Node >=22.19 is required. Windows and other
++ * non-Linux platforms have not yet been validated.
++ *
++ * This focused gate covers ordinary Markdown, folded fence and expansion,
++ * plus SyntaxText's four non-highlighting conditions and later eligible text.
++ * A separate SyntaxText case keeps an empty visible line with nonempty source
++ * eligible. It does not assert mouse routing, nested blocks, streaming long
++ * tails, or pending-load unmount races; broader regressions remain necessary.
++ */
++import assert from 'node:assert/strict'
++import { spawn, type ChildProcess } from 'node:child_process'
++import { closeSync, mkdirSync, mkdtempSync, openSync, realpathSync, rmSync } from 'node:fs'
++import { EventEmitter } from 'node:events'
++import { tmpdir } from 'node:os'
++import { basename, dirname, join } from 'node:path'
++import { PassThrough, Writable } from 'node:stream'
++import { fileURLToPath } from 'node:url'
++import type { ReactNode } from 'react'
++
++const CASES = ['control', 'plain', 'fold', 'syntax-transition', 'syntax-empty'] as const
++type Case = typeof CASES[number]
++const selectedCases: readonly Case[] = process.argv.includes('--syntax')
++  ? ['control', 'syntax-transition', 'syntax-empty']
++  : ['control', 'plain', 'fold']
++type ResolveObserver = { requests: number; notify?: () => void }
++const OBSERVER = '__dshMarkdownHighlightObserver'
++const TIMEOUT_MS = 30_000
++const CAPTURE_LIMIT = 64 * 1024
++
++// Installed before tsx and the entrypoint in each child. Observation only:
++// every request is delegated to Node's real resolver without alteration.
++const observerSource = `
++import { registerHooks } from 'node:module';
++globalThis.${OBSERVER} = { requests: 0 };
++registerHooks({ resolve(specifier, context, nextResolve) {
++  if (specifier === 'cli-highlight') {
++    const state = globalThis.${OBSERVER};
++    state.requests += 1;
++    state.notify?.();
++  }
++  return nextResolve(specifier, context);
++}});
++`
++const observerUrl = `data:text/javascript,${encodeURIComponent(observerSource)}`
++const sentinelUrl = `data:text/javascript,${encodeURIComponent('export const sentinel = true')}`
++
++/** Return only variables needed to launch Node and the synthetic fixture. */
++function childEnvironment(home: string, testCase: Case): NodeJS.ProcessEnv {
++  const env: NodeJS.ProcessEnv = {
++    PATH: process.env.PATH ?? '',
++    HOME: home,
++    USERPROFILE: home,
++    DSH_HOME: join(home, 'dsh'),
++    XDG_CONFIG_HOME: join(home, 'config'),
++    XDG_CACHE_HOME: join(home, 'cache'),
++    XDG_DATA_HOME: join(home, 'data'),
++    XDG_STATE_HOME: join(home, 'state'),
++    TMPDIR: join(home, 'tmp'),
++    TMP: join(home, 'tmp'),
++    TEMP: join(home, 'tmp'),
++    NODE_ENV: 'production',
++    TSX_DISABLE_CACHE: '1',
++    FORCE_COLOR: '3',
++    TERM_PROGRAM: 'kitty',
++    DSH_TUI_LANG: 'en',
++    DSH_TUI_THEME: 'dark',
++    DSH_HIGHLIGHT_TEST_CASE: testCase,
++  }
++  // Windows process launch may need these. Credentials, proxy settings,
++  // NODE_OPTIONS, and all existing DSH/XDG state are intentionally absent.
++  for (const key of ['SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT']) {
++    if (process.env[key] !== undefined) env[key] = process.env[key]
++  }
++  return env
++}
++
++async function runParent(): Promise<void> {
++  const tempRoot = realpathSync(tmpdir())
++  const scratch = realpathSync(mkdtempSync(join(tempRoot, 'dsh-markdown-highlight-')))
++  assert.equal(dirname(scratch), tempRoot)
++  assert.ok(basename(scratch).startsWith('dsh-markdown-highlight-'))
++  let active: ChildProcess | undefined
++  let activeClosed: Promise<void> | undefined
++  let terminateActive: (() => void) | undefined
++  let interrupted = false
++  const interrupt = (): void => { interrupted = true; terminateActive?.() }
++  process.once('SIGINT', interrupt)
++  process.once('SIGTERM', interrupt)
++  try {
++    const tsxLoader = import.meta.resolve('tsx/esm')
++    const entry = fileURLToPath(import.meta.url)
++    const failures: string[] = []
++    console.log(`Markdown lazy-highlight checks: ${process.platform}, Node ${process.version}, production React; non-Linux platforms not yet validated`)
++    for (const testCase of selectedCases) {
++      if (interrupted) throw new Error('runner interrupted')
++      const home = join(scratch, testCase)
++      mkdirSync(join(home, 'tmp'), { recursive: true })
++      const outcome = await new Promise<{ code: number | null; signal: NodeJS.Signals | null; output: string; timedOut: boolean; truncated: boolean; spawnError: string }>(resolve => {
++        const child = spawn(process.execPath, ['--import', observerUrl, '--import', tsxLoader, entry, '--child'], {
++          cwd: home,
++          env: childEnvironment(home, testCase),
++          stdio: ['ignore', 'pipe', 'pipe'],
++        })
++        active = child
++        let resolveClosed: (() => void) | undefined
++        activeClosed = new Promise<void>(done => { resolveClosed = done })
++        let output = ''
++        let truncated = false
++        let timedOut = false
++        let spawnError = ''
++        let killTimer: ReturnType<typeof setTimeout> | undefined
++        const terminate = (): void => {
++          child.kill()
++          killTimer ??= setTimeout(() => child.kill('SIGKILL'), 1_000)
++        }
++        terminateActive = terminate
++        const capture = (data: Buffer): void => {
++          const text = data.toString()
++          const room = Math.max(0, CAPTURE_LIMIT - output.length)
++          output += text.slice(0, room)
++          if (text.length > room) truncated = true
++        }
++        child.stdout?.on('data', capture)
++        child.stderr?.on('data', capture)
++        const timer = setTimeout(() => { timedOut = true; terminate() }, TIMEOUT_MS)
++        // Even a spawn error waits for close, so no scratch files are removed
++        // until the child and both capture pipes have finished.
++        child.once('error', error => { spawnError = error.message })
++        child.once('close', (code, signal) => {
++          clearTimeout(timer)
++          if (killTimer) clearTimeout(killTimer)
++          active = undefined
++          terminateActive = undefined
++          resolveClosed?.()
++          resolve({ code, signal, output, timedOut, truncated, spawnError })
++        })
++      })
++      if (outcome.timedOut || outcome.truncated || outcome.spawnError !== '' || outcome.signal !== null || outcome.code !== 0) {
++        failures.push(`${testCase}: child failed (exit=${outcome.code}, signal=${outcome.signal}, timeout=${outcome.timedOut}, truncated=${outcome.truncated}, spawnError=${outcome.spawnError})\n${outcome.output}${outcome.truncated ? '\n[child output truncated]' : ''}`)
++        console.error(`FAIL ${testCase}`)
++      } else {
++        console.log(`PASS ${testCase}: ${outcome.output.trim()}`)
++      }
++    }
++    if (failures.length > 0) throw new Error(failures.join('\n'))
++  } finally {
++    if (active) {
++      terminateActive?.()
++      await activeClosed
++    }
++    process.removeListener('SIGINT', interrupt)
++    process.removeListener('SIGTERM', interrupt)
++    // Re-resolve and check the owned absolute path immediately before deletion.
++    const actual = realpathSync(scratch)
++    assert.equal(actual, scratch, 'refuse cleanup of redirected scratch directory')
++    assert.equal(dirname(actual), tempRoot, 'refuse cleanup outside temporary root')
++    assert.ok(basename(actual).startsWith('dsh-markdown-highlight-'))
++    rmSync(actual, { recursive: true, force: true })
++  }
++}
++
++async function runChild(): Promise<void> {
++  assert.equal(process.env.NODE_ENV, 'production', 'React must be loaded in production mode')
++  const testCase = process.env.DSH_HIGHLIGHT_TEST_CASE as Case
++  assert.ok(CASES.includes(testCase), 'unknown child case')
++  const observer = (globalThis as typeof globalThis & { [OBSERVER]?: ResolveObserver })[OBSERVER]
++  assert.ok(observer, 'resolve observer preload missing')
++  assert.equal(observer.requests, 0, 'highlighter was already requested before the fixture')
++  const [React, xterm, ui, markdownModule, syntaxModule, loader, stats] = await Promise.all([
++    import('react'), import('@xterm/headless'), import('../src/ui.js'),
++    import('../src/components/Markdown.js'), import('../src/components/SyntaxText.js'),
++    import('../src/terminal-utils/cliHighlight.js'), import('../src/ink/render-stats.js'),
++  ])
++  const { createElement: h, useEffect } = React
++  const { Markdown } = markdownModule
++  const { SyntaxText } = syntaxModule
++  const { render, AlternateScreen, Box, Text } = ui
++  const terminal = new xterm.Terminal({ cols: 100, rows: 30, scrollback: 0, allowProposedApi: true })
++  const fd = openSync(join(process.env.HOME!, 'tty-output'), 'w')
++  const pulse = new EventEmitter()
++  let frames = 0
++  let pendingWrites = 0
++  let barrierEffect = false
++  let barrierDone = false
++  let observedAtBarrier = -1
++  let controlLoaded = false
++  let controlError: unknown
++  observer.notify = () => pulse.emit('change')
++
++  class FakeStdout extends Writable {
++    columns = 100
++    rows = 30
++    isTTY = true
++    fd = fd
++    override _write(chunk: unknown, _encoding: BufferEncoding, done: (error?: Error | null) => void): void {
++      pendingWrites++
++      terminal.write(String(chunk), () => { pendingWrites--; pulse.emit('change'); done() })
++    }
++  }
++  class FakeStdin extends PassThrough {
++    isTTY = true
++    setRawMode(): this { return this }
++    ref(): this { return this }
++    unref(): this { return this }
++  }
++  const stdout = new FakeStdout()
++  const stdin = new FakeStdin()
++  const stderr = Object.assign(new Writable({ write(_chunk, _encoding, done) { done() } }), { isTTY: true })
++  const lines = (): string[] => Array.from({ length: 30 }, (_, y) => terminal.buffer.active.getLine(terminal.buffer.active.baseY + y)?.translateToString(true) ?? '')
++  const has = (text: string): boolean => lines().some(line => line.includes(text))
++  const drain = (): Promise<void> => new Promise((resolve, reject) => stdout.write('', error => error ? reject(error) : resolve()))
++  const waitFor = (predicate: () => boolean, label: string): Promise<void> => new Promise((resolve, reject) => {
++    const finish = (error?: Error): void => { clearTimeout(timer); pulse.off('change', check); error ? reject(error) : resolve() }
++    const check = (): void => { try { if (predicate()) finish() } catch (error) { finish(error instanceof Error ? error : new Error(String(error))) } }
++    const timer = setTimeout(() => finish(new Error(`${testCase}: timed out waiting for ${label}`)), TIMEOUT_MS - 2_000)
++    pulse.on('change', check)
++    check()
++  })
++
++  function EffectBarrier(): null {
++    useEffect(() => {
++      barrierEffect = true
++      void import(sentinelUrl).then(() => queueMicrotask(() => {
++        observedAtBarrier = observer!.requests
++        barrierDone = true
++        pulse.emit('change')
++      }))
++    }, [])
++    return null
++  }
++  function LoaderControl(): null {
++    useEffect(() => {
++      void loader.getCliHighlightPromise().then(value => {
++        controlLoaded = value !== null
++        if (value === null) controlError = new Error('real cli-highlight import returned null')
++        pulse.emit('change')
++      }, error => { controlError = error; pulse.emit('change') })
++    }, [])
++    return null
++  }
++  const root = (child: ReactNode): ReactNode => h(AlternateScreen, null,
++    h(Box, { width: 100, flexDirection: 'column' }, child, h(EffectBarrier)))
++  const code = 'const answer = 42'
++  const fenced = `INTRO\n\n\`\`\`js\n${code}\n\`\`\``
++  // Keep the same four component positions on rerender: only the first
++  // SyntaxText changes from language=undefined to a supported language.
++  const syntaxFixture = (eligible: boolean): ReactNode => h(Box, { flexDirection: 'column' },
++    h(SyntaxText, { text: code, sourceText: code, language: eligible ? 'js' : undefined }),
++    h(SyntaxText, { text: 'EMPTY_SOURCE', sourceText: '', language: 'js' }),
++    h(SyntaxText, { text: 'COLOR_OVERRIDE', sourceText: code, language: 'js', color: '#ff0000' }),
++    h(SyntaxText, { text: 'DIM_OVERRIDE', sourceText: code, language: 'js', dimColor: true }))
++  const emptySyntaxFixture = (): ReactNode => h(Box, { flexDirection: 'column' },
++    h(Text, { children: 'BEFORE_EMPTY' }),
++    h(SyntaxText, { text: '', sourceText: 'const x = 1\n\nconst y = 2', lineIndex: 1, language: 'js' }),
++    h(Text, { children: 'AFTER_EMPTY' }))
++  const colorDiffers = (): boolean => {
++    const y = lines().findIndex(line => line.includes(code))
++    if (y < 0) return false
++    const x = lines()[y]!.indexOf(code)
++    const row = terminal.buffer.active.getLine(terminal.buffer.active.baseY + y)
++    const keyword = row?.getCell(x)
++    const number = row?.getCell(x + code.indexOf('42'))
++    return keyword !== undefined && number !== undefined &&
++      (keyword.getFgColorMode() !== number.getFgColorMode() || keyword.getFgColor() !== number.getFgColor())
++  }
++
++  let app: Awaited<ReturnType<typeof render>> | undefined
++  try {
++    const child = testCase === 'control'
++      ? h(Box, { flexDirection: 'column' }, h(LoaderControl), h(Text, { children: 'CONTROL' }))
++      : testCase === 'plain'
++        ? h(Markdown, { children: '**标签：**中文 👩‍💻 `inline` [link](https://example.com)\n\n| 列 | 值 |\n|---|---|\n| 一 | $x^2$ |' })
++        : testCase === 'syntax-transition'
++          ? syntaxFixture(false)
++          : testCase === 'syntax-empty'
++            ? emptySyntaxFixture()
++            : h(Markdown, { foldedCode: true, children: fenced })
++    app = await render(root(child), {
++      stdout: stdout as unknown as NodeJS.WriteStream,
++      stdin: stdin as unknown as NodeJS.ReadStream,
++      stderr: stderr as unknown as NodeJS.WriteStream,
++      patchConsole: false,
++      exitOnCtrlC: false,
++      onFrame: () => { frames++; pulse.emit('change') },
++    })
++    await waitFor(() => barrierEffect && barrierDone && frames > 0 && pendingWrites === 0, 'passive effect and sentinel loader barrier')
++    await drain()
++
++    if (testCase === 'control') {
++      assert.ok(observedAtBarrier > 0, 'positive control was not observed before the sentinel barrier')
++      await waitFor(() => controlLoaded || controlError !== undefined, 'real highlighter control')
++      assert.ifError(controlError)
++      assert.ok(controlLoaded, 'real highlighter did not load')
++    } else if (testCase === 'plain') {
++      assert.equal(observedAtBarrier, 0, 'ordinary Markdown requested cli-highlight')
++      assert.equal(observer.requests, 0)
++      assert.ok(has('中文') && has('inline') && has('link'), 'ordinary Markdown did not paint')
++    } else if (testCase === 'syntax-transition') {
++      assert.equal(observedAtBarrier, 0, 'ineligible SyntaxText requested cli-highlight')
++      assert.equal(observer.requests, 0)
++      assert.ok(has(code) && has('EMPTY_SOURCE') && has('COLOR_OVERRIDE') && has('DIM_OVERRIDE'), 'all four SyntaxText fixtures must paint')
++      assert.ok(!colorDiffers(), 'language-less text should initially use a single fallback color')
++      app.rerender(root(syntaxFixture(true)))
++      await waitFor(() => observer.requests > 0, 'real loader request after SyntaxText becomes eligible')
++      const highlight = await loader.getCliHighlightPromise()
++      assert.ok(highlight, 'real cli-highlight failed to load for SyntaxText')
++      await waitFor(colorDiffers, 'SyntaxText colors on actual xterm cells')
++      await drain()
++      assert.equal(observer.requests, 1, 'SyntaxText should share one highlighter resolution')
++      assert.ok(has('EMPTY_SOURCE') && has('COLOR_OVERRIDE') && has('DIM_OVERRIDE'), 'other fixtures changed during the transition')
++    } else if (testCase === 'syntax-empty') {
++      assert.ok(observedAtBarrier > 0, 'empty visible text with nonempty source must still request cli-highlight')
++      const highlight = await loader.getCliHighlightPromise()
++      assert.ok(highlight, 'real cli-highlight failed to load for empty visible text')
++      await drain()
++      assert.equal(observer.requests, 1, 'empty-line case should share one highlighter resolution')
++      assert.ok(has('BEFORE_EMPTY') && has('AFTER_EMPTY'), 'empty-line fixtures did not paint')
++    } else {
++      assert.equal(observedAtBarrier, 0, 'folded fence unexpectedly requested cli-highlight')
++      assert.equal(observer.requests, 0)
++      assert.ok(has('⌁') && has(code), 'folded code summary did not paint')
++      // A React prop transition isolates highlighter behavior from mouse input;
++      // the separate Chat fence regression covers actual disclosure gestures.
++      app.rerender(root(h(Markdown, { foldedCode: true, expandedCodePaths: new Set(['tokens/2']), children: fenced })))
++      await waitFor(() => observer.requests > 0, 'real loader request after expansion')
++      const highlight = await loader.getCliHighlightPromise()
++      assert.ok(highlight, 'real cli-highlight failed to load')
++      await waitFor(() => stats.renderWork.codeHighlight > 0 && frames > 0 && pendingWrites === 0, 'code highlight render')
++      await drain()
++      assert.equal(observer.requests, 1, 'shared highlighter was resolved more than once')
++      assert.ok(has(code), 'expanded code body did not paint')
++      await waitFor(colorDiffers, 'syntax colors on actual xterm cells')
++      assert.ok(colorDiffers(), 'keyword and number were not syntax-colored differently')
++    }
++    console.log(`real loader requests=${observer.requests}; barrier=${observedAtBarrier}`)
++  } finally {
++    observer.notify = undefined
++    if (app) await app.unmount()
++    terminal.dispose()
++    closeSync(fd)
++  }
++}
++
++if (process.argv.includes('--child')) await runChild()
++else await runParent()
+diff --git a/scripts/verify-streaming-markdown-blocks.tsx b/scripts/verify-streaming-markdown-blocks.tsx
+index 751c0c61..30dd4346 100644
+--- a/scripts/verify-streaming-markdown-blocks.tsx
++++ b/scripts/verify-streaming-markdown-blocks.tsx
+@@ -11,7 +11,7 @@ import type { DOMNode, TextNode, DOMElement } from '../src/ink/dom.js'
+ import type { Frame } from '../src/ink/frame.js'
+ import type { Screen } from '../src/ink/screen.js'
+ 
+-const [React, { marked }, { Box, Text }, { Markdown }, { StreamingMarkdown }, { MarkdownTable }, { CodeBlockFrame }, { configureMarked, formatToken }, { renderToScreen }, { cellAtIndex }, { TerminalSizeContext }] = await Promise.all([
++const [React, { marked }, { Box, Text }, { Markdown }, { StreamingMarkdown }, { MarkdownTable }, { CodeBlockFrame }, { appendBlockText, configureMarked, formatToken }, { renderToScreen }, { cellAtIndex }, { TerminalSizeContext }] = await Promise.all([
+   import('react'), import('marked'), import('../src/ui.js'),
+   import('../src/components/Markdown.js'), import('../src/components/StreamingMarkdown.js'),
+   import('../src/components/MarkdownTable.js'), import('../src/components/CodeBlockFrame.js'),
+@@ -37,7 +37,7 @@ function unsplit(source: string): React.ReactElement {
+       // uses, so the unsplit reference matches Markdown's node decisions.
+       flush()
+       nodes.push(<CodeBlockFrame key={nodes.length} token={token as Tokens.Code} highlight={null} />)
+-    } else text += formatToken(token)
++    } else text = appendBlockText(text, formatToken(token))
+   }
+   flush()
+   return <Box flexDirection="column" gap={1}>{nodes}</Box>
+@@ -72,6 +72,10 @@ function snapshot(element: React.ReactElement, width: number, styles = true) {
+ const paragraph = (index: number) => `Paragraph ${index}: **bold text**, inline \`value\`, and ordinary words to exercise wrapping across the sealed boundary.\n\n`
+ const prefix = Array.from({ length: 100 }, (_, index) => paragraph(index)).join('')
+ const cases = [
++  // Neither boundary has actually been cut; no synthetic fold marker or
++  // extra blank row may appear before the streaming source.
++  'x'.repeat(3585),
++  'x'.repeat(4608),
+   prefix + 'tail',
+   prefix + '\n\n\nlast paragraph\n',
+   prefix + '```ts\nconst value = 1\n```\nprose after code\n\n',
+@@ -156,6 +160,40 @@ try {
+     assert.ok(await settled(() => scanPositions(ink.frontFrame.screen, marker).length === 1))
+     assert.deepEqual(screenSnapshot(ink.frontFrame.screen, undefined, false), snapshot(unsplit(source), 55, false), 'growing suffix resolves definitions from the stable prefix')
+   }
++
++  // The same bytes can occur in distinct source spans. An unsafe hr boundary
++  // keeps the previous prefix, so comparing bytes instead of offsets used to
++  // hide the entire second paragraph and the newly appended tail.
++  const repeated = 'REPEATED-PARAGRAPH\n\nREPEATED-PARAGRAPH'
++  app.rerender(<StreamingMarkdown>{repeated}</StreamingMarkdown>)
++  assert.ok(await settled(() => scanPositions(ink.frontFrame.screen, 'REPEATED-PARAGRAPH').length === 2), 'both repeated paragraphs must initially render')
++  const repeatedAppended = `${repeated}\n\n---\nREPEATED-END`
++  app.rerender(<StreamingMarkdown>{repeatedAppended}</StreamingMarkdown>)
++  assert.ok(await settled(() => scanPositions(ink.frontFrame.screen, 'REPEATED-END').length === 1), 'an equal prefix must not hide the later source span')
++  assert.equal(scanPositions(ink.frontFrame.screen, 'REPEATED-PARAGRAPH').length, 2)
++  assert.deepEqual(screenSnapshot(ink.frontFrame.screen, undefined, false), snapshot(unsplit(repeatedAppended), 55, false), 'repeated prefix and suffix match full Markdown')
++
++  // A cut into an old long suffix is not an offset into a newly opened one.
++  // Accept an uncut old suffix too, so this regression does not require the
++  // legacy streaming fold once full streaming rendering becomes available.
++  const oldSuffix = `OLD-HEAD-${'x'.repeat(4982)}-OLD-TAIL`
++  app.rerender(<StreamingMarkdown>{oldSuffix}</StreamingMarkdown>)
++  assert.ok(await settled(() => scanPositions(ink.frontFrame.screen, '-OLD-TAIL').length === 1 && (scanPositions(ink.frontFrame.screen, 'folded').length === 1 || scanPositions(ink.frontFrame.screen, 'OLD-HEAD-').length === 1)), 'old suffix must finish painting')
++  const newSuffix = `NEW-HEAD-${'y'.repeat(3980)}-NEW-TAIL`
++  const advancedSource = `${oldSuffix}\n\n${newSuffix}`
++  app.rerender(<StreamingMarkdown>{advancedSource}</StreamingMarkdown>)
++  assert.ok(await settled(() => scanPositions(ink.frontFrame.screen, 'NEW-HEAD-').length === 1 && scanPositions(ink.frontFrame.screen, '-NEW-TAIL').length === 1), 'advanced suffix must keep its own head and tail')
++  assert.deepEqual(screenSnapshot(ink.frontFrame.screen, undefined, false), snapshot(unsplit(advancedSource), 55, false), 'advancing source boundary resets the old cut')
++
++  // Replacement may preserve an empty stable prefix while shrinking below an
++  // old cut. Do not let that now-out-of-range offset hide the new source.
++  const beforeReplacement = `REPLACE-OLD-${'z'.repeat(9983)}R-END`
++  app.rerender(<StreamingMarkdown key="replace-cut">{beforeReplacement}</StreamingMarkdown>)
++  assert.ok(await settled(() => scanPositions(ink.frontFrame.screen, 'R-END').length === 1 && (scanPositions(ink.frontFrame.screen, 'folded').length === 1 || scanPositions(ink.frontFrame.screen, 'REPLACE-OLD-').length === 1)), 'replacement control must finish painting')
++  const afterReplacement = `REPLACE-HEAD-${'v'.repeat(3974)}-REPLACE-TAIL`
++  app.rerender(<StreamingMarkdown key="replace-cut">{afterReplacement}</StreamingMarkdown>)
++  assert.ok(await settled(() => scanPositions(ink.frontFrame.screen, 'REPLACE-HEAD-').length === 1 && scanPositions(ink.frontFrame.screen, '-REPLACE-TAIL').length === 1), 'replacement shorter than the old cut remains visible')
++  assert.deepEqual(screenSnapshot(ink.frontFrame.screen, undefined, false), snapshot(unsplit(afterReplacement), 55, false), 'out-of-range cut cannot survive replacement')
+ } finally {
+   await app.unmount()
+ }
+diff --git a/scripts/verify-streaming-suffix-identity.mjs b/scripts/verify-streaming-suffix-identity.mjs
+new file mode 100644
+index 00000000..ecc501f5
+--- /dev/null
++++ b/scripts/verify-streaming-suffix-identity.mjs
+@@ -0,0 +1,42 @@
++/*
++ * Verify the actual StreamingMarkdown suffix selector against repeated source
++ * spans. This is a narrow source/lexer regression, not a rendered-screen,
++ * copy, long-stream, or end-to-end test. No TSX loader or child is used.
++ * If the selector is replaced by a full-source streaming renderer, migrate
++ * this check to the real rendered-output regression instead of preserving it.
++ * Run: node scripts/verify-streaming-suffix-identity.mjs
++ */
++import assert from 'node:assert/strict'
++import { readFileSync } from 'node:fs'
++import ts from 'typescript'
++import { marked } from 'marked'
++
++const source = readFileSync(new URL('../src/components/StreamingMarkdown.tsx', import.meta.url), 'utf8')
++const ast = ts.createSourceFile('StreamingMarkdown.tsx', source, ts.ScriptTarget.ES2024, true, ts.ScriptKind.TSX)
++const matches = []
++function visit(node) {
++  if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === 'hasDistinctSuffix') matches.push(node)
++  ts.forEachChild(node, visit)
++}
++visit(ast)
++assert.equal(matches.length, 1, 'the source suffix selector must be located exactly once')
++assert.ok(matches[0].initializer, 'the source suffix selector needs an initializer')
++// The actual expression is evaluated in isolation; a future refactor that
++// changes its dependencies fails loudly instead of silently skipping coverage.
++const expression = matches[0].initializer.getText(ast)
++const select = new Function('unstableSuffix', 'stablePrefix', `return (${expression})`)
++
++const first = 'REPEAT\n\nREPEAT'
++const tokens = marked.lexer(first)
++assert.deepEqual(tokens.map(token => token.type), ['paragraph', 'space', 'paragraph'])
++const stablePrefix = tokens.slice(0, 2).map(token => token.raw).join('')
++assert.equal(stablePrefix, 'REPEAT\n\n')
++const later = `${first}\n\n---\nTAIL`
++const suffix = later.substring(stablePrefix.length)
++assert.ok(suffix.startsWith(stablePrefix), 'fixture must hit equal text in different source spans')
++assert.deepEqual(marked.lexer(suffix).map(token => token.type), ['paragraph', 'space', 'hr', 'paragraph'])
++assert.equal(select(suffix, stablePrefix), true, 'equal bytes at different source offsets are not overlap')
++assert.equal(select('same', 'same'), true, 'identical nonempty prefix and suffix still denote separate spans')
++assert.equal(select('text', ''), true, 'a nonempty initial suffix remains visible')
++assert.equal(select('', 'prefix'), false, 'an empty suffix remains absent')
++console.log('streaming suffix identity: repeated source spans stay distinct')
+diff --git a/scripts/verify-streaming-tail-boundary.mjs b/scripts/verify-streaming-tail-boundary.mjs
+new file mode 100644
+index 00000000..c7240dc0
+--- /dev/null
++++ b/scripts/verify-streaming-tail-boundary.mjs
+@@ -0,0 +1,98 @@
++/*
++ * Verify the actual streaming tail helper's no-cut boundary. This narrow
++ * source-level regression is not a rendered-screen or full-stream test.
++ * If clipping is removed, migrate this check rather than preserving the helper.
++ * Run: node scripts/verify-streaming-tail-boundary.mjs
++ */
++import assert from 'node:assert/strict'
++import { readFileSync } from 'node:fs'
++import ts from 'typescript'
++import { marked } from 'marked'
++
++const source = readFileSync(new URL('../src/components/StreamingMarkdown.tsx', import.meta.url), 'utf8')
++const ast = ts.createSourceFile('StreamingMarkdown.tsx', source, ts.ScriptTarget.ES2024, true, ts.ScriptKind.TSX)
++const names = ['SUFFIX_TAIL_BUDGET', 'SUFFIX_BOUNDARY_LOOKBACK', 'SUFFIX_CUT_STEP']
++const statements = new Map()
++let helper
++for (const statement of ast.statements) {
++  if (ts.isVariableStatement(statement)) {
++    for (const declaration of statement.declarationList.declarations) {
++      if (ts.isIdentifier(declaration.name) && names.includes(declaration.name.text)) {
++        assert.equal(statement.declarationList.declarations.length, 1, 'tail constants need separate declarations')
++        assert.equal(statements.has(declaration.name.text), false, 'tail constant must be unique')
++        statements.set(declaration.name.text, statement.getText(ast))
++      }
++    }
++  }
++  if (ts.isFunctionDeclaration(statement) && statement.name?.text === 'clipSuffixTail') {
++    assert.equal(helper, undefined, 'tail helper must be unique')
++    helper = statement.getText(ast)
++  }
++}
++assert.deepEqual([...statements.keys()].sort(), [...names].sort(), 'all source tail constants must be located')
++assert.ok(helper, 'the actual source tail helper must be located')
++const input = `function factory(t: (key: string, values: { count: number }) => string) {\n${names.map(name => statements.get(name)).join('\n')}\n${helper}\nreturn clipSuffixTail\n}`
++const compiled = ts.transpileModule(input, { compilerOptions: { target: ts.ScriptTarget.ES2024, module: ts.ModuleKind.ESNext }, reportDiagnostics: true })
++assert.equal(compiled.diagnostics?.length ?? 0, 0, 'tail helper must transpile')
++const factory = new Function(`${compiled.outputText}\nreturn factory`)()
++let calls = 0
++const clip = factory((_key, values) => { calls++; return `[dropped ${values.count}]` })
++for (const length of [0, 3584, 3585, 4000, 4608]) {
++  const suffix = 'x'.repeat(length)
++  const cut = { current: 0 }
++  const before = calls
++  assert.equal(clip(suffix, cut), suffix, `uncut suffix ${length} must remain exact`)
++  assert.equal(cut.current, 0, `uncut suffix ${length} must retain zero cut`)
++  assert.equal(calls, before, `uncut suffix ${length} must not create a marker`)
++}
++const replacement = 'y'.repeat(4000)
++const staleCut = { current: 6416 }
++assert.equal(clip(replacement, staleCut), replacement, 'a cut beyond a replacement suffix cannot hide it')
++assert.equal(staleCut.current, 0, 'an out-of-range cut must be cleared')
++const atEndCut = { current: 4000 }
++assert.equal(clip(replacement, atEndCut), replacement, 'a cut at the replacement end cannot hide everything')
++assert.equal(atEndCut.current, 0, 'a cut at a nonempty suffix end must be cleared')
++const longReplacement = 'z'.repeat(5000)
++const oversizedCut = { current: 9000 }
++const beforeReplacementCalls = calls
++const replacementShown = clip(longReplacement, oversizedCut)
++assert.ok(oversizedCut.current < longReplacement.length, 'a replacement must not retain an out-of-range cut')
++if (oversizedCut.current === 0) {
++  assert.equal(replacementShown, longReplacement, 'an unfolded replacement must remain exact')
++  assert.equal(calls, beforeReplacementCalls)
++} else {
++  assert.equal(replacementShown, `[dropped ${oversizedCut.current}]\n\n${longReplacement.slice(oversizedCut.current)}`)
++  assert.equal(calls, beforeReplacementCalls + 1)
++}
++// Do not require clipping of over-budget text: full streaming is the goal.
++
++// Once the stable prefix advances, a cut measured from the old suffix has a
++// different origin. Check the actual advancement block and replay that reset
++// with the real lexer/helper. A future refactor must update this test rather
++// than silently treating unrelated source offsets as interchangeable.
++const advances = []
++function visit(node) {
++  if (ts.isIfStatement(node) && node.expression.getText(ast) === 'stableBoundary.safe' && ts.isBlock(node.thenStatement)) advances.push(node.thenStatement)
++  ts.forEachChild(node, visit)
++}
++visit(ast)
++assert.equal(advances.length, 1, 'stable-boundary advancement block must be unique')
++const body = advances[0].statements
++const resetIndex = body.findIndex(statement => statement.getText(ast).replace(/;$/u, '') === 'cutRef.current = 0')
++const prefixIndex = body.findIndex(statement => statement.getText(ast).startsWith('prefixRef.current = stripped.substring('))
++assert.ok(prefixIndex >= 0, 'source boundary advancement must be located')
++const oldSource = 'x'.repeat(5000)
++// Exercise a stale offset produced by the legacy clipper without requiring
++// future implementations to keep creating such cuts.
++const oldCut = { current: 1416 }
++const advanced = `${oldSource}\n\n${'y'.repeat(4000)}`
++const tokens = marked.lexer(advanced)
++assert.deepEqual(tokens.map(token => token.type), ['paragraph', 'space', 'paragraph'])
++const prefixLength = tokens.slice(0, 2).reduce((sum, token) => sum + token.raw.length, 0)
++assert.equal(prefixLength, oldSource.length + 2)
++if (resetIndex >= 0 && resetIndex < prefixIndex) new Function('cutRef', body[resetIndex].getText(ast))(oldCut)
++const newSuffix = advanced.substring(prefixLength)
++assert.equal(clip(newSuffix, oldCut), newSuffix, 'old source cut must not remove the new suffix head')
++assert.equal(oldCut.current, 0)
++assert.ok(resetIndex >= 0 && prefixIndex > resetIndex, 'cut must reset before its source boundary advances')
++console.log('streaming tail boundary: zero-cut and advanced-source checks passed')
+diff --git a/scripts/verify-streaming-unfolded.tsx b/scripts/verify-streaming-unfolded.tsx
+new file mode 100644
+index 00000000..a9d2906a
+--- /dev/null
++++ b/scripts/verify-streaming-unfolded.tsx
+@@ -0,0 +1,184 @@
++/**
++ * Bounded synthetic regression: actual fullscreen Chat -> MessageList ->
++ * StreamingMarkdown -> terminal paint, with a headless xterm viewport.
++ * No real backend, session, credentials, process inspection, or network.
++ *
++ * Diagnostic probe, NOT a release gate: it stays red until the streaming
++ * suffix budget can be made lossless, and a gate that always fails is noise in
++ * verify:build. Run it by hand:
++ *   node scripts/run-streaming-unfolded.mjs
++ *
++ * A nonzero exit is a real failure, including a missed screen/navigation
++ * prerequisite. Historical clipSuffixTail budget 3584 + 1024 clips the head
++ * of the >6000-character single paragraph; that must be reported as red, not
++ * reclassified as a pass just because the source still contains the head.
++ * Code fences render their opening delimiter as a language-labelled frame;
++ * the language label, not literal backticks, is the observable start marker.
++ */
++import { closeSync, lstatSync, mkdtempSync, realpathSync, rmSync, writeSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { basename, dirname, join } from 'node:path'
++
++// The wrapper forwards fd 3 and drains fd 1 separately; reopening /dev/stdout
++// fails for socket-backed harness output. Ink never receives the reporter fd.
++const reportFd = 3
++const report = (line: string): void => { writeSync(reportFd, `${line}\n`) }
++const tempParent = realpathSync(tmpdir())
++const temp = mkdtempSync(join(tempParent, 'dsh-stream-unfolded-'))
++const tempReal = realpathSync(temp)
++if (dirname(tempReal) !== tempParent || !basename(tempReal).startsWith('dsh-stream-unfolded-')) {
++  throw new Error('refusing unsafe temporary directory')
++}
++let cleaned = false
++function cleanup(): void {
++  if (cleaned) return
++  cleaned = true
++  // Never follow a replaced symlink or delete any path other than our own dir.
++  try {
++    if (!lstatSync(temp).isDirectory() || realpathSync(temp) !== tempReal || dirname(tempReal) !== tempParent) {
++      throw new Error('temporary directory identity changed; refusing cleanup')
++    }
++    rmSync(temp, { recursive: true })
++  } catch (error) {
++    report(`CLEANUP FAILURE: ${String(error)}`)
++    process.exitCode = 1
++  }
++}
++process.once('SIGTERM', () => { cleanup(); process.exit(143) })
++process.once('SIGINT', () => { cleanup(); process.exit(130) })
++
++// Keep only OS process-launch paths, then give every home/config/cache path a
++// private root. No inherited session settings or credentials reach imports.
++const osEnv = Object.fromEntries(['PATH', 'SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT']
++  .flatMap(key => process.env[key] === undefined ? [] : [[key, process.env[key]]]))
++for (const key of Object.keys(process.env)) delete process.env[key]
++Object.assign(process.env, osEnv, {
++  HOME: temp, USERPROFILE: temp, TMPDIR: temp, TMP: temp, TEMP: temp,
++  XDG_CONFIG_HOME: join(temp, 'config'), XDG_CACHE_HOME: join(temp, 'cache'),
++  XDG_DATA_HOME: join(temp, 'data'), XDG_STATE_HOME: join(temp, 'state'),
++  DSH_HOME: join(temp, 'dsh'), DSH_TUI_HOME: join(temp, 'tui'),
++  DSH_TUI_LANG: 'en', DSH_TUI_THEME: 'dark', FORCE_COLOR: '3',
++  TERM: 'xterm-256color', NODE_ENV: 'production',
++})
++
++let failures = 0
++try {
++  const [{ PassThrough, Writable }, React, { Terminal }, { render, AlternateScreen }, { Chat }, { QuestionStore }, { LOCAL_COMMANDS, completeCommands }, { settled, viewportLines }] = await Promise.all([
++    import('node:stream'), import('react'), import('@xterm/headless'), import('../src/ui.js'),
++    import('../src/screens/Chat.js'), import('../src/dsh-adapter/questions.js'),
++    import('../src/commands.js'), import('./lib/term-test.mjs'),
++  ])
++  const COLS = 100, ROWS = 32
++  const check = (name: string, ok: boolean, detail = ''): void => {
++    report(`${ok ? 'PASS' : 'FAIL'} ${name}${detail ? `: ${detail}` : ''}`)
++    if (!ok) failures++
++  }
++  const pack = (screen: string): string => screen.replace(/\s+/g, '')
++  const has = (screen: string, text: string): boolean => pack(screen).includes(pack(text))
++  const folded = (screen: string): boolean => /charsfolded(?:whilestreaming|\(clickor)/i.test(pack(screen))
++  const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
++
++  async function scenario(name: string, source: string, head: string, tail: string, language?: string): Promise<void> {
++    const term = new Terminal({ cols: COLS, rows: ROWS, scrollback: 0, allowProposedApi: true })
++    const frames: string[] = []
++    class Stdout extends Writable {
++      columns = COLS; rows = ROWS; isTTY = true
++      override _write(chunk: unknown, _encoding: BufferEncoding, done: () => void): void {
++        term.write(String(chunk), () => { frames.push(viewportLines(term).join('\n')); done() })
++      }
++    }
++    class Stdin extends PassThrough {
++      isTTY = true
++      setRawMode(): this { return this }
++      override ref(): this { return this }
++      override unref(): this { return this }
++    }
++    const stdout = new Stdout(), stdin = new Stdin()
++    const stderr = new Writable({ write(_chunk, _encoding, done) { done() } })
++    const listeners = new Set<() => void>()
++    const row = { id: 2, kind: 'assistant', text: source.slice(0, 120), streaming: true }
++    const channel = {
++      whaleIdle: false, version: 0,
++      rows: [{ id: 1, kind: 'user', text: 'SYNTHETIC REQUEST' }, row],
++      status: 'idle', sessionTitle: 'synthetic', agentId: 'synthetic',
++      model: 'deepseek-v4-flash', provider: 'deepseek', reasoningEffort: 'max', effortLevels: [],
++      tokens: { input: 0, output: 0 }, cwd: temp, displayCwd: temp, gitBranch: '',
++      working: true, spinnerMode: 'requesting', responseChars: 0, activeToolCount: 0,
++      turnStart: 0, pending: [], commandList: LOCAL_COMMANDS, notifications: [],
++      mode: { plan: false, sandbox: undefined }, activityFrames: 'moon8', subagents: [],
++      subscribe(cb: () => void) { listeners.add(cb); return () => listeners.delete(cb) },
++      submit() {}, cancel() {}, clear() {}, notify() {}, listModels: async () => [],
++      listSessions: async () => [], setResumeTarget() {}, loadOlder() {}, mcpStatus: () => [],
++      pushLocal() {}, commandCompletions: (input: string) => completeCommands(input),
++    }
++    const screen = (): string => viewportLines(term).join('\n')
++    let instance: Awaited<ReturnType<typeof render>> | undefined
++    try {
++      instance = await render(<AlternateScreen><Chat channel={channel as never} questionStore={new QuestionStore()} fullscreen /></AlternateScreen>, {
++        stdout: stdout as unknown as NodeJS.WriteStream, stdin: stdin as unknown as NodeJS.ReadStream,
++        stderr: stderr as unknown as NodeJS.WriteStream, exitOnCtrlC: false, patchConsole: false,
++      })
++      const initial = await settled(() => has(screen(), head), { timeoutMs: 6000 })
++      check(`${name} initial streaming paint`, initial)
++      // Append rather than simply mounting a completed string. The row remains streaming.
++      const before = frames.length
++      row.text = source
++      channel.responseChars = source.length
++      channel.version++
++      for (const listener of listeners) listener()
++      const finalReady = await settled(() => frames.length > before && has(screen(), tail), { timeoutMs: 6000 })
++      check(`${name} streaming growth painted suffix`, finalReady, `chars=${source.length}`)
++      // PageUp/PageDown are real Chat input. Inspect parsed xterm screen only.
++      // A page is less than one viewport, so no screen row is skipped. A bounded
++      // 16-page traversal covers both 6.6k fixtures even at 100x32.
++      let sawHead = has(screen(), head)
++      let sawLanguage = language === undefined || (sawHead && has(screen(), `┌─ ${language}`))
++      for (let i = 0; i < 16 && (!sawHead || !sawLanguage); i++) {
++        stdin.write('\x1b[5~')
++        await sleep(120) // 固定窗:pacing page input and throttled renderer must drain before next page
++        sawHead ||= has(screen(), head)
++        sawLanguage ||= language !== undefined && has(screen(), head) && has(screen(), `┌─ ${language}`)
++      }
++      if (source.length > 6000) check(`${name} PageUp reaches transcript start`,
++        has(screen(), 'SYNTHETIC REQUEST') && !has(screen(), tail),
++        `request=${has(screen(), 'SYNTHETIC REQUEST')} tail=${has(screen(), tail)}`)
++      check(`${name} PageUp reaches complete painted prefix`, sawHead)
++      if (language !== undefined) check(`${name} opening fence paints language frame with prefix`, sawLanguage, `language=${language}`)
++      let sawTail = has(screen(), tail)
++      for (let i = 0; i < 16 && !sawTail; i++) {
++        stdin.write('\x1b[6~')
++        await sleep(120) // 固定窗:pacing page input and throttled renderer must drain before next page
++        sawTail ||= has(screen(), tail)
++      }
++      check(`${name} PageDown reaches complete painted suffix`, sawTail,
++        sawHead ? '' : 'prefix prerequisite failed; suffix checked independently')
++      // Frames come from xterm's write callback, not raw ANSI or DOM/source.
++      const foldFrame = frames.find(folded)
++      check(`${name} no streaming-folded or long-line marker in traversed screens`, !foldFrame,
++        foldFrame ? pack(foldFrame).match(/.{0,25}charsfolded.{0,75}/i)?.[0] ?? 'fold marker' : `parsed frames=${frames.length}`)
++    } catch (error) {
++      check(`${name} harness`, false, error instanceof Error ? error.stack ?? error.message : String(error))
++    } finally {
++      if (instance) await instance.unmount()
++      term.dispose()
++      stdin.destroy()
++      stdout.destroy()
++      stderr.destroy()
++    }
++  }
++
++  const plain = (length: number, head: string, tail: string): string => head + 'x'.repeat(length - head.length - tail.length) + tail
++  await scenario('plain-1200-control', plain(1200, 'CONTROLHEADuniqueABC', 'CONTROLTAILuniqueXYZ'), 'CONTROLHEADuniqueABC', 'CONTROLTAILuniqueXYZ')
++  await scenario('plain-6600', plain(6600, 'PLAINHEADuniqueABC', 'PLAINTAILuniqueXYZ'), 'PLAINHEADuniqueABC', 'PLAINTAILuniqueXYZ')
++  const fenceHead = 'FENCEHEADuniqueABC', fenceTail = 'FENCETAILuniqueXYZ'
++  const fence = '```plaintext\n' + fenceHead + '\n' + Array.from({ length: 100 }, (_, i) => `line${String(i).padStart(3, '0')}${'z'.repeat(60)}`).join('\n') + '\n' + fenceTail
++  await scenario('unclosed-fence-over-6000', fence, fenceHead, fenceTail, 'plaintext')
++  report(`RESULT: ${failures} failed checks`)
++  if (failures) process.exitCode = 1
++} catch (error) {
++  report(`HARNESS FAILURE: ${error instanceof Error ? error.stack ?? error.message : String(error)}`)
++  process.exitCode = 1
++} finally {
++  cleanup()
++  closeSync(reportFd)
++}
+diff --git a/scripts/verify-transcript-images.tsx b/scripts/verify-transcript-images.tsx
+index 274e9988..013edec4 100644
+--- a/scripts/verify-transcript-images.tsx
++++ b/scripts/verify-transcript-images.tsx
+@@ -518,6 +518,7 @@ const virtualScroll: ScrollBoxHandle = {
+   scrollBy(dy) { virtualScrollTop += dy },
+   scrollToElement() {},
+   scrollToBottom() {},
++  getScrollIntentVersion: () => 0,
+   getScrollTop: () => virtualScrollTop,
+   getPendingDelta: () => 0,
+   getScrollHeight: () => 100,
+diff --git a/src/components/Markdown.tsx b/src/components/Markdown.tsx
+index eee1c7cb..2d95e6a2 100644
+--- a/src/components/Markdown.tsx
++++ b/src/components/Markdown.tsx
+@@ -3,7 +3,7 @@ import { marked, type Token, type Tokens } from 'marked'
+ import { Box, Text, useTheme } from '../ui.js'
+ import type { TextDecoration } from '../ink/styles.js'
+ import { getTheme } from '../theme.js'
+-import { appendBlockText, configureMarked, formatToken, stripPromptXMLTags } from '../terminal-utils/markdown.js'
++import { appendBlockText, codeLanguageTag, configureMarked, formatToken, stripPromptXMLTags } from '../terminal-utils/markdown.js'
+ import { getCliHighlightPromise, type CliHighlight } from '../terminal-utils/cliHighlight.js'
+ import { isMermaidLang } from '../terminal-utils/mermaid.js'
+ import { isMathBlockToken, isMathToken } from '../terminal-utils/math.js'
+@@ -13,6 +13,8 @@ import { CodeBlockFrame } from './CodeBlockFrame.js'
+ import { MermaidDiagram } from './MermaidDiagram.js'
+ import { InlineMathParagraph } from './InlineMathParagraph.js'
+ import { MathBlock } from './MathBlock.js'
++import type { ClickEvent } from '../ink/events/click-event.js'
++import { t as translate } from '../i18n.js'
+ 
+ /**
+  * Markdown 渲染组件：marked 分词 + ANSI 格式化。
+@@ -47,6 +49,20 @@ type Props = {
+    * line (that API promises raw code, not the chat's pre-processing).
+    */
+   stripPromptTags?: boolean
++  /**
++   * Fold every top-level fence to a one-row digest (language · lines · head
++   * of the body, click to expand). Set for settled transcript rows in the
++   * windowed transcript: an old chunk is mounted whole while the rail seek
++   * runs, and painting/highlighting its fences was the dominant per-click
++   * cost. Streaming does not use this settled code-block fold; its separate
++   * unstable-suffix limit is handled by StreamingMarkdown.
++   */
++  foldedCode?: boolean
++  /** Expanded structural token paths, owned by the transcript rather than the mounted row. */
++  expandedCodePaths?: ReadonlySet<string>
++  closedGlobalCodePaths?: ReadonlySet<string>
++  /** Toggle one path; callers own its lifetime across virtualization. */
++  onToggleCodePath?: (path: string, event: ClickEvent) => void
+ }
+ 
+ /**
+@@ -156,6 +172,62 @@ function isMermaidToken(token: Token): token is Tokens.Code {
+   return token.type === 'code' && isMermaidLang((token as Tokens.Code).lang)
+ }
+ 
++// Visit only children consumed by the formatter. Unknown or oversized token
++// trees conservatively request the shared highlighter rather than miss code.
++const HIGHLIGHT_SCAN_LIMIT = 8192
++const HIGHLIGHT_CONTAINER_TYPES = new Set([
++  'blockquote', 'em', 'strong', 'del', 'heading', 'link', 'list_item', 'paragraph',
++])
++const HIGHLIGHT_LEAF_TYPES = new Set([
++  'checkbox', 'codespan', 'hr', 'image', 'space', 'br', 'escape', 'math', 'mathBlock', 'def', 'html',
++])
++function tokenTreeNeedsHighlight(value: unknown): boolean {
++  const pending: unknown[] = [value]
++  const seen = new WeakSet<object>()
++  let visited = 0
++  const append = (children: unknown): boolean => {
++    if (!Array.isArray(children) || pending.length + children.length > HIGHLIGHT_SCAN_LIMIT) return false
++    for (const child of children) pending.push(child)
++    return true
++  }
++  while (pending.length > 0) {
++    if (++visited > HIGHLIGHT_SCAN_LIMIT) return true
++    const value = pending.pop()
++    if (value === null || typeof value !== 'object' || Array.isArray(value)) return true
++    const node = value as Record<string, unknown>
++    const type = node.type
++    if (typeof type !== 'string') return true
++    if (type === 'code') return true
++    if (HIGHLIGHT_LEAF_TYPES.has(type)) continue
++    if (seen.has(value)) continue
++    seen.add(value)
++    if (type === 'list') {
++      if (!append(node.items)) return true
++    } else if (type === 'table') {
++      if (!Array.isArray(node.header) || !Array.isArray(node.rows) || node.rows.length > HIGHLIGHT_SCAN_LIMIT) return true
++      const rows = [node.header, ...node.rows]
++      let cellCount = 0
++      for (const row of rows) {
++        if (!Array.isArray(row)) return true
++        cellCount += row.length
++        if (cellCount > HIGHLIGHT_SCAN_LIMIT) return true
++        for (const cell of row) {
++          if (cell === null || typeof cell !== 'object') return true
++          const tokens = (cell as { tokens?: unknown }).tokens
++          if (tokens !== undefined && !append(tokens)) return true
++        }
++      }
++    } else if (HIGHLIGHT_CONTAINER_TYPES.has(type)) {
++      if (!append(node.tokens)) return true
++    } else if (type === 'text') {
++      if (node.tokens !== undefined && !append(node.tokens)) return true
++    } else {
++      return true
++    }
++  }
++  return false
++}
++
+ /**
+  * 把 lexer 产出的 token 列表转成 React 节点序列：table、mermaid 与公式块
+  * 独立渲染，其余 token 的 ANSI 文本按完整块分批拼接，只去整段首尾空白。
+@@ -165,8 +237,13 @@ function renderTokensToNodes(
+   highlight: CliHighlight | null,
+   dimColor: boolean,
+   inlineMathImages: boolean,
+-): React.ReactNode[] {
++  foldedCode: boolean,
++  expandedCodePaths: ReadonlySet<string> | undefined,
++  closedGlobalCodePaths: ReadonlySet<string> | undefined,
++  onToggleCodePath: ((path: string, event: ClickEvent) => void) | undefined,
++): { nodes: React.ReactNode[]; needsHighlight: boolean } {
+   const nodes: React.ReactNode[] = []
++  let needsHighlight = false
+   let ansiText = ''
+   let textParts: string[] = []
+   let afterOwnNode = false
+@@ -197,10 +274,11 @@ function renderTokensToNodes(
+     textParts = []
+   }
+ 
+-  for (const token of tokens) {
++  for (const [index, token] of tokens.entries()) {
+     const ownNodeBefore = afterOwnNode
+     afterOwnNode = false
+     if (token.type === 'table') {
++      if (!needsHighlight) needsHighlight = tokenTreeNeedsHighlight(token)
+       flushAnsiText()
+       nodes.push(
+         <MarkdownTable
+@@ -210,6 +288,7 @@ function renderTokensToNodes(
+         />,
+       )
+     } else if (inlineMathImages && token.type === 'paragraph' && hasInlineMath(token)) {
++      if (!needsHighlight) needsHighlight = tokenTreeNeedsHighlight(token)
+       flushAnsiText()
+       nodes.push(<InlineMathParagraph key={nodes.length} token={token as Tokens.Paragraph} highlight={highlight} />)
+       afterOwnNode = true
+@@ -220,28 +299,31 @@ function renderTokensToNodes(
+     } else if (isMathBlockToken(token)) {
+       flushAnsiText()
+       nodes.push(<MathBlock key={nodes.length} token={token} dimColor={dimColor} />)
+-    } else if (isMermaidToken(token)) {
+-      flushAnsiText()
+-      nodes.push(
+-        <MermaidDiagram
+-          key={nodes.length}
+-          token={token}
+-          highlight={highlight}
+-          dimColor={dimColor}
+-        />,
+-      )
+     } else if (token.type === 'code') {
+-      // Top-level fences get the CodeBlockFrame (header/rail/padding);
+-      // the mermaid branch above keeps diagram fences routed to
+-      // MermaidDiagram (whose fallback re-enters the frame), and code
+-      // nested in lists/quotes keeps formatToken's ANSI path.
+       flushAnsiText()
++      const code = token as Tokens.Code
++      // Token-array paths extend naturally to list items and quotes later;
++      // never derive identity from the rendered-node count or code text.
++      const path = `tokens/${index}`
++      const fence = /^ {0,3}(?:`{3,}|~{3,})/.test(code.raw)
++      const toggle = fence && onToggleCodePath !== undefined
++        ? (event: ClickEvent): void => onToggleCodePath(path, event)
++        : undefined
++      const folded = fence && (foldedCode ? !expandedCodePaths?.has(path) : closedGlobalCodePaths?.has(path))
++      if (!folded) needsHighlight = true
++      const body = isMermaidToken(token)
++        ? <MermaidDiagram token={code} highlight={highlight} dimColor={dimColor} />
++        : <CodeBlockFrame token={code} highlight={highlight} dimColor={dimColor} />
+       nodes.push(
+-        <CodeBlockFrame key={nodes.length} token={token as Tokens.Code} highlight={highlight} dimColor={dimColor} />,
++        folded
++          ? <FoldedCodeRow key={path} token={code} dimColor={dimColor} onExpand={toggle} />
++          : toggle === undefined ? <React.Fragment key={path}>{body}</React.Fragment>
++            : <Box key={path} onClick={toggle}>{body}</Box>,
+       )
+     } else {
+       // appendBlockText inserts the row break after the (newline-free) hr
+       // divider when the next block does not open its own line.
++      if (!needsHighlight) needsHighlight = tokenTreeNeedsHighlight(token)
+       ansiText = appendBlockText(ansiText, formatToken(token, 0, null, null, highlight))
+       // A top-level token boundary keeps inline formatting and code fences
+       // intact while letting the painter cull finished offscreen text blocks.
+@@ -253,7 +335,88 @@ function renderTokensToNodes(
+   }
+ 
+   flushAnsiText()
+-  return nodes
++  return { nodes, needsHighlight }
++}
++
++/** Preview clip before the wrap engine sees it: a minified fence can be a
++ *  single 100k-char line, and pushing that through truncation is the cost
++ *  this fold exists to avoid. */
++const FOLDED_CODE_PREVIEW_CHARS = 160
++
++/** Summarize without splitting every line or retaining the fence in the preview. */
++export function summarizeFoldedCode(text: string): { lineCount: number; preview: string } {
++  let lineCount = 0
++  let newline = -1
++  while ((newline = text.indexOf('\n', newline + 1)) !== -1) lineCount++
++  // A trailing newline terminates the last line, rather than starting one.
++  if (text !== '' && !text.endsWith('\n')) lineCount++
++
++  // Bounded chunks use native trim semantics without allocating a whole line
++  // or leaving the input in JavaScript's legacy RegExp match state.
++  const chunkSize = 4096
++  let start = 0
++  while (start < text.length) {
++    const chunk = text.slice(start, start + chunkSize)
++    const trimmed = chunk.trimStart()
++    start += chunk.length - trimmed.length
++    if (trimmed !== '') break
++  }
++  if (start === text.length) return { lineCount, preview: '' }
++  let end = text.indexOf('\n', start)
++  if (end === -1) end = text.length
++  while (end > start) {
++    const chunk = text.slice(Math.max(start, end - chunkSize), end)
++    const trimmed = chunk.trimEnd()
++    end -= chunk.length - trimmed.length
++    if (trimmed !== '') break
++  }
++
++  // Copy at most 160 UTF-16 code units, so a substring cannot keep a huge
++  // original string alive. Code units intentionally match slice(), including
++  // a possible split surrogate pair at the clipping boundary.
++  let preview = ''
++  const limit = Math.min(end, start + FOLDED_CODE_PREVIEW_CHARS)
++  for (let index = start; index < limit; index++) preview += String.fromCharCode(text.charCodeAt(index))
++  if (end - start > FOLDED_CODE_PREVIEW_CHARS) preview += '…'
++  return { lineCount, preview }
++}
++
++/**
++ * A settled fence folded to ONE row: `⌁ <lang> · <n> 行 · <head> … （点击展开）`.
++ * The body is never formatted, highlighted or laid out — that pipeline is
++ * exactly what made a revealed historical chunk expensive, since the rail
++ * seek mounts the chunk whole before the viewport window takes over again.
++ * The transcript owns each token path's disclosure state, including across
++ * unmounts; Ctrl+O temporarily exposes every fence.
++ */
++function FoldedCodeRow({ token, dimColor, onExpand }: {
++  token: Tokens.Code
++  dimColor: boolean
++  onExpand: ((event: ClickEvent) => void) | undefined
++}): React.ReactNode {
++  const [hovered, setHovered] = React.useState(false)
++  const clickable = onExpand !== undefined
++  const { lineCount, preview } = React.useMemo(() => summarizeFoldedCode(token.text), [token.text])
++  const summary = translate('code-fence-folded', {
++    lang: codeLanguageTag(token) || 'code',
++    n: lineCount,
++  })
++  const hint = translate('code-fence-folded-expand')
++  return (
++    <Box
++      flexDirection="row"
++      onClick={onExpand}
++      onMouseEnter={clickable ? () => setHovered(true) : undefined}
++      onMouseLeave={clickable ? () => setHovered(false) : undefined}
++    >
++      <Text dimColor={dimColor} wrap="truncate-end">
++        <Text color={hovered ? 'text' : 'subtle'}>{'⌁ '}{summary}</Text>
++        {preview === '' ? '' : ` · ${preview}`}
++        {' … '}
++        <Text italic color={hovered ? 'text' : undefined}>{hint}</Text>
++      </Text>
++    </Box>
++  )
+ }
+ 
+ /**
+@@ -267,7 +430,7 @@ function renderTokensToNodes(
+  * block — the dominant long-output stall (string-width via wrap-ansi, 60%+
+  * of CPU in streaming profiles).
+  */
+-function MarkdownImpl({ children, dimColor = false, cacheTokens = true, inlineMathImages = true, stripPromptTags = true }: Props): React.ReactNode {
++function MarkdownImpl({ children, dimColor = false, cacheTokens = true, inlineMathImages = true, stripPromptTags = true, foldedCode = false, expandedCodePaths, closedGlobalCodePaths, onToggleCodePath }: Props): React.ReactNode {
+   const [highlight, setHighlight] = React.useState<CliHighlight | null>(null)
+   // Inline math is baked into the ANSI text, so the switch must invalidate
+   // the memo below (MathBlock nodes subscribe on their own).
+@@ -279,16 +442,6 @@ function MarkdownImpl({ children, dimColor = false, cacheTokens = true, inlineMa
+   const [themeName] = useTheme()
+   const palette = getTheme(themeName)
+ 
+-  React.useEffect(() => {
+-    let mounted = true
+-    void getCliHighlightPromise().then((loaded) => {
+-      if (mounted) setHighlight(loaded)
+-    })
+-    return () => {
+-      mounted = false
+-    }
+-  }, [])
+-
+   configureMarked()
+ 
+   const renderedNodes = React.useMemo(() => {
+@@ -299,12 +452,27 @@ function MarkdownImpl({ children, dimColor = false, cacheTokens = true, inlineMa
+       dimColor,
+       // Dimmed text (thinking) cannot dim an image, so it keeps Unicode.
+       inlineMathImages && mathRendering === 'image' && !dimColor,
++      foldedCode,
++      expandedCodePaths,
++      closedGlobalCodePaths,
++      onToggleCodePath,
+     )
+-  }, [children, dimColor, highlight, cacheTokens, mathRendering, inlineMathImages, palette, stripPromptTags])
++  }, [children, dimColor, highlight, cacheTokens, mathRendering, inlineMathImages, palette, stripPromptTags, foldedCode, expandedCodePaths, closedGlobalCodePaths, onToggleCodePath])
++
++  // Plain prose and folded fences do not need the highlighter. Keep the
++  // existing shared, asynchronous loader for code that actually renders.
++  React.useEffect(() => {
++    if (!renderedNodes.needsHighlight) return
++    let mounted = true
++    void getCliHighlightPromise().then((loaded) => {
++      if (mounted) setHighlight(loaded)
++    })
++    return () => { mounted = false }
++  }, [renderedNodes.needsHighlight])
+ 
+   return (
+     <Box flexDirection="column" gap={1}>
+-      {renderedNodes}
++      {renderedNodes.nodes}
+     </Box>
+   )
+ }
+@@ -320,5 +488,9 @@ export const Markdown = React.memo(
+     prev.dimColor === next.dimColor &&
+     prev.cacheTokens === next.cacheTokens &&
+     prev.inlineMathImages === next.inlineMathImages &&
+-    prev.stripPromptTags === next.stripPromptTags,
++    prev.stripPromptTags === next.stripPromptTags &&
++    prev.foldedCode === next.foldedCode &&
++    prev.expandedCodePaths === next.expandedCodePaths &&
++    prev.closedGlobalCodePaths === next.closedGlobalCodePaths &&
++    prev.onToggleCodePath === next.onToggleCodePath,
+ )
+diff --git a/src/components/StreamingMarkdown.tsx b/src/components/StreamingMarkdown.tsx
+index a40261b9..4164b176 100644
+--- a/src/components/StreamingMarkdown.tsx
++++ b/src/components/StreamingMarkdown.tsx
+@@ -18,8 +18,8 @@ import { isStandaloneToken, Markdown } from './Markdown.js'
+  * every frame — an unbounded suffix (a single huge paragraph with no block
+  * boundary to advance the prefix) made that O(total) per frame. The suffix
+  * is clipped to this many characters (preferring a paragraph boundary),
+- * with a leading marker naming the dropped amount; settling renders the
+- * full text once through the non-streaming path.
++ * with a leading marker naming the dropped amount; settling switches to the
++ * non-streaming path, which may independently fold long lines.
+  *
+  * The cut point is STICKY (advances only when the suffix outgrows budget +
+  * step): a cut that slid every frame would break append-only growth, and
+@@ -33,6 +33,9 @@ const STABLE_BLOCK_BUDGET = 8192
+ 
+ function clipSuffixTail(suffix: string, cut: { current: number }): string {
+   const total = suffix.length
++  // A replacement can shrink the suffix without changing its stable prefix.
++  // An offset at or beyond its end must not suppress the entire replacement.
++  if (cut.current >= total) cut.current = 0
+   if (total <= SUFFIX_TAIL_BUDGET) {
+     cut.current = 0
+     return suffix
+@@ -47,6 +50,7 @@ function clipSuffixTail(suffix: string, cut: { current: number }): string {
+       : windowStart
+   }
+   const dropped = cut.current
++  if (dropped === 0) return suffix
+   return `${t('streaming-folded', { count: dropped })}\n\n${suffix.slice(cut.current)}`
+ }
+ 
+@@ -281,6 +285,9 @@ export function StreamingMarkdown({
+   if (advance > 0) {
+     const stableBoundary = analyzeStableBoundary(tokens, lastContentIdx)
+     if (stableBoundary.safe) {
++      // The cut is relative to the old suffix; advancing the source boundary
++      // makes that offset invalid even when the new suffix is longer than it.
++      cutRef.current = 0
+       if (!blocks.definitions) {
+         let end = boundary
+         for (let index = 0; index < lastContentIdx; index++) {
+@@ -334,13 +341,9 @@ export function StreamingMarkdown({
+           : boundaryGapRef.current + suffixStart.leadingNewlines
+       : 0
+ 
+-  // A lexer boundary must be strictly outside the stable prefix. If marked
+-  // reports a raw span that ends at the current cursor (possible around an
+-  // unfinished fence/table while deltas arrive), rendering both branches can
+-  // paint the same tail twice. Keep the suffix authoritative and never render
+-  // an overlapping empty/duplicate boundary.
+-  const hasDistinctSuffix = unstableSuffix !== '' &&
+-    (stablePrefix === '' || !unstableSuffix.startsWith(stablePrefix))
++  // The suffix starts at stablePrefix.length in the source, so its span
++  // cannot overlap the prefix even when their text happens to be identical.
++  const hasDistinctSuffix = unstableSuffix !== ''
+ 
+   return (
+     <Box flexDirection="column">
+diff --git a/src/components/SyntaxText.tsx b/src/components/SyntaxText.tsx
+index 7fdf9dab..0d9a58cc 100644
+--- a/src/components/SyntaxText.tsx
++++ b/src/components/SyntaxText.tsx
+@@ -20,11 +20,15 @@ type Props = {
+ export function SyntaxText({ text, language, sourceText = text, lineIndex = 0, color, dimColor }: Props): React.ReactNode {
+   const [highlighter, setHighlighter] = React.useState<CliHighlight | null>(null)
+   const [themeName] = useTheme()
++  // The renderer uses plain text when there is no language/source or when a
++  // caller supplies an overriding color. Avoid loading the syntax engine then.
++  const needsHighlight = language !== undefined && sourceText !== '' && color === undefined && !dimColor
+   React.useEffect(() => {
++    if (!needsHighlight) return
+     let mounted = true
+     void getCliHighlightPromise().then(value => { if (mounted) setHighlighter(value) })
+     return () => { mounted = false }
+-  }, [])
++  }, [needsHighlight])
+   // 当次渲染解析色板，**不按名字 memo**：`auto` 明暗翻转、运行时同名重注册
+   // 都不改名字，只改色板身份；按名字缓存会一直留着旧色板（getTheme 本身只是
+   // 一次 switch / resolver 查表，与其它取色组件一致）。
+diff --git a/src/utils/fileTarget.ts b/src/utils/fileTarget.ts
+index 2eafd177..d3b480e6 100644
+--- a/src/utils/fileTarget.ts
++++ b/src/utils/fileTarget.ts
+@@ -20,6 +20,7 @@ import { resolve } from 'node:path'
+ import { homedir } from 'node:os'
+ import { fileURLToPath } from 'node:url'
+ import { existsSync } from 'node:fs'
++import { scanPathSpans, trailingPathPunctuationStart } from './pathSpan.js'
+ 
+ /** Our custom OSC 8 scheme carrying a raw display path (URI-encoded). */
+ export const FILE_LINK_SCHEME = 'dsh-file:'
+@@ -107,7 +108,9 @@ function hasPlausibleExtension(stripped: string): boolean {
+  */
+ export function looksLikeFilePath(text: string): boolean {
+   const t = text.trim()
+-  if (t.length < 2 || t.length > 200) return false
++  // encodeURIComponent cannot encode isolated UTF-16 surrogates. Keep such
++  // text visible but do not turn it into a different, misleading file link.
++  if (t.length < 2 || t.length > 200 || !t.isWellFormed()) return false
+   if (!t.includes('/') && !t.includes('\\')) return false
+   if (/\s/u.test(t)) return false
+   if (/[<>"'`|?*]/.test(t)) return false
+@@ -140,20 +143,12 @@ export function pathExistsOnDisk(path: string): boolean {
+   }
+ }
+ 
+-/**
+- * Candidate-span scanner: anchored paths (`./`, `../`, `/`, `~/`, drive)
+- * run to the end of the word; everything else must contain a slash AND a
+- * dot-extension tail. This is only a pre-filter — every span is then
+- * verified by `looksLikeFilePath` before it becomes clickable.
+- */
+-const PATH_SPAN_RE =
+-  /(?:\.{1,2}[\\/]|[\\/]|~[\\/]|[A-Za-z]:[\\/])[^\s<>"'`|?#]*|(?:[^\s<>"'`|?#]*[\\/][^\s<>"'`|?#]*\.[A-Za-z0-9]{1,6})/gu
+-
+ /**
+  * Replace every path-looking span in `text` via `wrap(path, display)`.
+  * Trailing sentence punctuation stays OUTSIDE the wrapped display (so
+  * "src/foo.ts." links `src/foo.ts` and keeps the period). Spans that fail
+- * `looksLikeFilePath` are returned unchanged.
++ * `looksLikeFilePath` are returned unchanged. Anchored spans run to the word
++ * end; other candidates need a slash and an extension.
+  * @param text - plain text to scan (no ANSI).
+  * @param wrap - builds the clickable rendering for one path.
+  */
+@@ -161,15 +156,20 @@ export function linkifyFilePaths(
+   text: string,
+   wrap: (path: string, display: string) => string,
+ ): string {
+-  return text.replace(PATH_SPAN_RE, (match, offset, full) => {
+-    // A candidate must start at a text boundary, not inside another token:
+-    // `/idle/needs-input` in `working/idle/needs-input` otherwise looks like
+-    // an absolute path (#1181). Colons and slashes are not boundaries, so
+-    // URL interiors stay excluded too. Quotes/opening delimiters and `=`
+-    // still allow standalone anchored paths in prose and assignments.
+-    if (offset > 0 && !/[\s<>"'`|([{=]/u.test(full[offset - 1]!)) return match
+-    const display = match.replace(/[.,;:!?]+$/u, '')
+-    if (display === '' || !looksLikeFilePath(display)) return match
+-    return wrap(display, display) + match.slice(display.length)
+-  })
++  // Every path candidate contains a separator; skip scanning otherwise.
++  if (!text.includes('/') && !text.includes('\\')) return text
++  let output = ''
++  let cursor = 0
++  for (const { offset, end } of scanPathSpans(text)) {
++    output += text.slice(cursor, offset)
++    const match = text.slice(offset, end)
++    cursor = end
++    // Do not turn a suffix inside another token or URL into an absolute path
++    // (#1181). Quotes, opening delimiters and '=' remain valid boundaries.
++    if (offset > 0 && !/[\s<>"'`|([{=]/u.test(text[offset - 1]!)) { output += match; continue }
++    const display = match.slice(0, trailingPathPunctuationStart(match))
++    if (display === '' || !looksLikeFilePath(display)) { output += match; continue }
++    output += wrap(display, display) + match.slice(display.length)
++  }
++  return output + text.slice(cursor)
+ }
+diff --git a/src/utils/fold-long-lines.ts b/src/utils/fold-long-lines.ts
+index 860399cd..967bb057 100644
+--- a/src/utils/fold-long-lines.ts
++++ b/src/utils/fold-long-lines.ts
+@@ -20,6 +20,36 @@ import { primaryComboString } from './keymap.js'
+  */
+ export const LONG_LINE_MAX_CHARS = 1000
+ 
++/** Tokens the transcript turns into hyperlinks: Markdown link targets,
++ *  bare URLs, `dsh-file:` paths, issue references and file paths. Clipping
++ *  inside one would paint a link whose destination differs from the source
++ *  text (an autolinked truncated URL), so such a partial token is dropped
++ *  instead of being shown. */
++const LINK_TOKEN =
++  /^(?:\[[^\]\n]*\]\(|[a-z][a-z0-9+.-]*:\/\/|(?:dsh-file|file):|\.{0,2}\/|~\/|[\w.-]+\/[\w.-]+#\d+|[\w.-]+\/[\w.-]+\.[a-z0-9]{1,8}(?:[?#][^\s]*)?)/i
++
++/** Fence delimiter at the start of a line (` ``` ` / `~~~`, also inside a
++ *  blockquote or list quote prefix). */
++const FENCE_OPEN = /^(?: {0,3}(?:> ?)*)(`{3,}|~{3,})/
++
++const isWhitespace = (code: number): boolean =>
++  code === 32 || code === 9 || code === 10 || code === 13
++
++/**
++ * Start index of the token the clip would split when that token is a link
++ * target; the unmodified `cut` otherwise. The clip is only unsafe when it
++ * falls strictly inside a token (neither side is whitespace).
++ */
++function safeClipEnd(text: string, lineStart: number, cut: number, lineEnd: number): number {
++  if (cut <= lineStart || cut >= lineEnd) return cut
++  if (isWhitespace(text.charCodeAt(cut - 1)) || isWhitespace(text.charCodeAt(cut))) return cut
++  let tokenStart = cut
++  while (tokenStart > lineStart && !isWhitespace(text.charCodeAt(tokenStart - 1))) tokenStart--
++  let tokenEnd = cut
++  while (tokenEnd < lineEnd && !isWhitespace(text.charCodeAt(tokenEnd))) tokenEnd++
++  return LINK_TOKEN.test(text.slice(tokenStart, tokenEnd)) ? tokenStart : cut
++}
++
+ export type LongLineFold = {
+   /** Text to render. Identity-equal to the input when nothing was folded. */
+   readonly text: string
+@@ -41,11 +71,14 @@ function formatCount(value: number): string {
+  * Clip every line of `text` longer than `max` characters, appending an
+  * inline localized fold marker (`long-line-folded`) to the clipped line.
+  *
+- * Line boundaries are preserved (never re-flowed, never merged), so the
+- * result stays valid input for the markdown renderer and for diff-style
+- * line pairing. The caller decides WHEN to fold (e.g. not while the global
+- * expansion is on); this function is a pure, allocation-free fast path when
+- * no line exceeds the budget.
++ * Lines inside a fenced code block are never clipped: the fence has its own
++ * fold/expand gesture, and truncating its body would hand Markdown a broken
++ * block (and the expanded view a truncated copy of the user's code).
++ * Line boundaries are preserved (never re-flowed or merged), but clipping
++ * raw text can split Markdown links, ANSI sequences or code fences. Callers
++ * must not assume the result retains the original formatting or link targets.
++ * The caller decides WHEN to fold; the no-fold path does not allocate line
++ * slices.
+  */
+ export function foldLongLines(text: string, max: number = LONG_LINE_MAX_CHARS): LongLineFold {
+   if (text === '' || max <= 0) return { text, hiddenChars: 0, foldedLines: 0 }
+@@ -57,11 +90,20 @@ export function foldLongLines(text: string, max: number = LONG_LINE_MAX_CHARS):
+   let lineStart = 0
+   let hiddenChars = 0
+   let foldedLines = 0
++  /** Open fence (` ``` ` vs `~~~`) and its delimiter length, if any. */
++  let fence: { char: string; length: number } | undefined
+ 
+   for (;;) {
+     const newline = text.indexOf('\n', lineStart)
+     const lineEnd = newline === -1 ? text.length : newline
+-    const folded = lineEnd - lineStart > max
++    const delimiter = FENCE_OPEN.exec(text.slice(lineStart, Math.min(lineEnd, lineStart + 64)))
++    if (delimiter !== null) {
++      const marker = delimiter[1]!
++      const char = marker[0]!
++      if (fence === undefined) fence = { char, length: marker.length }
++      else if (fence.char === char && marker.length >= fence.length) fence = undefined
++    }
++    const folded = fence === undefined && lineEnd - lineStart > max
+ 
+     if (folded) {
+       // First fold: everything before this line is untouched, so it is
+@@ -79,6 +121,8 @@ export function foldLongLines(text: string, max: number = LONG_LINE_MAX_CHARS):
+         const lead = text.charCodeAt(end - 1)
+         const trail = text.charCodeAt(end)
+         if (lead >= 0xD800 && lead <= 0xDBFF && trail >= 0xDC00 && trail <= 0xDFFF) end--
++        // Never paint a truncated hyperlink target (see LINK_TOKEN).
++        end = safeClipEnd(text, lineStart, end, lineEnd)
+         const hidden = lineEnd - end
+         hiddenChars += hidden
+         foldedLines++
+diff --git a/src/utils/pathSpan.ts b/src/utils/pathSpan.ts
+new file mode 100644
+index 00000000..966ee83e
+--- /dev/null
++++ b/src/utils/pathSpan.ts
+@@ -0,0 +1,78 @@
++/** UTF-16 offsets of a path-like candidate in the original input. */
++export type PathSpan = { offset: number; end: number }
++
++// Capture the primitive so a reentrant callback cannot change later scans.
++const codeAt = Function.prototype.call.bind(String.prototype.charCodeAt) as (text: string, index: number) => number
++const separator = (n: number) => n === 47 || n === 92
++const letter = (n: number) => (n >= 65 && n <= 90) || (n >= 97 && n <= 122)
++const alphanumeric = (n: number) => letter(n) || (n >= 48 && n <= 57)
++
++// ECMAScript \s and the original path-span exclusions. Surrogate code units
++// remain allowed; the actual path validation rejects ill-formed UTF-16.
++function excluded(n: number): boolean {
++  return (n >= 9 && n <= 13) || n === 0x20 || n === 0x00a0 || n === 0x1680 ||
++    (n >= 0x2000 && n <= 0x200a) || n === 0x2028 || n === 0x2029 ||
++    n === 0x202f || n === 0x205f || n === 0x3000 || n === 0xfeff ||
++    n === 60 || n === 62 || n === 34 || n === 39 || n === 96 ||
++    n === 124 || n === 63 || n === 35
++}
++
++function anchored(text: string, index: number, end: number): boolean {
++  const c = codeAt(text, index)
++  const n1 = index + 1 < end ? codeAt(text, index + 1) : -1
++  const n2 = index + 2 < end ? codeAt(text, index + 2) : -1
++  return separator(c) || (c === 126 && separator(n1)) ||
++    (c === 46 && (separator(n1) || (n1 === 46 && separator(n2)))) ||
++    (letter(c) && n1 === 58 && separator(n2))
++}
++
++/** Yield path-like spans, including those later rejected by path validation. */
++export function* scanPathSpans(text: string, stats = { steps: 0 }): Generator<PathSpan> {
++  let cursor = 0
++  while (cursor < text.length) {
++    stats.steps++
++    if (excluded(codeAt(text, cursor))) { cursor++; continue }
++    const start = cursor
++    let firstSlash = -1
++    let lastDot = -1
++    while (cursor < text.length && !excluded(codeAt(text, cursor))) {
++      stats.steps++
++      const c = codeAt(text, cursor)
++      if (firstSlash < 0 && separator(c)) firstSlash = cursor
++      if (c === 46 && cursor + 1 < text.length && alphanumeric(codeAt(text, cursor + 1))) lastDot = cursor
++      cursor++
++    }
++    // Both candidate forms require a slash; avoid rescanning ordinary words.
++    if (firstSlash < 0) continue
++    const end = cursor
++    if (anchored(text, start, end)) { yield { offset: start, end }; continue }
++    let remainder = start
++    if (lastDot > firstSlash) {
++      let matchedEnd = lastDot + 1
++      let count = 0
++      while (matchedEnd < end && count < 6 && alphanumeric(codeAt(text, matchedEnd))) {
++        matchedEnd++; count++; stats.steps++
++      }
++      yield { offset: start, end: matchedEnd }
++      remainder = matchedEnd
++    }
++    // A successful unanchored match consumed the last eligible dot. If it
++    // failed at the run start, it cannot succeed later within that run.
++    for (let i = remainder; i < end; i++) {
++      stats.steps++
++      if (anchored(text, i, end)) { yield { offset: i, end }; break }
++    }
++  }
++}
++
++/** Return the start of the trailing ASCII punctuation suffix. */
++export function trailingPathPunctuationStart(text: string, stats = { inspected: 0 }): number {
++  let end = text.length
++  while (end > 0) {
++    stats.inspected++
++    const ch = codeAt(text, end - 1)
++    if (ch !== 46 && ch !== 44 && ch !== 59 && ch !== 58 && ch !== 33 && ch !== 63) break
++    end--
++  }
++  return end
++}

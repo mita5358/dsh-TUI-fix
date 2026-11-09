@@ -1,0 +1,62 @@
+From f37f9511d9f016445d5911de5cbff47da6697159 Mon Sep 17 00:00:00 2001
+From: mita5358 <kafitcohr@outlook.com>
+Date: Fri, 30 Oct 2026 23:16:43 +0800
+Subject: [PATCH 06/20] perf(dsh): trace the seed phases so a slow open can be
+ attributed
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+DSH_TUI_BOOT_TRACE already marks render-start/render-done, but the seed
+between them was opaque: on the titan record (139 MB, 93k events) the marks
+could not say how much of a 16.5 s open was reading the log, translating the
+replay, folding it, or painting the frame.
+
+Mark the four boundaries the seed crosses — raw history delivered, translate
+done, chunks planned and older rows folded, newest chunk projected, seed
+complete. All marks stay behind the same opt-in env var and cost nothing
+when it is unset.
+---
+ src/dsh-adapter/channel/extensions.ts | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/src/dsh-adapter/channel/extensions.ts b/src/dsh-adapter/channel/extensions.ts
+index 3988c71f..cd7beb53 100644
+--- a/src/dsh-adapter/channel/extensions.ts
++++ b/src/dsh-adapter/channel/extensions.ts
+@@ -37,6 +37,7 @@ import { touchSession } from '../../sessionHistory.js'
+ import { snapshotLiveSessionEvents } from '../compat/liveSession.js'
+ import { DEFAULT_SESSION_MODES, resolveSessionModes } from '../../sessionModes.js'
+ import { installedMeetsVersion } from '../contract.js'
++import { markBoot } from '../../utils/bootTrace.js'
+ import { chunkForRow, placeholderEvent, planChunks, placeholderRows, type HistoryChunk } from '../backend/history-chunks.js'
+ import { createDshSession } from '../backend/session.js'
+ import { createDshTranslator, dshPricingWindow } from '../backend/translate.js'
+@@ -651,7 +652,9 @@ export function attachDshExtensions(
+     // the pass itself is what has to shrink. The record is cut into turn-
+     // aligned chunks (history-chunks.ts); every older chunk keeps a digest row
+     // and its prompt rows, and "load earlier" projects it in place.
++    markBoot('seed-enter')
+     const entries = dshNative().translateReplay(events)
++    markBoot('translate-done')
+     seedEntries = entries
+     seedChunks = planChunks(entries)
+     loadedChunks.clear()
+@@ -680,11 +683,16 @@ export function attachDshExtensions(
+       placeholderCounts.set(chunk.index, rows.length)
+       state.rows.push(...rows)
+     }
++    markBoot('fold-done')
+     projector.apply(entries.slice(newest.start, newest.end), { replay: true })
++    markBoot('newest-done')
+     loadedChunks.add(newest.index)
+     subagentProjection.bootstrapFromLog(events)
+   }
+-  replaySessionSeed(initialNative.rawHistory())
++  const initialEvents = initialNative.rawHistory()
++  markBoot('raw-history-done')
++  replaySessionSeed(initialEvents)
++  markBoot('seed-done')
+   projector.settleStreaming()
+   // Attached to an idle agent: any replayed turn/start belongs to a previous
+   // session run, so the spinner must not come up on boot.

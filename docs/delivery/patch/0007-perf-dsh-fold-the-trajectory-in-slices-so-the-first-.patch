@@ -1,0 +1,192 @@
+From 8fde8094b697a4be0da62f7aa9d0bfa2a42ab026 Mon Sep 17 00:00:00 2001
+From: mita5358 <kafitcohr@outlook.com>
+Date: Fri, 30 Oct 2026 23:16:47 +0800
+Subject: [PATCH 07/20] perf(dsh): fold the trajectory in slices so the first
+ frame paints
+
+Chat folds the session's whole event log into the trajectory build on every
+render, and the first fold is unbounded. On the titan record that is 93k
+events, nearly all of it assistant/message stream validation: 2.3 s of
+main-thread work charged to the first frame, after the transcript was already
+assembled.
+
+Give extendTrajectory an optional budget and let Chat hand it 4k events per
+tick. The build's source becomes a prefix of the snapshot and the next call
+resumes through the same incremental path a live append uses, so nothing is
+refolded and the ledger is identical once the fold catches up. The first
+frame now paints before the fold starts; the strip and the trajectory scene
+fill in over the following ticks.
+
+Measured on the titan session in a mirror install: first visible content
+16,518 ms -> 14,281 ms. verify-trace-projection gains a budget oracle (zero
+budget, 3-event slices, partial prefix, oversized budget) and still passes
+71/71 checks.
+---
+ scripts/verify-trace-projection.mjs      | 20 +++++++++++
+ src/dsh-adapter/trajectory/projection.ts | 42 +++++++++++++++++++-----
+ src/screens/Chat.tsx                     | 31 +++++++++++++++--
+ 3 files changed, 83 insertions(+), 10 deletions(-)
+
+diff --git a/scripts/verify-trace-projection.mjs b/scripts/verify-trace-projection.mjs
+index 2667ac69..d85f69fc 100644
+--- a/scripts/verify-trace-projection.mjs
++++ b/scripts/verify-trace-projection.mjs
+@@ -156,6 +156,26 @@ check('fixture folds to a non-trivial ledger', whole.nodes.length > 40, `${whole
+   check('incremental fold equals from-scratch at every split point', worst === null, worst ?? `${events.length + 1} splits`)
+ }
+ 
++{
++  // Budgeted slices — the titan first-frame path. A caller that cannot afford
++  // the whole fold spreads it over frames; the result must be the same ledger,
++  // and the cursor must advance by exactly the budget.
++  let build = extendTrajectory(null, events, { budget: 0 })
++  check('a zero budget folds nothing and keeps an empty cursor', build.nodes.length === 0 && build.source.length === 0)
++  let ticks = 0
++  while (build.source.length < events.length && ticks < events.length + 1) {
++    const before = build.source.length
++    build = extendTrajectory(build, events, { budget: 3 })
++    if (build.source.length !== Math.min(events.length, before + 3)) break
++    ticks += 1
++  }
++  check('budgeted slices fold the whole snapshot', build.source.length === events.length, `${build.source.length}/${events.length} in ${ticks} ticks`)
++  check('budgeted slices equal from-scratch', diff(build.nodes, whole.nodes) === null, diff(build.nodes, whole.nodes) ?? '')
++  const partial = extendTrajectory(null, events, { budget: 7 })
++  check('a partial build exposes a prefix of the snapshot', partial.source.length === 7 && partial.source[6] === events[6])
++  check('a budget larger than the tail consumes it whole', extendTrajectory(partial, events, { budget: 10_000 }).source.length === events.length)
++}
++
+ {
+   // One-event-at-a-time replay — the live streaming path.
+   let build = null
+diff --git a/src/dsh-adapter/trajectory/projection.ts b/src/dsh-adapter/trajectory/projection.ts
+index 00793382..f4a37a07 100644
+--- a/src/dsh-adapter/trajectory/projection.ts
++++ b/src/dsh-adapter/trajectory/projection.ts
+@@ -829,40 +829,66 @@ export function emptyTrajectory(): TrajBuild {
+   return { source: [], nodes: [], timing: new Map(), counts: state.counts, state }
+ }
+ 
++/** Options for {@link extendTrajectory}. */
++export interface ExtendOptions {
++  /**
++   * Fold at most this many events, leaving the rest for the next call.
++   *
++   * A long record costs ~2.3 s of main-thread work to fold (measured on the
++   * titan log: 93k events, mostly `assistant/message` stream validation). A
++   * caller that runs on the first-frame path uses this to spread that work
++   * over several frames instead of holding the frame back; the build's
++   * `source` is then a prefix of the snapshot, and the next call resumes from
++   * it exactly like any other incremental append.
++   */
++  readonly budget?: number
++}
++
+ /**
+  * Extend a previous projection with the session's current event snapshot.
+  *
+  * @param previous - The prior build, or `null` to fold from scratch.
+  * @param events - The session's current immutable event snapshot.
++ * @param options - See {@link ExtendOptions}.
+  * @returns A build over `events`; `previous` itself when nothing was appended.
+  */
+ export function extendTrajectory(
+   previous: TrajBuild | null,
+   events: readonly RawTrajEvent[],
++  options: ExtendOptions = {},
+ ): TrajBuild {
+   const raw = asRawEvents(events)
++  const cursor = previous?.source.length ?? 0
++  const limit = options.budget === undefined
++    ? raw.length
++    : Math.min(raw.length, cursor + Math.max(0, options.budget))
++  const source = limit === raw.length ? raw : raw.slice(0, limit)
+   if (
+     previous !== null &&
+-    raw.length >= previous.source.length &&
+-    (previous.source.length === 0 ||
+-      raw[previous.source.length - 1] === previous.source[previous.source.length - 1])
++    raw.length >= cursor &&
++    limit > cursor &&
++    (cursor === 0 ||
++      raw[cursor - 1] === previous.source[cursor - 1])
+   ) {
+-    if (raw.length === previous.source.length) return previous
+     const nodes = previous.nodes
+     const timing = previous.timing
+     const state = cloneState(previous.state)
+-    for (let index = previous.source.length; index < raw.length; index++) {
++    for (let index = cursor; index < limit; index++) {
+       consume(state, nodes, timing, raw[index]!)
+     }
+     syncRowCount(state, nodes)
+-    return { source: raw, nodes, timing, counts: state.counts, state }
++    return { source, nodes, timing, counts: state.counts, state }
++  }
++  if (previous !== null && raw.length >= cursor && limit <= cursor &&
++    (cursor === 0 || raw[cursor - 1] === previous.source[cursor - 1])) {
++    return previous
+   }
+   const nodes: TrajNode[] = []
+   const timing = new Map<string, StepTiming>()
+   const state = newState()
+-  for (const event of raw) consume(state, nodes, timing, event)
++  for (let index = 0; index < limit; index++) consume(state, nodes, timing, raw[index]!)
+   syncRowCount(state, nodes)
+-  return { source: raw, nodes, timing, counts: state.counts, state }
++  return { source, nodes, timing, counts: state.counts, state }
+ }
+ 
+ /**
+diff --git a/src/screens/Chat.tsx b/src/screens/Chat.tsx
+index 2e248bb9..d493e3c6 100644
+--- a/src/screens/Chat.tsx
++++ b/src/screens/Chat.tsx
+@@ -232,6 +232,17 @@ const STATUS_VIEW_UI = Object.freeze({
+ /** Shared empty snapshot for hosts whose channel has no event log. */
+ const NO_EVENTS: readonly SessionEvent[] = []
+ 
++/**
++ * Events per trajectory-fold slice on the first-frame path.
++ *
++ * The trajectory strips fold the whole session, and folding it in one pass
++ * costs ~2.3 s on a 93k-event record (nearly all of it `assistant/message`
++ * stream validation) — the conversation is painted but held back by that
++ * pass. 4k events is roughly one 150 ms slice: big enough to finish the fold
++ * in a few dozen ticks, small enough that each tick leaves the frame on time.
++ */
++const TRAJECTORY_FOLD_BUDGET = 4000
++
+ const COMMAND_RESULT_CELLS = 200
+ 
+ /** Per-line width budget for a transcript block (`/plugins`, `/goal`): much
+@@ -4593,12 +4604,28 @@ export function Chat({
+    * conversation pays nothing for it.
+    */
+   const trajectoryRef = React.useRef<TrajBuild | null>(null)
++  // oxlint-disable-next-line typescript/no-unnecessary-condition -- runtime guard: headless hosts render Chat with a partial channel
++  const trajectoryEvents = channel.traceEvents?.() ?? NO_EVENTS
++  const trajectoryStarted = trajectoryRef.current !== null
++  const trajectoryBudget = !trajectoryStarted
++    ? (trajectoryEvents.length > TRAJECTORY_FOLD_BUDGET ? 0 : null)
++    : (trajectoryRef.current!.source.length < trajectoryEvents.length ? TRAJECTORY_FOLD_BUDGET : null)
+   trajectoryRef.current = extendTrajectory(
+     trajectoryRef.current,
+-    // oxlint-disable-next-line typescript/no-unnecessary-condition -- runtime guard: headless hosts render Chat with a partial channel
+-    channel.traceEvents?.() ?? NO_EVENTS,
++    trajectoryEvents,
++    trajectoryBudget === null ? {} : { budget: trajectoryBudget },
+   )
+   const trajectory = trajectoryRef.current
++  // Keep pulling slices until the fold catches up with the snapshot; a live
++  // append arriving in between simply enlarges the target and the next tick
++  // picks it up through the ordinary incremental path.
++  const [, bumpTrajectoryFold] = React.useState(0)
++  React.useEffect(() => {
++    if (trajectoryRef.current === null) return
++    if (trajectoryRef.current.source.length >= trajectoryEvents.length) return
++    const timer = setTimeout(() => bumpTrajectoryFold(tick => tick + 1), 0)
++    return () => clearTimeout(timer)
++  })
+ 
+   /**
+    * The status-line wake.

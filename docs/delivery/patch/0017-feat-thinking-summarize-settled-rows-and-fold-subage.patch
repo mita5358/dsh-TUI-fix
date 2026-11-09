@@ -1,0 +1,2889 @@
+From 576f5c02ed93e622d6d465b749600127071f8199 Mon Sep 17 00:00:00 2001
+From: mita5358 <kafitcohr@outlook.com>
+Date: Mon, 9 Nov 2026 13:00:50 +0800
+Subject: [PATCH 17/20] feat(thinking): summarize settled rows and fold
+ subagent groups
+
+---
+ scripts/lib/thinking-test-rig.mjs             | 158 +++++++++++
+ scripts/repro-thinking-stream-fold.tsx        |  13 +-
+ scripts/thinking-virtualization-probe.mjs     |  79 ++++++
+ scripts/thinking-virtualization-rig.mjs       | 193 ++++++++++++++
+ scripts/verify-digest-click.tsx               | 145 ++++++++++
+ scripts/verify-history-prose-default.tsx      | 248 ++++++++++++++++++
+ scripts/verify-leading-thinking-lines.mjs     |  90 +++++++
+ .../verify-selection-attachment-bounded.ts    |  91 +++++++
+ scripts/verify-settled-thinking-cells.mjs     |  40 +++
+ scripts/verify-settled-thinking-chat.mjs      | 172 ++++++++++++
+ scripts/verify-settled-thinking-component.tsx |  85 ++++++
+ scripts/verify-settled-thinking-summary.mjs   | 122 +++++++++
+ scripts/verify-subagent-group-fold.tsx        | 172 ++++++++++++
+ scripts/verify-subagent-settled-no-scan.mjs   | 171 ++++++++++++
+ scripts/verify-thinking-ticker-render.tsx     |  91 +++++++
+ scripts/verify-thinking-ticker-tail.ts        |  40 +++
+ scripts/verify-thinking-virtualization.mjs    | 125 +++++++++
+ src/components/Chat/SubagentGroupHeader.tsx   |  96 +++++++
+ src/components/Chat/SubagentMessage.tsx       |   6 +-
+ src/components/SubagentDetailScene.tsx        |  16 +-
+ .../messages/AssistantTextMessage.tsx         |  12 +-
+ .../messages/AssistantThinkingMessage.tsx     |  62 ++++-
+ .../messages/AssistantToolUseMessage.tsx      |  75 ++++--
+ src/components/messages/TranscriptLeaves.tsx  |  16 ++
+ .../messages/settledThinkingSummary.ts        | 148 +++++++++++
+ src/components/messages/thinkingTicker.ts     |  13 +
+ 26 files changed, 2447 insertions(+), 32 deletions(-)
+ create mode 100644 scripts/lib/thinking-test-rig.mjs
+ create mode 100644 scripts/thinking-virtualization-probe.mjs
+ create mode 100644 scripts/thinking-virtualization-rig.mjs
+ create mode 100644 scripts/verify-digest-click.tsx
+ create mode 100644 scripts/verify-history-prose-default.tsx
+ create mode 100644 scripts/verify-leading-thinking-lines.mjs
+ create mode 100644 scripts/verify-selection-attachment-bounded.ts
+ create mode 100644 scripts/verify-settled-thinking-cells.mjs
+ create mode 100644 scripts/verify-settled-thinking-chat.mjs
+ create mode 100644 scripts/verify-settled-thinking-component.tsx
+ create mode 100644 scripts/verify-settled-thinking-summary.mjs
+ create mode 100644 scripts/verify-subagent-group-fold.tsx
+ create mode 100644 scripts/verify-subagent-settled-no-scan.mjs
+ create mode 100644 scripts/verify-thinking-ticker-render.tsx
+ create mode 100644 scripts/verify-thinking-ticker-tail.ts
+ create mode 100644 scripts/verify-thinking-virtualization.mjs
+ create mode 100644 src/components/Chat/SubagentGroupHeader.tsx
+ create mode 100644 src/components/messages/settledThinkingSummary.ts
+ create mode 100644 src/components/messages/thinkingTicker.ts
+
+diff --git a/scripts/lib/thinking-test-rig.mjs b/scripts/lib/thinking-test-rig.mjs
+new file mode 100644
+index 00000000..539978e8
+--- /dev/null
++++ b/scripts/lib/thinking-test-rig.mjs
+@@ -0,0 +1,158 @@
++/** Real Chat/xterm fixture with a private synthetic channel and home.
++ * Used by verify-settled-thinking-chat.mjs; no real backend or transcript.
++ */
++import assert from 'node:assert/strict'
++import { createRequire } from 'node:module'
++import { fileURLToPath, pathToFileURL } from 'node:url'
++import { lstatSync, mkdtempSync, openSync, closeSync, realpathSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { basename, dirname, join } from 'node:path'
++import { PassThrough, Writable } from 'node:stream'
++
++// React chooses its production/dev build at first load; reject a misconfigured
++// process before importing React, xterm, or any application module.
++assert.equal(process.env.NODE_ENV, 'production', 'NODE_ENV=production is required before React loads')
++
++// Remove inherited credentials and user settings before importing the app.
++const allowedEnv = new Set(['NODE_ENV', 'PATH', 'Path', 'SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT'])
++for (const key of Object.keys(process.env)) if (!allowedEnv.has(key)) delete process.env[key]
++const root = realpathSync(tmpdir())
++const home = realpathSync(mkdtempSync(join(root, 'dsh-thinking-fixture-')))
++const created = lstatSync(home)
++let cleaned = false
++export function cleanup() {
++  if (cleaned) return
++  const actual = realpathSync(home)
++  const current = lstatSync(home)
++  assert.equal(actual, home)
++  assert.equal(dirname(actual), root)
++  assert.ok(basename(actual).startsWith('dsh-thinking-fixture-'))
++  assert.ok(current.isDirectory() && current.dev === created.dev && current.ino === created.ino)
++  if (process.platform !== 'win32') {
++    assert.equal(current.uid, process.getuid())
++    assert.equal(current.mode & 0o077, 0)
++  }
++  rmSync(actual, { recursive: true })
++  cleaned = true
++}
++process.once('exit', cleanup)
++Object.assign(process.env, {
++  HOME: home, USERPROFILE: home, DSH_HOME: join(home, '.dsh'),
++  XDG_CONFIG_HOME: join(home, '.config'), XDG_CACHE_HOME: join(home, '.cache'),
++  XDG_DATA_HOME: join(home, '.local', 'share'), XDG_STATE_HOME: join(home, '.local', 'state'),
++  DSH_TUI_LANG: 'en', DSH_TUI_THEME: 'dark', FORCE_COLOR: '3', TERM: 'xterm-256color',
++})
++
++const repo = fileURLToPath(new URL('../../', import.meta.url))
++const require = createRequire(join(repo, 'package.json'))
++const React = require('react')
++const { Terminal } = require('@xterm/headless')
++const appImport = path => import(pathToFileURL(join(repo, path)).href)
++const [{ render, AlternateScreen }, { Chat }, { QuestionStore }, { LOCAL_COMMANDS }, { setLang }, { stringWidth }, { settled, sleep }] = await Promise.all([
++  appImport('src/ui.ts'), appImport('src/screens/Chat.tsx'), appImport('src/dsh-adapter/questions.ts'),
++  appImport('src/commands.ts'), appImport('src/i18n.ts'), appImport('src/ink/stringWidth.ts'), appImport('scripts/lib/term-test.mjs'),
++])
++
++export { setLang, sleep }
++export async function rig({ columns = 100, rows = 45, initialRows = [], thinkingFold = 'preview' } = {}) {
++  const term = new Terminal({ cols: columns, rows, scrollback: 0, allowProposedApi: true })
++  const titleChanges = []
++  term.onTitleChange(title => titleChanges.push(title))
++  const fd = openSync(join(home, `tty-${Math.random().toString(36).slice(2)}`), 'w')
++  let pendingWrites = 0, frames = 0, requiredFrame = -1
++  // Hard cap applies to the whole rig lifetime, including redraws. Never
++  // truncate silently: stop feeding the oversized chunk to xterm and fail at
++  // the next drain. Retained output is at most OUTPUT_LIMIT UTF-16 code units.
++  const OUTPUT_LIMIT = 256 * 1024
++  let output = '', outputOverflow = false
++  class Stdout extends Writable {
++    isTTY = true
++    constructor() { super(); this.columns = columns; this.rows = rows; this.fd = fd }
++    _write(chunk, _encoding, done) {
++      if (outputOverflow) { done(); return }
++      // UTF-8 byte size upper-bounds decoded UTF-16 units for valid text;
++      // rejecting first prevents even transient conversion of a giant chunk.
++      const remaining = OUTPUT_LIMIT - output.length
++      if (Buffer.isBuffer(chunk) && chunk.length > remaining * 3) { outputOverflow = true; done(); return }
++      const text = String(chunk)
++      if (text.length > remaining) { outputOverflow = true; done(); return }
++      output += text
++      pendingWrites++
++      term.write(text, () => { pendingWrites--; done() })
++    }
++  }
++  class Stdin extends PassThrough {
++    isTTY = true
++    setRawMode() { return this }
++    ref() { return this }
++    unref() { return this }
++  }
++  const stdout = new Stdout(), stdin = new Stdin()
++  const stderr = Object.assign(new Writable({ write(_chunk, _encoding, done) { done() } }), { isTTY: true })
++  const listeners = new Set()
++  const channel = {
++    version: 0, rows: initialRows, thinkingFold, smoothStreaming: false,
++    agentId: 'synthetic-agent', sessionId: 'synthetic-session', whaleIdle: false,
++    status: 'idle', sessionTitle: 'fixture', model: 'model', provider: 'fixture',
++    tokens: { input: 0, output: 0 }, cwd: home, displayCwd: home, gitBranch: '',
++    working: false, spinnerMode: 'requesting', mode: { plan: false }, responseChars: 0,
++    activeToolCount: 0, turnStart: 0, lastUserText: '', pending: [],
++    commandList: LOCAL_COMMANDS, commandCompletions: () => [], notifications: [],
++    contextSegments: { system: 0, prompt: 0, assistant: 0, thinking: 0, tools: 0 },
++    subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn) },
++    submit() {}, steer() {}, cancel() {}, clear() { this.rows = []; this.emit() }, notify() {},
++    listModels: async () => [], listSessions: () => [], setResumeTarget() {},
++    emit() { requiredFrame = frames; this.version++; for (const fn of listeners) fn() },
++  }
++  const screen = () => {
++    const buffer = term.buffer.active
++    return Array.from({ length: rows }, (_, y) => buffer.getLine(buffer.baseY + y)?.translateToString(true) ?? '')
++  }
++  const drain = async () => {
++    for (let attempt = 0; attempt < 20; attempt++) {
++      await new Promise((resolve, reject) => stdout.write('', error => error ? reject(error) : resolve()))
++      if (pendingWrites === 0 && stdout.writableLength === 0) {
++        if (outputOverflow) throw new Error(`terminal output capture exceeded hard limit ${OUTPUT_LIMIT}; assertion invalid`)
++        return
++      }
++    }
++    throw new Error('xterm did not drain')
++  }
++  const wait = async (predicate, timeoutMs = 2500) => {
++    const ok = await settled(() => frames > requiredFrame && pendingWrites === 0 && stdout.writableLength === 0 && predicate(), { timeoutMs })
++    await drain()
++    return Boolean(ok && predicate())
++  }
++  const setRows = newRows => { channel.rows = newRows; channel.emit() }
++  const click = async (label, accepts = () => true) => {
++    await drain()
++    const line = screen().findIndex(text => text.includes(label) && accepts(text))
++    if (line < 0) return false
++    const text = screen()[line]
++    const charOffset = text.indexOf(label)
++    const col = stringWidth(text.slice(0, charOffset)) + 1
++    requiredFrame = frames
++    stdin.write(`\x1b[<0;${col};${line + 1}M\x1b[<0;${col};${line + 1}m`)
++    return true
++  }
++  const input = text => { requiredFrame = frames; stdin.write(text) }
++  let app
++  try {
++    app = await render(
++      React.createElement(AlternateScreen, null, React.createElement(Chat, { channel, questionStore: new QuestionStore(), fullscreen: true, trajectorySeen: true })),
++      { stdout, stdin, stderr, patchConsole: false, exitOnCtrlC: false, onFrame: () => { frames++ } },
++    )
++  } catch (error) {
++    term.dispose()
++    closeSync(fd)
++    throw error
++  }
++  return {
++    channel, term, screen, wait, setRows, click, input, drain, titleChanges,
++    getOutput: () => output,
++    async close() {
++      try { await app.unmount(); await drain() }
++      finally { term.dispose(); closeSync(fd) }
++    },
++  }
++}
+diff --git a/scripts/repro-thinking-stream-fold.tsx b/scripts/repro-thinking-stream-fold.tsx
+index 10f9a678..28ad0728 100644
+--- a/scripts/repro-thinking-stream-fold.tsx
++++ b/scripts/repro-thinking-stream-fold.tsx
+@@ -182,8 +182,17 @@ check('步骤落定后 full 正文仍保持展开', bodyLines(ls) >= 10, `body=$
+ reasoningRow.thinkingOpen = false
+ channel.version += 1
+ for (const listener of listeners) listener()
+-await waitFor(() => bodyLines(lines()) === 0)
+-check('turn 结束后 full 正文折叠', bodyLines(lines()) === 0, `body=${bodyLines(lines())}`)
++// Folded settled blocks are no longer "header only": the contract is ONE
++// summary row carrying the opening fragment, an ellipsis and the expand
++// hint (docs/delivery/EVIDENCE.md §11). So the single line that still
++// contains 推理第 must be that digest row, not a leftover body line.
++await waitFor(() => bodyLines(lines()) === 1)
++const folded = lines().filter(line => line.includes('推理第'))
++check(
++  'turn 结束后折叠成一行摘要',
++  folded.length === 1 && folded[0].includes('…') && folded[0].includes('展开'),
++  `folded=${folded.length}`,
++)
+ 
+ await inst.unmount()
+ console.log(failed === 0 ? '\nALL PASS' : `\n${failed} 项失败`)
+diff --git a/scripts/thinking-virtualization-probe.mjs b/scripts/thinking-virtualization-probe.mjs
+new file mode 100644
+index 00000000..2ed71824
+--- /dev/null
++++ b/scripts/thinking-virtualization-probe.mjs
+@@ -0,0 +1,79 @@
++/* Real Chat + synthetic channel + physical xterm; independent of DSH history
++ * chunking and LRU. Run via verify-thinking-virtualization.mjs --run;
++ * no forceRedraw.
++ * DOM row identity and MessageList window are both checked on each side of
++ * the scroll; offscreen pixels alone do not establish virtualization.
++ */
++import assert from 'node:assert/strict'
++const repoRoot = new URL('../', import.meta.url)
++const { rig, setLang, sleep } = await import(new URL('scripts/thinking-virtualization-rig.mjs', repoRoot).href)
++const HEAD = 'VIRT_REASON_HEAD', MID = 'VIRT_REASON_MIDDLE', TAIL = 'VIRT_REASON_TAIL'
++const NEXT = 'VIRT_NEXT_ROW_SENTINEL'
++const thinkingText = `${HEAD} short explanation\n\n${MID} complete middle paragraph\n\n${TAIL} complete final paragraph`
++const beforeRows = Array.from({ length: 124 }, (_, i) => ({ id: i + 1, kind: 'assistant', text: `VIRTUAL_FILLER_${i}`, streaming: false }))
++const target = { id: 125, kind: 'reasoning', text: thinkingText, streaming: false, thinkingOpen: false }
++const afterRows = [{ id: 126, kind: 'assistant', text: NEXT, streaming: false },
++  ...Array.from({ length: 4 }, (_, i) => ({ id: 127 + i, kind: 'assistant', text: `VIRTUAL_AFTER_${i}`, streaming: false }))]
++const rows = [...beforeRows, target, ...afterRows]
++const index = rows.findIndex(row => row.id === target.id)
++const boundary = rows.length - 120, windowIndex = index - boundary
++assert.ok(rows.length > 120 && index > boundary && index < rows.length - 1)
++assert.equal(rows[index + 1].text, NEXT, 'fixed order places the sentinel directly after the reasoning row')
++assert.ok(rows.every(row => !('folded' in row) && !('collapsed' in row)), 'fixture contains no historical chunks')
++const has = (app, text) => app.screen().some(line => line.includes(text))
++const header = line => /(?:⚓|\*)\s+Thinking\b/u.test(line)
++const full = app => [HEAD, MID, TAIL].every(text => has(app, text))
++const summaryLine = app => app.screen().find(line => header(line) && line.includes(HEAD) && line.includes('…') && /click\s+to\s+expand/i.test(line))
++const inWindow = note => note && note.rowCount === 120 && windowIndex >= note.start && windowIndex < note.end
++const outWindow = note => note && note.rowCount === 120 && (windowIndex < note.start || windowIndex >= note.end)
++let app
++try {
++  setLang('en')
++  app = await rig({ columns: 100, rows: 45, initialRows: rows, thinkingFold: 'preview' })
++  assert.ok(await app.wait(() => Boolean(summaryLine(app)) && has(app, NEXT) && inWindow(app.geometry()), 5000), 'settled folded target and adjacent row must paint inside the last-120 window')
++  assert.equal(has(app, MID) || has(app, TAIL), false, 'folded summary must hide the remaining body')
++  const originalSummary = summaryLine(app)
++  const initialRow = app.rowNode(HEAD, NEXT)
++  assert.ok(initialRow && app.attached(initialRow), 'actual reasoning row wrapper must be attached before opening')
++  console.log(`INITIAL ${JSON.stringify({ total: rows.length, index, boundary, windowIndex, geometry: app.geometry(), frame: app.frame(), scrollTop: app.scroll()?.scrollTop })}`)
++
++  assert.ok(await app.click('Thinking', header), 'a real SGR press/release must hit the visible settled summary')
++  const openClick = app.lastClick()
++  assert.ok(await app.wait(() => full(app) && has(app, NEXT), 5000), 'all reasoning content must paint in a new parsed frame')
++  const openRow = app.rowNode(HEAD, NEXT)
++  assert.ok(openRow && app.attached(openRow), 'opened reasoning wrapper must be attached')
++  assert.ok(inWindow(app.geometry()), 'opened target remains inside the virtual window')
++  console.log(`OPEN ${JSON.stringify({ click: openClick, frame: app.frame(), geometry: app.geometry(), scrollTop: app.scroll()?.scrollTop })}`)
++  await sleep(600) // 固定窗:墙钟 wait beyond terminal double-click recognition before the later closing click
++
++  let unmounted = false, pageCount = 0
++  for (; pageCount < 12; pageCount++) {
++    const prevTop = app.scroll()?.scrollTop
++    assert.ok(typeof prevTop === 'number' && prevTop > 0, 'there must be room to page upward')
++    app.input('\x1b[5~')
++    assert.ok(await app.wait(() => typeof app.scroll()?.scrollTop === 'number' && app.scroll().scrollTop < prevTop, 5000), 'PageUp must produce a new parsed frame with upward movement')
++    if (!app.attached(openRow) && outWindow(app.geometry())) { unmounted = true; break }
++  }
++  assert.ok(unmounted, 'the captured DOM row object must be detached and its index outside the mounted window')
++  assert.equal(has(app, MID) || has(app, TAIL), false, 'expanded body must no longer occupy the physical viewport')
++  console.log(`UNMOUNT ${JSON.stringify({ pages: pageCount + 1, frame: app.frame(), geometry: app.geometry(), scrollTop: app.scroll()?.scrollTop, attached: app.attached(openRow) })}`)
++
++  app.input('\x1b[F')
++  assert.ok(await app.wait(() => full(app) && has(app, NEXT) && inWindow(app.geometry()), 5000), 'End must return to the same expanded body in a new parsed frame')
++  const remounted = app.rowNode(HEAD, NEXT)
++  assert.ok(remounted && app.attached(remounted), 'the reasoning row must be attached again')
++  assert.notEqual(remounted, openRow, 'remount must produce a new DOM row object')
++  assert.equal(app.attached(openRow), false, 'the old row object must remain detached')
++  console.log(`REMOUNT ${JSON.stringify({ frame: app.frame(), geometry: app.geometry(), scrollTop: app.scroll()?.scrollTop, expanded: full(app) })}`)
++
++  assert.ok(await app.click('Thinking', header), 'a second real SGR click must hit the re-mounted header')
++  const closeClick = app.lastClick()
++  assert.ok(await app.wait(() => Boolean(summaryLine(app)) && !has(app, MID) && !has(app, TAIL) && has(app, NEXT), 5000), 'new parsed frame must restore the folded summary')
++  // Compare exact visible text apart from trailing ASCII spaces only; this
++  // probe does not validate the style of trailing blank terminal cells.
++  assert.equal(summaryLine(app).replace(/ +$/u, ''), originalSummary.replace(/ +$/u, ''), 'the same original summary must be restored')
++  assert.ok(app.rowNode(HEAD, NEXT) && inWindow(app.geometry()), 'the same logical row remains mounted after collapsing')
++  console.log(`CLOSED ${JSON.stringify({ click: closeClick, frame: app.frame(), geometry: app.geometry() })}`)
++} finally {
++  await app?.close()
++}
+diff --git a/scripts/thinking-virtualization-rig.mjs b/scripts/thinking-virtualization-rig.mjs
+new file mode 100644
+index 00000000..cf68030d
+--- /dev/null
++++ b/scripts/thinking-virtualization-rig.mjs
+@@ -0,0 +1,193 @@
++/** Real Chat/xterm fixture with a private synthetic channel and home.
++ * Used only by thinking-virtualization-probe.mjs; no real backend or transcript.
++ */
++import assert from 'node:assert/strict'
++import { createRequire } from 'node:module'
++import { fileURLToPath, pathToFileURL } from 'node:url'
++import { lstatSync, openSync, closeSync, realpathSync, fstatSync, readSync } from 'node:fs'
++import { basename, dirname, join } from 'node:path'
++import { PassThrough, Writable } from 'node:stream'
++
++// React chooses its production/dev build at first load; reject a misconfigured
++// process before importing React, xterm, or any application module.
++assert.equal(process.env.NODE_ENV, 'production', 'NODE_ENV=production is required before React loads')
++
++// Supervisor supplies a completely fresh allowlisted environment. Verify the
++// owned scratch before loading any application module; never inspect real HOME.
++const root = process.env.DSH_THINK_TEMP_ROOT
++const scratch = process.env.DSH_THINK_SCRATCH
++assert.ok(root && scratch && realpathSync(root) === root)
++assert.equal(dirname(scratch), root)
++assert.ok(basename(scratch).startsWith('dsh-thinking-virtual-'))
++assert.equal(realpathSync(scratch), scratch)
++const created = lstatSync(scratch)
++assert.ok(created.isDirectory())
++if (process.platform !== 'win32') {
++  assert.equal(typeof process.getuid, 'function')
++  assert.equal(created.uid, process.getuid())
++  assert.equal(created.mode & 0o077, 0)
++}
++const home = join(scratch, 'home')
++assert.equal(process.env.HOME, home)
++assert.equal(process.env.DSH_TUI_GEOMETRY_TRACE, join(scratch, 'geometry.jsonl'))
++const repo = fileURLToPath(new URL('../', import.meta.url))
++const require = createRequire(join(repo, 'package.json'))
++const React = require('react')
++const { Terminal } = require('@xterm/headless')
++const appImport = path => import(pathToFileURL(join(repo, path)).href)
++const [{ render, AlternateScreen }, { Chat }, { QuestionStore }, { LOCAL_COMMANDS }, { setLang }, { stringWidth }, { settled, sleep }, { default: inkInstances }] = await Promise.all([
++  appImport('src/ui.ts'), appImport('src/screens/Chat.tsx'), appImport('src/dsh-adapter/questions.ts'),
++  appImport('src/commands.ts'), appImport('src/i18n.ts'), appImport('src/ink/stringWidth.ts'), appImport('scripts/lib/term-test.mjs'), appImport('src/ink/instances.ts'),
++])
++
++export { setLang, sleep }
++export async function rig({ columns = 100, rows = 45, initialRows = [], thinkingFold = 'preview' } = {}) {
++  const term = new Terminal({ cols: columns, rows, scrollback: 0, allowProposedApi: true })
++  const titleChanges = []
++  term.onTitleChange(title => titleChanges.push(title))
++  const fd = openSync(join(home, `tty-${Math.random().toString(36).slice(2)}`), 'w')
++  let pendingWrites = 0, frames = 0, requiredFrame = -1
++  // Hard cap applies to the whole rig lifetime, including redraws. Never
++  // truncate silently: stop feeding the oversized chunk to xterm and fail at
++  // the next drain. Retained output is at most OUTPUT_LIMIT UTF-16 code units.
++  const OUTPUT_LIMIT = 256 * 1024
++  let output = '', outputOverflow = false
++  class Stdout extends Writable {
++    isTTY = true
++    constructor() { super(); this.columns = columns; this.rows = rows; this.fd = fd }
++    _write(chunk, _encoding, done) {
++      if (outputOverflow) { done(); return }
++      // UTF-8 byte size upper-bounds decoded UTF-16 units for valid text;
++      // rejecting first prevents even transient conversion of a giant chunk.
++      const remaining = OUTPUT_LIMIT - output.length
++      if (Buffer.isBuffer(chunk) && chunk.length > remaining * 3) { outputOverflow = true; done(); return }
++      const text = String(chunk)
++      if (text.length > remaining) { outputOverflow = true; done(); return }
++      output += text
++      pendingWrites++
++      term.write(text, () => { pendingWrites--; done() })
++    }
++  }
++  class Stdin extends PassThrough {
++    isTTY = true
++    setRawMode() { return this }
++    ref() { return this }
++    unref() { return this }
++  }
++  const stdout = new Stdout(), stdin = new Stdin()
++  const stderr = Object.assign(new Writable({ write(_chunk, _encoding, done) { done() } }), { isTTY: true })
++  const listeners = new Set()
++  const channel = {
++    version: 0, rows: initialRows, thinkingFold, smoothStreaming: false,
++    agentId: 'synthetic-agent', sessionId: 'synthetic-session', whaleIdle: false,
++    status: 'idle', sessionTitle: 'fixture', model: 'model', provider: 'fixture',
++    tokens: { input: 0, output: 0 }, cwd: home, displayCwd: home, gitBranch: '',
++    working: false, spinnerMode: 'requesting', mode: { plan: false }, responseChars: 0,
++    activeToolCount: 0, turnStart: 0, lastUserText: '', pending: [],
++    commandList: LOCAL_COMMANDS, commandCompletions: () => [], notifications: [],
++    contextSegments: { system: 0, prompt: 0, assistant: 0, thinking: 0, tools: 0 },
++    subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn) },
++    submit() {}, steer() {}, cancel() {}, clear() { this.rows = []; this.emit() }, notify() {},
++    listModels: async () => [], listSessions: () => [], setResumeTarget() {},
++    emit() { requiredFrame = frames; this.version++; for (const fn of listeners) fn() },
++  }
++  const screen = () => {
++    const buffer = term.buffer.active
++    return Array.from({ length: rows }, (_, y) => buffer.getLine(buffer.baseY + y)?.translateToString(true) ?? '')
++  }
++  const rootNode = () => inkInstances.get(stdout)?.rootNode
++  const walk = (node, pred) => {
++    if (!node) return undefined
++    if (pred(node)) return node
++    for (const child of node.childNodes ?? []) { const found = walk(child, pred); if (found) return found }
++    return undefined
++  }
++  const hasText = (node, text) => Boolean(walk(node, n => typeof n.nodeValue === 'string' && n.nodeValue.includes(text)))
++  // The reasoning wrapper and its immediately following sentinel are sibling
++  // MemoRow roots. Find their lowest common parent and retain the reasoning
++  // child identity, so an absent text alone cannot masquerade as unmount.
++  const rowNode = (reasoningMarker, nextRowMarker) => {
++    let node = walk(rootNode(), n => typeof n.nodeValue === 'string' && n.nodeValue.includes(reasoningMarker))
++    while (node?.parentNode) {
++      const parent = node.parentNode
++      if ((parent.childNodes ?? []).some(child => child !== node && hasText(child, nextRowMarker))) return node
++      node = parent
++    }
++    return undefined
++  }
++  const attached = node => Boolean(node && walk(rootNode(), n => n === node))
++  const scroll = () => walk(rootNode(), n => n.scrollViewportHeight !== undefined)
++  const geometry = () => {
++    const limit = 2 * 1024 * 1024
++    let traceFd
++    try { traceFd = openSync(process.env.DSH_TUI_GEOMETRY_TRACE, 'r') }
++    catch (error) { if (error.code === 'ENOENT') return undefined; throw error }
++    try {
++      // Bound before allocation and again during read in case the trace grows
++      // after fstat. Oversize, malformed JSON and I/O errors fail loudly.
++      if (fstatSync(traceFd).size > limit) throw new Error(`geometry trace exceeded ${limit} bytes`)
++      const chunks = []
++      let used = 0
++      while (used <= limit) {
++        const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, limit + 1 - used))
++        const n = readSync(traceFd, chunk, 0, chunk.length, null)
++        if (n === 0) break
++        used += n
++        if (used > limit) throw new Error(`geometry trace exceeded ${limit} bytes`)
++        chunks.push(chunk.subarray(0, n))
++      }
++      return Buffer.concat(chunks, used).toString('utf8').trim().split('\n').filter(Boolean)
++        .flatMap(line => { const list = JSON.parse(line).list; return list ? [list] : [] }).at(-1)
++    } finally { closeSync(traceFd) }
++  }
++  const drain = async () => {
++    for (let attempt = 0; attempt < 20; attempt++) {
++      await new Promise((resolve, reject) => stdout.write('', error => error ? reject(error) : resolve()))
++      if (pendingWrites === 0 && stdout.writableLength === 0) {
++        if (outputOverflow) throw new Error(`terminal output capture exceeded hard limit ${OUTPUT_LIMIT}; assertion invalid`)
++        return
++      }
++    }
++    throw new Error('xterm did not drain')
++  }
++  const wait = async (predicate, timeoutMs = 2500) => {
++    const ok = await settled(() => frames > requiredFrame && pendingWrites === 0 && stdout.writableLength === 0 && predicate(), { timeoutMs })
++    await drain()
++    return Boolean(ok && predicate())
++  }
++  const setRows = newRows => { channel.rows = newRows; channel.emit() }
++  let lastClick
++  const click = async (label, accepts = () => true) => {
++    await drain()
++    const line = screen().findIndex(text => text.includes(label) && accepts(text))
++    if (line < 0) return false
++    const text = screen()[line]
++    const charOffset = text.indexOf(label)
++    const col = stringWidth(text.slice(0, charOffset)) + 1
++    lastClick = { col, row: line + 1, label }
++    requiredFrame = frames
++    stdin.write(`\x1b[<0;${col};${line + 1}M\x1b[<0;${col};${line + 1}m`)
++    return true
++  }
++  const input = text => { requiredFrame = frames; stdin.write(text) }
++  let app
++  try {
++    app = await render(
++      React.createElement(AlternateScreen, null, React.createElement(Chat, { channel, questionStore: new QuestionStore(), fullscreen: true, trajectorySeen: true })),
++      { stdout, stdin, stderr, patchConsole: false, exitOnCtrlC: false, onFrame: () => { frames++ } },
++    )
++  } catch (error) {
++    term.dispose()
++    closeSync(fd)
++    throw error
++  }
++  return {
++    channel, term, screen, wait, setRows, click, input, drain, titleChanges,
++    rowNode, attached, scroll, geometry, frame: () => frames, lastClick: () => lastClick,
++    getOutput: () => output,
++    async close() {
++      try { await app.unmount(); await drain() }
++      finally { term.dispose(); closeSync(fd) }
++    },
++  }
++}
+diff --git a/scripts/verify-digest-click.tsx b/scripts/verify-digest-click.tsx
+new file mode 100644
+index 00000000..9194f693
+--- /dev/null
++++ b/scripts/verify-digest-click.tsx
+@@ -0,0 +1,145 @@
++/**
++ * A collapsed history chunk paints ONE digest line. That line is the load
++ * control for its chunk: clicking it calls `onRevealCollapsed(rowId)` so the
++ * chunk is projected in place. Before this the only way to read old history
++ * was to scroll to the very top and press the "load earlier" pager, then find
++ * the place again — the reported rail-era annoyance.
++ *
++ * A plain `notice` divider (compact summary, no `collapsed` flag) must stay
++ * inert: it carries no loadable region.
++ *
++ * Mouse hit-testing, the row's click handler and the divider chrome are all
++ * production code; only the channel call is a spy.
++ *
++ * Run: node --import tsx/esm scripts/verify-digest-click.tsx
++ */
++process.env.NODE_ENV = 'production'
++process.env.FORCE_COLOR = '3'
++process.env.DSH_TUI_LANG = 'en'
++import '../src/force-production-react.js'
++
++import assert from 'node:assert/strict'
++import { PassThrough, Writable } from 'node:stream'
++import type { ScrollBoxHandle } from '../src/ui.js'
++import type { ChatRow } from '../src/dsh-adapter/channel.js'
++import type { DOMElement } from '../src/ink/dom.js'
++import { settled, sleep } from './lib/term-test.mjs'
++
++const [React, { Box, render, ScrollBox }, { MessageList }, { nodeCache }] = await Promise.all([
++  import('react'),
++  import('../src/ui.js'),
++  import('../src/components/MessageList.js'),
++  import('../src/ink/node-cache.js'),
++])
++
++class Input extends PassThrough {
++  isTTY = true
++  setRawMode() { return this }
++  ref() { return this }
++  unref() { return this }
++}
++class Sink extends Writable {
++  isTTY = true
++  columns = 100
++  rows = 30
++  _write(_chunk: unknown, _encoding: BufferEncoding, done: () => void) { done() }
++}
++
++const ROWS_N = 200
++const DIGEST_ID = 199
++const DIGEST_TURNS = [
++  { id: -2_000_001, seq: 900_001, text: 'OLD-PROMPT-1', imageCount: 0 },
++  { id: -2_000_002, seq: 900_002, text: 'OLD-PROMPT-2', imageCount: 0 },
++]
++const PLAIN_NOTICE_ID = 198
++
++const rows: ChatRow[] = Array.from({ length: ROWS_N }, (_, i): ChatRow => {
++  const id = i + 1
++  if (id === DIGEST_ID) {
++    return {
++      id,
++      kind: 'notice',
++      text: '3 earlier turns',
++      collapsed: true,
++      collapsedTurns: DIGEST_TURNS,
++      restored: true,
++    }
++  }
++  if (id === PLAIN_NOTICE_ID) return { id, kind: 'notice', text: 'session compacted' }
++  if (id % 4 === 0) return { id, kind: 'user', text: `turn ${id / 4}` }
++  return {
++    id, kind: 'tool', text: '',
++    tool: {
++      callId: `call-${id}`, name: 'Read', argsText: `module-${id}.ts`,
++      status: 'ok', startedAt: 0, durationMs: 5,
++      resultText: `source ${id} first\nsource ${id} second`,
++    },
++  }
++})
++
++let handle: ScrollBoxHandle | null = null
++const mounted = new Map<number, DOMElement>()
++const expandedRows = new Set<number>()
++const revealed: number[] = []
++const noop = (): void => {}
++const registerRowRef = (id: number, el: DOMElement | null): void => {
++  if (el) mounted.set(id, el)
++  else mounted.delete(id)
++}
++
++function Harness(): React.ReactElement {
++  const [scroll, setScroll] = React.useState<ScrollBoxHandle | null>(null)
++  handle = scroll
++  return <Box flexDirection="column" height={24}>
++    <ScrollBox ref={setScroll} height={20} stickyScroll flexDirection="column">
++      <MessageList rows={rows} expanded={false} expandedRows={expandedRows} selectedId={null}
++        onToggleRow={noop} model="test" showAll={false} onToggleAll={noop}
++        onRevealCollapsed={(id: number) => { revealed.push(id) }}
++        registerRowRef={registerRowRef} scrollHandle={scroll} />
++    </ScrollBox>
++  </Box>
++}
++
++const stdout = new Sink()
++const app = await render(<Harness />, {
++  stdout: stdout as unknown as NodeJS.WriteStream,
++  stdin: new Input() as unknown as NodeJS.ReadStream,
++  stderr: new Sink() as unknown as NodeJS.WriteStream,
++  exitOnCtrlC: false, patchConsole: false,
++})
++try {
++  assert.ok(await settled(() => handle !== null && mounted.has(DIGEST_ID) && mounted.has(PLAIN_NOTICE_ID)),
++    'the tail window must mount both dividers')
++
++  const { dispatchClick } = await import('../src/ink/hit-test.js')
++  const { default: inkInstances } = await import('../src/ink/instances.js')
++  const rootNode = (inkInstances.get(stdout as never) as unknown as { rootNode?: DOMElement } | undefined)?.rootNode
++  assert.ok(rootNode !== undefined, 'the ink root must exist')
++
++  const digest = mounted.get(DIGEST_ID)!
++  const rect = nodeCache.get(digest)
++  assert.ok(rect !== undefined, 'the digest line must have a laid-out rect')
++  // Hit-testing reads root-space geometry, so no terminal is needed. Click the
++  // divider's own line, one column in; a blank gutter cell would be ignored by
++  // the fold handlers, but this row's load control has no blank guard.
++  // 固定窗:pacing 吸底尾巴挂载后仍在测量行高，没有单一可轮询的落定锚点
++  await sleep(200)
++  const topBefore = handle!.getScrollTop()
++  const hit = dispatchClick(rootNode!, rect!.x + 2, rect!.y)
++  assert.equal(hit, true, 'the digest line must consume the click')
++  assert.deepEqual(revealed, [DIGEST_ID], 'the click must project exactly the clicked chunk')
++
++  const plain = mounted.get(PLAIN_NOTICE_ID)!
++  const plainRect = nodeCache.get(plain)
++  assert.ok(plainRect !== undefined)
++  const plainHit = dispatchClick(rootNode!, plainRect!.x + 2, plainRect!.y)
++  assert.equal(plainHit, false, 'a plain notice divider must not be clickable')
++  assert.deepEqual(revealed, [DIGEST_ID], 'a plain notice must not request a load')
++
++  // The click must not have moved the reader: the digest loads in place.
++  await sleep(200) // 固定窗:探针 let any post-click re-anchor pass run
++  assert.equal(handle!.getScrollTop(), topBefore, 'projecting a chunk in place must not scroll the reader')
++  console.log('PASS: digest line projects its chunk on click; plain notices stay inert')
++} finally {
++  await app.unmount()
++}
+diff --git a/scripts/verify-history-prose-default.tsx b/scripts/verify-history-prose-default.tsx
+new file mode 100644
+index 00000000..ae692bf4
+--- /dev/null
++++ b/scripts/verify-history-prose-default.tsx
+@@ -0,0 +1,248 @@
++/**
++ * Default historical prose through synthetic DSH events -> createChannel ->
++ * mountChannelUi -> fullscreen Chat -> headless xterm. No real session or
++ * credentials; HOME and DSH/XDG homes are temporary. No reveal, hover, rail
++ * click or Ctrl+O: only normal PageUp/End and wheel scrolling. Before rendering and again
++ * before input, check real transcript rows, never collapsedTurns metadata.
++ * Twelve turns each have a prompt and ten answer lines (>120 logical lines);
++ * this does NOT exercise MessageList's separate 120 projected-row cap. Large
++ * tool arguments force old chunks without flooding the visible viewport.
++ * Run: node --import tsx/esm scripts/verify-history-prose-default.tsx
++ */
++import assert from 'node:assert/strict'
++import { closeSync, mkdtempSync, mkdirSync, openSync, realpathSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { basename, dirname, join } from 'node:path'
++import { PassThrough, Writable } from 'node:stream'
++
++const tempRoot = realpathSync(tmpdir())
++const scratch = mkdtempSync(join(tempRoot, 'dsh-history-prose-'))
++const envKeys = ['HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'FORCE_COLOR']
++const previous = new Map([...Object.entries(process.env).filter(([key]) => key.startsWith('DSH_')), ...envKeys.map(key => [key, process.env[key]] as const)])
++for (const key of Object.keys(process.env)) if (key.startsWith('DSH_')) delete process.env[key]
++process.env.HOME = join(scratch, 'home')
++process.env.USERPROFILE = process.env.HOME
++process.env.DSH_HOME = join(scratch, 'dsh-home')
++process.env.XDG_CONFIG_HOME = join(scratch, 'config')
++process.env.XDG_CACHE_HOME = join(scratch, 'cache')
++process.env.XDG_DATA_HOME = join(scratch, 'data')
++process.env.XDG_STATE_HOME = join(scratch, 'state')
++process.env.FORCE_COLOR = '3'
++process.env.DSH_TUI_THEME = 'dark'
++process.env.DSH_TUI_LANG = 'zh'
++mkdirSync(process.env.HOME, { recursive: true })
++let ttyFd: number | undefined
++
++try {
++  ttyFd = openSync(join(scratch, 'tty-output'), 'w')
++  const [React, { Terminal }, { render, AlternateScreen }, { Chat }, { QuestionStore }, { createChannel }, { mountChannelUi }, { registerTuiChannel }, { bindChannelCommands }, { settled, sleep }, { default: inkInstances }, { createDshTranslator }, { planChunks }] = await Promise.all([
++    import('react'), import('@xterm/headless'), import('../src/ui.js'), import('../src/screens/Chat.js'),
++    import('../src/dsh-adapter/questions.js'), import('../src/dsh-adapter/channel.js'),
++    import('../src/dsh-adapter/channel-ui.js'), import('../src/adapter/channel/host-registry.js'),
++    import('../src/dsh-adapter/channel/commands.js'), import('./lib/term-test.mjs'), import('../src/ink/instances.js'),
++    import('../src/dsh-adapter/backend/translate.js'), import('../src/dsh-adapter/backend/history-chunks.js'),
++  ])
++  type RawEvent = { type: string; seq: number; time: number; data: Record<string, unknown> }
++  const events: RawEvent[] = []
++  const append = (type: string, data: Record<string, unknown>): void => {
++    events.push({ type, seq: events.length + 1, time: events.length + 1, data })
++  }
++  const prompt = (n: number) => `PROSE-PROMPT-${n}-complete question`
++  const answerLine = (n: number, line: number) => `PROSE-ANSWER-${n}-line-${String(line).padStart(2, '0')}-complete`
++  const answer = (n: number) => Array.from({ length: 10 }, (_, i) => answerLine(n, i + 1)).join('\n')
++  for (let n = 1; n <= 12; n += 1) {
++    append('user/message', { id: `user-${n}`, source: { kind: 'user' }, content: [{ type: 'text', text: prompt(n) }] })
++    if (n < 12) append('tool/call', { turn: n, step: 1, callId: `large-${n}`, name: 'ask_user_question', arguments: JSON.stringify({ unused: 'x'.repeat(300_000) }) })
++    append('assistant/message', { turn: n, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: answer(n) }] } })
++  }
++  const callbacks = new Map<string, Set<(...args: unknown[]) => unknown>>()
++  const cleanups: (() => void)[] = []
++  const agent = { id: 'history-prose', status: 'idle', session: { id: 'synthetic-session', seq: events.length, events, header: { cwd: scratch } }, ctx: { on: () => () => undefined }, followup() {}, steer() {}, cancel() {}, inbox: { remove: () => true } }
++  const services: Record<string, unknown> = {
++    settings: { describe: () => [{ ns: 'llm-pi-ai', revision: 1, user: {}, value: {} }, { ns: 'dsh-tui', revision: 1, user: {}, value: { recapOnOpen: false } }], get: () => ({}), mutate: async () => undefined },
++    credentials: { resolve: async () => undefined, set: async () => undefined, unset: async () => undefined },
++    llm: { listConfigurableProviders: () => [], discoverModels: async () => [] },
++  }
++  const ctx = {
++    on(name: string, listener: (...args: unknown[]) => unknown) { const set = callbacks.get(name) ?? new Set(); set.add(listener); callbacks.set(name, set); return () => { set.delete(listener) } },
++    effect(setup: () => () => void) { cleanups.push(setup()) },
++    get(name: string) { return services[name] }, logger: { warn() {} },
++  }
++  const raw = createChannel(ctx as never, agent as never, { model: 'model', provider: 'provider', cwd: scratch, activity: false, whale: false, whaleIdle: false, minimalUi: true, smoothStreaming: false })
++  const unregister = registerTuiChannel(ctx, raw)
++  const mount = mountChannelUi(ctx, raw, undefined, 'new')
++  bindChannelCommands(raw, mount.channel)
++  const COLS = 100
++  const ROWS = 40
++  const term = new Terminal({ cols: COLS, rows: ROWS, scrollback: 0, allowProposedApi: true })
++  let pendingFrames = 0
++  let parsedFrames = 0
++  let observeFrame: () => void = () => undefined
++  class FakeStdout extends Writable {
++    columns = COLS
++    rows = ROWS
++    isTTY = true
++    fd = ttyFd
++    _write(chunk: unknown, _encoding: BufferEncoding, done: () => void) {
++      pendingFrames += 1
++      term.write(String(chunk), () => { pendingFrames -= 1; parsedFrames += 1; observeFrame(); done() })
++    }
++  }
++  class FakeStdin extends PassThrough { isTTY = true; setRawMode() { return this }; ref() { return this }; unref() { return this } }
++  const stdout = new FakeStdout()
++  const stdin = new FakeStdin()
++  const stderr = Object.assign(new Writable({ write(_chunk, _encoding, done) { done() } }), { isTTY: true })
++  const screen = (): string[] => Array.from({ length: ROWS }, (_, i) => term.buffer.active.getLine(term.buffer.active.baseY + i)?.translateToString(true) ?? '')
++  type ProbeNode = { childNodes?: ProbeNode[]; scrollTop?: number; scrollHeight?: number; scrollViewportHeight?: number; scrollViewportTop?: number }
++  const scrollNode = (): ProbeNode | undefined => {
++    const root = (inkInstances.get(stdout as never) as unknown as { rootNode?: ProbeNode } | undefined)?.rootNode
++    const walk = (node: ProbeNode): ProbeNode | undefined => {
++      if (node.scrollViewportHeight !== undefined) return node
++      for (const child of node.childNodes ?? []) { const found = walk(child); if (found) return found }
++      return undefined
++    }
++    return root && walk(root)
++  }
++  let passed = 0
++  let failed = 0
++  const check = (name: string, ok: boolean): void => {
++    if (ok) { passed += 1; console.log(`PASS: ${name}`) }
++    else { failed += 1; console.error(`FAIL: ${name}`) }
++  }
++  const targets = [1, 6, 11, 12]
++  // Default window = the newest chunk (OPEN_ROUNDS/OPEN_CHARS in
++  // docs/dynamic-history-loading.md): its turns must be present as full prompt
++  // + full answer rows; older turns must be either equally full (already
++  // materialized) or covered by a collapsed digest row — never silently
++  // missing. Every round here carries ~300 KB of tool arguments, so the char
++  // budget (not the round count) decides the window; take it from the plan.
++  let openWindow: [number, number] = [1, 0]
++  const checkRows = (stage: string): void => {
++    const rows = mount.channel.rows
++    for (const n of targets) {
++      const userIndex = rows.findIndex(row => row.kind === 'user' && row.text === prompt(n))
++      const answerIndex = rows.findIndex(row => row.kind === 'assistant' && row.text === answer(n))
++      const full = userIndex >= 0 && answerIndex > userIndex
++      if (n >= openWindow[0] && n <= openWindow[1]) {
++        check(`${stage}: turn ${n} has full prompt then full answer in transcript rows`, full)
++        continue
++      }
++      const digest = rows.findIndex(row => row.collapsed === true && (row.collapsedTurns ?? []).some(turn => turn.text === prompt(n)))
++      check(`${stage}: older turn ${n} is loaded in full or behind a collapsed digest row`, full || digest >= 0)
++    }
++  }
++  let app: Awaited<ReturnType<typeof render>> | undefined
++  try {
++    check('fixture contains >120 logical prompt/answer lines', 12 * 11 > 120)
++    const translator = createDshTranslator({ tools: () => undefined, scope: () => undefined, attachments: () => undefined })
++    const chunks = planChunks(translator.translateReplay(events as never, { present: false }))
++    check('translated fixture plans multiple old chunks', chunks.length >= 3)
++    const newest = chunks[chunks.length - 1]!
++    openWindow = [newest.fromRound, newest.toRound]
++    check('the newest chunk opens a real window of rounds', newest.fromRound >= 1 && newest.toRound >= newest.fromRound)
++    checkRows('before render, before interaction')
++    app = await render(<AlternateScreen><Chat channel={mount.channel} questionStore={new QuestionStore()} fullscreen trajectorySeen /></AlternateScreen>, { stdout: stdout as never, stdin: stdin as never, stderr: stderr as never, patchConsole: false, exitOnCtrlC: false })
++    check('initial xterm screen and scrolling viewport are ready', await settled(() => scrollNode() !== undefined && screen().some(line => line.trim() !== ''), { timeoutMs: 20000 }))
++    checkRows('after render, before interaction')
++    const rowPairs = (): number[] => targets.filter(n => {
++      const rows = mount.channel.rows
++      const userIndex = rows.findIndex(row => row.kind === 'user' && row.text === prompt(n))
++      return userIndex >= 0 && rows.findIndex(row => row.kind === 'assistant' && row.text === answer(n)) > userIndex
++    })
++    const preInput = rowPairs()
++    console.log(`PRE_INPUT transcript_pairs=${preInput.join(',')}`)
++    const found = new Set<number>()
++    const foundAfterInput = new Set<number>()
++    const firstMaterialized = new Map<number, string>()
++    let navigation = 'End'
++    const capture = (): void => {
++      for (const n of rowPairs()) if (!preInput.includes(n) && !firstMaterialized.has(n)) firstMaterialized.set(n, navigation)
++      const lines = screen()
++      for (const n of targets) {
++        const indexes = [prompt(n), ...Array.from({ length: 10 }, (_, i) => answerLine(n, i + 1))].map(text => lines.findIndex(line => line.includes(text)))
++        if (indexes.every((index, i) => index >= 0 && (i === 0 || index > indexes[i - 1]!))) {
++          found.add(n)
++          if (!preInput.includes(n)) foundAfterInput.add(n)
++        }
++      }
++    }
++    // Each callback follows xterm's asynchronous parse of a complete stdout
++    // write. Retain successful actual frames, not just the last frame after a
++    // chunk has materialized and potentially moved the viewport again.
++    observeFrame = capture
++    // End is ordinary scrolling, not a reveal: start at the actual tail.
++    stdin.write('\x1b[F')
++    check('End reaches newest prompt before the upward walk', await settled(() => screen().some(line => line.includes(prompt(12)))))
++    await settled(() => screen().some(line => line.includes(answerLine(12, 10))) && pendingFrames === 0, { timeoutMs: 1500 })
++    capture()
++    let moves = 0
++    navigation = 'PageUp'
++    const pageStart = scrollNode()?.scrollTop
++    const pageFrame = parsedFrames
++    stdin.write('\x1b[5~')
++    const pageMoved = await settled(() => pageStart !== undefined && (scrollNode()?.scrollTop ?? pageStart) < pageStart, { timeoutMs: 3000, stepMs: 5 })
++    const pageParsed = await settled(() => parsedFrames > pageFrame, { timeoutMs: 3000, stepMs: 5 })
++    if (pageMoved && pageParsed) moves += 1
++    console.log(`PAGE_UP start=${pageStart} observedUp=${pageMoved} parsedFrame=${pageParsed} top=${scrollNode()?.scrollTop}`)
++    // 固定窗:墙钟 MessageList load-on-sight waits 120ms after a section
++    // enters view; allow that production timer and the resulting frame to land.
++    await sleep(180)
++    await settled(() => pendingFrames === 0 && stdout.writableLength === 0)
++    capture()
++    // PageUp through the oldest reachable position; then wheel downward in
++    // three-line steps, so a full short turn cannot be skipped by paging.
++    for (let i = 0; i < 30; i += 1) {
++      const before = scrollNode()?.scrollTop
++      if (before === undefined || before <= 0) break
++      const frames = parsedFrames
++      stdin.write('\x1b[5~')
++      const moved = await settled(() => (scrollNode()?.scrollTop ?? before) < before, { timeoutMs: 1000, stepMs: 5 })
++      if (moved && await settled(() => parsedFrames > frames, { timeoutMs: 1000, stepMs: 5 })) moves += 1
++      await sleep(180) // 固定窗:墙钟 allow the production load-on-sight debounce to settle
++      await settled(() => pendingFrames === 0 && stdout.writableLength === 0)
++      capture()
++      if (!moved) break
++    }
++    navigation = 'wheel-down'
++    let wheelMoves = 0
++    for (let i = 0; i < 180 && !targets.every(n => found.has(n)); i += 1) {
++      const node = scrollNode()
++      const before = node?.scrollTop
++      if (before === undefined || node?.scrollViewportHeight === undefined || node.scrollViewportTop === undefined) break
++      const max = Math.max(0, (node.scrollHeight ?? 0) - node.scrollViewportHeight)
++      if (before >= max) break
++      const y = Math.max(1, Math.min(ROWS, node.scrollViewportTop + Math.floor(node.scrollViewportHeight / 2) + 1))
++      const frames = parsedFrames
++      stdin.write(`\x1b[<65;50;${y}M`)
++      const moved = await settled(() => (scrollNode()?.scrollTop ?? before) > before, { timeoutMs: 1000, stepMs: 5 })
++      if (moved && await settled(() => parsedFrames > frames, { timeoutMs: 1000, stepMs: 5 })) { moves += 1; wheelMoves += 1 }
++      await sleep(180) // 固定窗:墙钟 allow the production load-on-sight debounce to settle
++      await settled(() => pendingFrames === 0 && stdout.writableLength === 0)
++      capture()
++      if (!moved) break
++    }
++    observeFrame = () => undefined
++    console.log(`SCROLL moves=${moves} wheelMoves=${wheelMoves} finalTop=${scrollNode()?.scrollTop} found=${[...found].join(',')} post_input_materialized=${JSON.stringify(Object.fromEntries(firstMaterialized))} screen_after_input_only=${[...foundAfterInput].join(',')}`)
++    check('ordinary upward scrolling changes the viewport', pageMoved && pageParsed)
++    for (const n of targets) check(`ordinary scrolling paints full turn ${n} in correct screen order`, found.has(n))
++    if (failed) console.error(`FINAL SCREEN:\n${screen().join('\n')}`)
++    console.log(`HISTORY PROSE ${failed ? 'FAILED' : 'OK'} (${passed} passed, ${failed} failed)`)
++  } finally {
++    if (app) await app.unmount()
++    mount.dispose()
++    unregister()
++    raw.releaseContributions()
++    for (const cleanup of cleanups.reverse()) cleanup()
++    term.dispose()
++  }
++  if (failed) process.exitCode = 1
++} finally {
++  if (ttyFd !== undefined) closeSync(ttyFd)
++  for (const key of Object.keys(process.env)) if (key.startsWith('DSH_')) delete process.env[key]
++  for (const [key, value] of previous) { if (value === undefined) delete process.env[key]; else process.env[key] = value }
++  const actual = realpathSync(scratch)
++  assert.equal(dirname(actual), tempRoot, 'refuse cleanup outside real temporary root')
++  assert.ok(basename(actual).startsWith('dsh-history-prose-'), 'refuse cleanup of unowned path')
++  assert.equal(actual, scratch, 'refuse cleanup of replaced or redirected path')
++  rmSync(actual, { recursive: true, force: true })
++}
+diff --git a/scripts/verify-leading-thinking-lines.mjs b/scripts/verify-leading-thinking-lines.mjs
+new file mode 100644
+index 00000000..66eeb853
+--- /dev/null
++++ b/scripts/verify-leading-thinking-lines.mjs
+@@ -0,0 +1,90 @@
++/** Bounded first-nonblank reasoning preview and control-sequence safety.
++ * Run: node --import tsx/esm scripts/verify-leading-thinking-lines.mjs
++ */
++import assert from 'node:assert/strict'
++import { settledThinkingHead as summarize } from '../src/components/messages/settledThinkingSummary.ts'
++const E = '\x1b', B = '\x07', ST = `${E}\\`
++const cases = [
++  ['\nHello\nTAIL', 'Hello…'],
++  ['\r\n \t \r\n\u2028\u2029首😀\nTAIL', '首😀…'],
++  ['\n\n', '…'],
++  ['  \t\n  \t', '…'],
++  [`${E}[31m  ${E}[0m\nFIRST\nTAIL`, 'FIRST…'],
++  [`\n${E}]52;c;HIDDEN\nHIDDEN${B}\nFIRST\nTAIL`, 'FIRST…'],
++  [`${E}PSECRET\nSECRET${ST}\nFIRST\nTAIL`, 'FIRST…'],
++  [`\n${E}]52;c;UNFINISHED\nSECRET`, '…'],
++  [`\n${E}PUNFINISHED\nSECRET`, '…'],
++  [`\n${E}[31\nBODY_ONLY_TAIL`, '…'],
++  [`${E}[31mhello\nBODY_ONLY_TAIL`, 'hello…'],
++  [`\nhello${E}]0;HIDDEN\nHIDDEN${B} end\nTAIL`, 'hello end…'],
++  [`\nhello${E}PSECRET\nSECRET${ST} end\nTAIL`, 'hello end…'],
++  ['\n'.repeat(4096) + 'SECRET', '…'],
++  ['\n'.repeat(4095) + 'X', 'X…'],
++  ['\n'.repeat(4095) + 'XSECRET', '…'],
++  ['\n'.repeat(4094) + 'XY\nSECRET', 'X…'],
++  ['\n'.repeat(4095) + '😀SECRET', '…'],
++  ['\n'.repeat(4094) + `${E}[52;c;SECRET`, '…'],
++  ['\nX' + 'a' + '\u0301'.repeat(10000), 'X…'],
++  ['\nX👩' + '\u200d👩'.repeat(10000), 'X…'],
++]
++for (const [input, expected] of cases) assert.equal(summarize(input), expected, JSON.stringify(input.slice(0, 40)))
++// Stop immediately after actual first nonempty line, even through CSI/newlines.
++for (const brk of ['\r', '\n', '\u2028', '\u2029']) {
++  assert.equal(summarize(`\nhead${brk}BODY_ONLY_TAIL`), 'head…')
++  assert.equal(summarize(`\nhead${E}[31${brk}BODY_ONLY_TAIL`), brk === '\r' || brk === '\n' ? 'head…' : 'hea…')
++}
++// Every prefix truncation of string controls before content is fail closed.
++for (const sequence of [`${E}]0;title${B}`, `${E}]8;;url${ST}`, `${E}]52;c;payload${B}`, `${E}Ppayload${ST}`, '\x9d52;c;payload\x9c', '\x90payload\x9c']) {
++  for (let cut = 1; cut < sequence.length; cut++) {
++    const value = summarize('\n' + sequence.slice(0, cut))
++    assert.equal(value, '…', `${JSON.stringify(sequence)} cut=${cut}`)
++    assert.doesNotMatch(value, /[\x00-\x1f\x7f-\x9f]/u)
++  }
++}
++// Confirm the actual raw source never has charCodeAt called beyond 4095.
++for (const text of [
++  '\n'.repeat(10_000) + 'SECRET',
++  '\n'.repeat(4095) + '😀SECRET',
++  '\n'.repeat(100) + `${E}]52;c;` + 'x'.repeat(10_000) + B + 'SECRET',
++]) {
++  const original = String.prototype.charCodeAt
++  let max = -1
++  try {
++    String.prototype.charCodeAt = function (offset) {
++      if (String(this) === text) { max = Math.max(max, offset); assert.ok(offset < 4096, `out of bounds ${offset}`) }
++      return original.call(this, offset)
++    }
++    summarize(text)
++  } finally { String.prototype.charCodeAt = original }
++  assert.ok(max <= 4095 && max >= 0, `max=${max}`)
++}
++// Independent oracle for small, well-formed control sequences and normal text.
++const seg = new Intl.Segmenter('en', { granularity: 'grapheme' })
++function oracle(text) {
++  const visible = text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
++    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
++    .replace(/\x1bP[^\x1b]*\x1b\\/g, '')
++    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g, '')
++  const first = visible.split(/[\r\n\u2028\u2029]/u).find(line => line.trim()) ?? ''
++  const normalized = first.replace(/\s+/gu, ' ').trim()
++  let head = ''
++  for (const { segment } of seg.segment(normalized)) {
++    if (head.length + segment.length > 160) break
++    head += segment
++  }
++  return `${head.trimEnd()}…`
++}
++let seed = 123456789
++const atoms = ['a', '中', '😀', 'e\u0301', '👩‍💻', '🇨🇳', ' ', '\t', '\n', '\r\n', '\u2028', `${E}[31m`, `${E}[0m`, `${E}]52;c;abc${B}`, `${E}Pdata${ST}`]
++for (let trial = 0; trial < 5000; trial++) {
++  let input = ''
++  for (let j = 0; j < 12; j++) { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; input += atoms[seed % atoms.length] }
++  assert.equal(summarize(input), oracle(input), `oracle trial ${trial}`)
++}
++// Prefixing blank lines must not change the summary of a nonblank first line.
++for (let trial = 0; trial < 5000; trial++) {
++  let input = 'HEAD'
++  for (let j = 0; j < 10; j++) { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; input += atoms[seed % atoms.length] }
++  assert.equal(summarize('\n \t\r\n' + input), summarize(input), `prefixed trial ${trial}`)
++}
++console.log(`PASS: ${cases.length} edge cases, all control-string prefix cuts, scan index <4096 and 10000 generated cases`)
+diff --git a/scripts/verify-selection-attachment-bounded.ts b/scripts/verify-selection-attachment-bounded.ts
+new file mode 100644
+index 00000000..422f8686
+--- /dev/null
++++ b/scripts/verify-selection-attachment-bounded.ts
+@@ -0,0 +1,91 @@
++/** Selection attachment replay must keep legacy results without splitting large bodies.
++ * Run: node --import tsx/esm scripts/verify-selection-attachment-bounded.ts
++ */
++import assert from 'node:assert/strict'
++import { readFileSync } from 'node:fs'
++import vm from 'node:vm'
++import ts from 'typescript'
++import { replaySelectionAttachment } from '../src/channel/selection-record.js'
++
++function oracle(content: readonly unknown[] | undefined) {
++  if (content === undefined) return undefined
++  for (const block of content) {
++    if (block === null || typeof block !== 'object') continue
++    const text = (block as { type?: unknown; text?: unknown }).text
++    if ((block as { type?: unknown }).type !== 'text' || typeof text !== 'string') continue
++    const opened = /^<attached-file path="([^"]+)" selection(?: count="(\d+)")?>\n/.exec(text)
++    if (opened === null) continue
++    let closed = text.slice(opened[0].length)
++    if (closed.endsWith('</attached-file>')) closed = closed.slice(0, -'</attached-file>'.length)
++    if (closed.endsWith('\n')) closed = closed.slice(0, -1)
++    const lines = closed.split('\n').length
++    const counted = opened[2] === undefined ? undefined : Number(opened[2])
++    return { lines: counted ?? (closed.endsWith('\n[… truncated]') ? lines - 1 : lines), path: opened[1]!.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&') }
++  }
++  return undefined
++}
++const compare = (content: unknown) => {
++  const run = (fn: typeof oracle) => {
++    try { return { ok: true as const, value: fn(content as readonly unknown[] | undefined) } }
++    catch (error) { return { ok: false as const, name: error instanceof Error ? error.name : typeof error } }
++  }
++  assert.deepEqual(run(replaySelectionAttachment), run(oracle))
++}
++const bodies = ['', '\n', '\n\n', 'a\n', 'a\r\n', '\n[… truncated]', 'a\n[… truncated]\n</attached-file>', '[… truncated]', 'x</attached-file>extra', '\ud800', '🐋\n汉']
++const paths = ['x', '&lt;&gt;&quot;&amp;', '&amp;lt;', 'x\n[… truncated]', '', 'bad"quote']
++const counts = ['', ' count="0"', ' count="0003"', ` count="${'9'.repeat(400)}"`, ' count="-1"', ' count="1.5"', ' count=""']
++for (const body of bodies) for (const path of paths) for (const count of counts) {
++  compare([{ type: 'text', text: `<attached-file path="${path}" selection${count}>\n${body}` }])
++}
++for (const value of [undefined, null, 5, 'not-an-array', [], [null, {}, { type: 'text', text: 3 }], [
++  { type: 'text', text: '<attached-file path="a" selection count="0">\nx' },
++  { type: 'text', text: '<attached-file path="b" selection>\ny' },
++]]) compare(value)
++let seed = 0x2468ace0
++const alphabet = ['a', '\n', '\r', '汉', '🐋', '\ud800', '<', '>', '/', ' ', '[… truncated]', '</attached-file>']
++for (let n = 0; n < 3000; n++) {
++  seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0
++  const length = seed % 32
++  let body = ''
++  for (let i = 0; i < length; i++) { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; body += alphabet[seed % alphabet.length] }
++  compare([{ type: 'text', text: `<attached-file path="x&amp;lt;" selection${n % 2 ? ' count="12"' : ''}>\n${body}` }])
++}
++// Execute the actual source in a separate JS realm so the split observer cannot
++// affect the host or any application code. The literal original is a positive control.
++const source = readFileSync(new URL('../src/channel/selection-record.ts', import.meta.url), 'utf8')
++const js = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
++const context = vm.createContext({ module: { exports: {} }, exports: {} })
++vm.runInContext('module.exports = exports', context)
++vm.runInContext(js, context)
++vm.runInContext(`globalThis.original = ${oracle.toString()}`, context)
++vm.runInContext(`
++  const split = String.prototype.split
++  globalThis.splitCalls = 0
++  String.prototype.split = function (...args) {
++    if (args[0] === '\\n') globalThis.splitCalls++
++    return split.apply(this, args)
++  }
++  globalThis.run = (text, useOriginal) => {
++    globalThis.splitCalls = 0
++    const fn = useOriginal ? globalThis.original : module.exports.replaySelectionAttachment
++    const value = fn([{ type: 'text', text }])
++    return { value, calls: globalThis.splitCalls }
++  }
++`, context)
++const run = context.run as (text: string, useOriginal: boolean) => { value: { lines: number }; calls: number }
++const body = 'x\n'.repeat(262144)
++const counted = `<attached-file path="x" selection count="262144">\n${body}</attached-file>`
++const control = run(counted, true)
++assert.equal(control.value.lines, 262144)
++assert.ok(control.calls > 0, 'observer must detect the original split')
++const result = run(counted, false)
++assert.equal(result.value.lines, 262144)
++assert.equal(result.calls, 0, 'authoritative count must not split the attachment body')
++const uncounted = `<attached-file path="x" selection>\n${body}</attached-file>`
++const legacyControl = run(uncounted, true)
++assert.equal(legacyControl.value.lines, 262144)
++assert.ok(legacyControl.calls > 0, 'observer must detect the original legacy split')
++const legacyResult = run(uncounted, false)
++assert.equal(legacyResult.value.lines, 262144)
++assert.equal(legacyResult.calls, 0, 'legacy replay must count lines without splitting the body')
++console.log('PASS selection replay differential and bounded body handling')
+diff --git a/scripts/verify-settled-thinking-cells.mjs b/scripts/verify-settled-thinking-cells.mjs
+new file mode 100644
+index 00000000..020bf976
+--- /dev/null
++++ b/scripts/verify-settled-thinking-cells.mjs
+@@ -0,0 +1,40 @@
++/** Grapheme-safe folded thinking widths and hint priority.
++ * Run: node --import tsx/esm scripts/verify-settled-thinking-cells.mjs
++ */
++import assert from 'node:assert/strict'
++import { fitThinkingRow } from '../src/components/messages/settledThinkingSummary.ts'
++import { stringWidth } from '../src/ink/stringWidth.ts'
++import { getGraphemeSegmenter } from '../src/utils/intl.ts'
++
++const input = {
++  marker: '⚓', label: 'Thinking', preview: '开始👩‍👩‍👧‍👦e\u0301🇨🇳🇺🇸…',
++  ctrlHint: '(Ctrl+O to expand)', clickHint: '(click to expand)', width: 100,
++}
++const full = '⚓ Thinking 开始👩‍👩‍👧‍👦e\u0301🇨🇳🇺🇸… (Ctrl+O to expand) (click to expand)'
++assert.equal(fitThinkingRow(input), full)
++const minimumHints = stringWidth(`${input.marker} ${input.ctrlHint} ${input.clickHint}`)
++const previewGraphemes = [...getGraphemeSegmenter().segment(input.preview)].map(x => x.segment)
++for (let width = 0; width <= 100; width++) {
++  const row = fitThinkingRow({ ...input, width })
++  assert.ok(stringWidth(row) <= width, `${width}: ${stringWidth(row)} ${row}`)
++  assert.doesNotMatch(row, /[\r\n\x00-\x1f\x7f-\x9f\u2028\u2029]/u)
++  if (width >= minimumHints) {
++    assert.ok(row.includes(input.marker), `marker lost at ${width}`)
++    assert.ok(row.includes(input.ctrlHint), `ctrl hint lost at ${width}`)
++    assert.ok(row.includes(input.clickHint), `click hint lost at ${width}`)
++  }
++  // Every displayed body grapheme must be a whole prefix of the original.
++  const title = `${input.marker} ${input.label}`
++  if (row.startsWith(title)) {
++    let shown = row.slice(title.length)
++    for (const hint of [input.ctrlHint, input.clickHint]) shown = shown.replace(` ${hint}`, '')
++    shown = shown.trim().replace(/…$/u, '')
++    const prefix = [...getGraphemeSegmenter().segment(shown)].map(x => x.segment)
++    assert.deepEqual(prefix, previewGraphemes.slice(0, prefix.length), `broken grapheme at width ${width}`)
++  }
++  if (row.includes('👩')) assert.ok(row.includes('👩‍👩‍👧‍👦'), `split ZWJ at ${width}`)
++}
++// A non-clickable body must not invent a click affordance.
++assert.ok(!fitThinkingRow({ ...input, clickHint: '', width: 100 }).includes('click to expand'))
++assert.throws(() => fitThinkingRow({ ...input, preview: 'unsafe\nsecond' }))
++console.log('PASS: 101 cell widths, project Intl/stringWidth, whole ZWJ/flags/combining, both hints where physically possible')
+diff --git a/scripts/verify-settled-thinking-chat.mjs b/scripts/verify-settled-thinking-chat.mjs
+new file mode 100644
+index 00000000..e4097f49
+--- /dev/null
++++ b/scripts/verify-settled-thinking-chat.mjs
+@@ -0,0 +1,172 @@
++/** Real Chat/Ink/xterm regression using only an isolated synthetic channel.
++ * Each independent scenario mounts a fresh Chat and xterm. The click checks
++ * observe incremental frames without forcing a full repaint.
++ * Run: node --import tsx/esm scripts/verify-settled-thinking-chat.mjs
++ */
++process.env.NODE_ENV = 'production'
++const { rig, setLang, sleep, cleanup } = await import('./lib/thinking-test-rig.mjs')
++
++let failed = 0, skipped = 0
++function check(name, ok, lines = []) {
++  console.log(`${ok ? 'PASS' : 'FAIL'}: ${name}`)
++  if (!ok) { failed++; console.error(lines.join('\n')) }
++}
++function skip(name, why) { skipped++; console.log(`SKIP: ${name}: ${why}`) }
++const reason = (text, extra = {}) => ({ id: 1, kind: 'reasoning', text, streaming: false, ...extra })
++const sentinel = { id: 999, kind: 'assistant', text: 'AFTER_REASONING_SENTINEL', streaming: false }
++const has = (lines, text) => lines.some(line => line.includes(text))
++const isThinkingHeader = line => /(?:⚓|\*)\s+Thinking\b/u.test(line)
++const headerIndex = lines => lines.findIndex(isThinkingHeader)
++const hint = line => /click\s+to\s+expand/i.test(line)
++const shown = (line, prefix) => line.includes(prefix) && line.includes('…') && hint(line)
++const rows = text => [reason(text), sentinel]
++
++// Exactly one test fixture per semantic scenario; no replacement rows can
++// leave old pixels from an unrelated case in its xterm. A failed readiness
++// check gates every negative assertion so an old/blank screen cannot pass.
++async function scenario(name, options, run) {
++  let app
++  try {
++    app = await rig(options)
++    await run(app)
++  } catch (error) {
++    check(`${name}: harness/overflow error: ${error instanceof Error ? error.message : String(error)}`, false, app?.screen() ?? [])
++  } finally {
++    if (app) {
++      try { await app.close() }
++      catch (error) { check(`${name}: close/output overflow: ${error instanceof Error ? error.message : String(error)}`, false) }
++    }
++  }
++}
++async function readyEnglish(app) {
++  return app.wait(() => headerIndex(app.screen()) >= 0 && has(app.screen(), 'AFTER_REASONING_SENTINEL'))
++}
++function oneRow(lines, h) {
++  return h >= 0 && lines.findIndex(line => line.includes('AFTER_REASONING_SENTINEL')) === h + 2
++}
++// Locate ASCII sentinel by actual terminal cells, never JS substring columns.
++function sentinelStyle(app) {
++  const target = 'AFTER_REASONING_SENTINEL', buffer = app.term.buffer.active
++  for (let y = 0; y < app.term.rows; y++) {
++    const line = buffer.getLine(buffer.baseY + y)
++    if (!line) continue
++    for (let x = 0; x <= app.term.cols - target.length; x++) {
++      let candidate = ''
++      for (let j = 0; j < target.length; j++) candidate += line.getCell(x + j)?.getChars() ?? ''
++      if (candidate === target) {
++        const cell = line.getCell(x)
++        return [cell?.getFgColor(), cell?.getBgColor(), cell?.isBold(), cell?.isDim()]
++      }
++    }
++  }
++  return undefined
++}
++
++try {
++  setLang('en')
++  await scenario('settled and click', { initialRows: rows('START_REASONING explains initial logic\nBODY_ONLY_MIDDLE\nBODY_ONLY_TAIL') }, async app => {
++    const ready = await readyEnglish(app)
++    let lines = app.screen(), h = headerIndex(lines)
++    check('fresh settled fixture and following sentinel are visible (green control)', ready, lines)
++    check('settled summary is one visual row with prefix, ellipsis and click-to-expand hint',
++      ready && oneRow(lines, h) && shown(lines[h], 'START_REASONING'), lines)
++    check('settled summary does not show middle or tail', ready && !has(lines, 'BODY_ONLY_MIDDLE') && !has(lines, 'BODY_ONLY_TAIL'), lines)
++
++    // Observe the actual incremental output, not a forced clean repaint.
++    const clicked = ready && await app.click('Thinking', isThinkingHeader)
++    const committedOpen = clicked && await app.wait(() => has(app.screen(), 'BODY_ONLY_MIDDLE') && has(app.screen(), 'BODY_ONLY_TAIL'))
++    lines = app.screen()
++    const opened = committedOpen && has(lines, 'BODY_ONLY_MIDDLE') && has(lines, 'BODY_ONLY_TAIL')
++    check('SGR click expands settled reasoning to its body (green control)', opened, lines)
++    await sleep(600) // 固定窗:墙钟 terminal double-click recognition window
++    const clickedAgain = opened && await app.click('Thinking', isThinkingHeader)
++    const committedClose = clickedAgain && await app.wait(() => !has(app.screen(), 'BODY_ONLY_MIDDLE') && !has(app.screen(), 'BODY_ONLY_TAIL'))
++    lines = app.screen(); h = headerIndex(lines)
++    check('second SGR click collapses body (green control)', committedClose && h >= 0 &&
++      !has(lines, 'BODY_ONLY_MIDDLE') && !has(lines, 'BODY_ONLY_TAIL'), lines)
++    check('second SGR click restores the summary', committedClose && oneRow(lines, h) && shown(lines[h], 'START_REASONING'), lines)
++  })
++
++  await scenario('short', { initialRows: rows('SHORT_PREFIX') }, async app => {
++    const ready = await readyEnglish(app), lines = app.screen(), h = headerIndex(lines)
++    check('short nonempty reasoning includes prefix and ellipsis', ready && oneRow(lines, h) && shown(lines[h], 'SHORT_PREFIX'), lines)
++  })
++
++  await scenario('count only', { initialRows: [reason('', { reasoningTokens: 68 }), sentinel] }, async app => {
++    const isCountHeader = line => /(?:⚓|\*)\s+Thought\b/u.test(line) && line.includes('68')
++    const ready = await app.wait(() => app.screen().some(isCountHeader) && has(app.screen(), 'AFTER_REASONING_SENTINEL'))
++    const lines = app.screen(), header = lines.find(isCountHeader) ?? ''
++    check('count-only remains count-only without fabricated summary or click hint (green control)',
++      ready && !header.includes('…') && !hint(header) && !has(lines, 'SHORT_PREFIX'), lines)
++  })
++
++  setLang('zh')
++  await scenario('Chinese', { initialRows: rows('中文前缀内容\n绝不能泄露后段') }, async app => {
++    const isChineseHeader = line => /(?:⚓|\*)\s+思考/u.test(line)
++    const ready = await app.wait(() => app.screen().some(isChineseHeader) && has(app.screen(), 'AFTER_REASONING_SENTINEL'))
++    const lines = app.screen(), h = lines.findIndex(isChineseHeader)
++    const header = lines[h] ?? ''
++    check('Chinese summary shows prefix, ellipsis and localised click-to-expand hint', ready && oneRow(lines, h) &&
++      header.includes('中文前缀') && header.includes('…') && /点击.{0,8}展开/.test(header) && !has(lines, '绝不能泄露后段'), lines)
++  })
++  setLang('en')
++
++  let baselineStyle, baselineTitles
++  await scenario('safety baseline', { initialRows: rows('BASELINE_NONEMPTY') }, async app => {
++    const ready = await readyEnglish(app)
++    baselineStyle = ready ? sentinelStyle(app) : undefined
++    baselineTitles = ready ? [...app.titleChanges] : undefined
++    check('fresh safety baseline renders sentinel and its cell style (green control)', ready && baselineStyle !== undefined, app.screen())
++  })
++
++  const hostile = 'SAFE_START ' + '\x1b]0;THINK_EVIL_TITLE\x07' + '\x1b]52;c;THINK_EVIL_CLIP\x07' +
++    '\x1b]8;;https://invalid.example/THINK_EVIL_LINK\x07label\x1b]8;;\x07' + '\x1b[31m' + '\x1b[2J' + '\x1bPTHINK_EVIL_DCS\x1b\\' + '\nBODY_ONLY_TAIL'
++  await scenario('control injection', { initialRows: rows(hostile) }, async app => {
++    const ready = await readyEnglish(app), lines = app.screen(), output = app.getOutput()
++    const exercised = ready && has(lines, 'SAFE_START')
++    check('control-sequence probe actually paints the safe preview prefix', exercised, lines)
++    if (!exercised) return skip('control sequence safety', 'preview absent: no sanitizer path was exercised')
++    check('no hostile OSC/DCS reaches terminal or changes title and adjacent style',
++      !output.includes('\x1b]0;THINK_EVIL_TITLE') && !output.includes('\x1b]52;c;THINK_EVIL_CLIP') &&
++      !output.includes('https://invalid.example/THINK_EVIL_LINK') && !output.includes('\x1bPTHINK_EVIL_DCS') &&
++      !app.titleChanges.includes('THINK_EVIL_TITLE') && baselineStyle !== undefined &&
++      JSON.stringify(sentinelStyle(app)) === JSON.stringify(baselineStyle), lines)
++  })
++
++  const unterminatedOsc = '\x1b]52;c;THINK_UNCLOSED_OSC' + 'x'.repeat(2000)
++  await scenario('unterminated control', { initialRows: rows('OPEN_PREFIX_X ' + unterminatedOsc) }, async app => {
++    const ready = await readyEnglish(app), lines = app.screen()
++    const exercised = ready && has(lines, 'OPEN_PREFIX')
++    check('unterminated-sequence probe paints the safe prefix', exercised, lines)
++    check('unterminated OSC cannot escape into terminal output or change the title', exercised &&
++      !app.getOutput().includes('\x1b]52;c;THINK_UNCLOSED_OSC') &&
++      !app.getOutput().includes(unterminatedOsc) && baselineTitles !== undefined &&
++      JSON.stringify(app.titleChanges) === JSON.stringify(baselineTitles), lines)
++  })
++
++  // An output-size assertion is necessary but does NOT prove a bound on CPU,
++  // input traversal, or memory allocation; run a separate measured probe.
++  await scenario('large prefix', { initialRows: rows('LONG_START_' + 'x'.repeat(1_000_000) + 'LONG_END_MUST_NOT_PAINT') }, async app => {
++    const ready = await readyEnglish(app), lines = app.screen(), h = headerIndex(lines)
++    check('large reasoning emits bounded visible prefix, not its tail', ready && oneRow(lines, h) &&
++      shown(lines[h], 'LONG_START_') && !has(lines, 'LONG_END_MUST_NOT_PAINT') && app.getOutput().length < 100_000, lines)
++  })
++
++  await scenario('Unicode', { initialRows: rows('宽前缀e\u0301👩‍💻' + '文'.repeat(160) + '\nUNICODE_HIDDEN_TAIL') }, async app => {
++    const ready = await readyEnglish(app), lines = app.screen(), h = headerIndex(lines)
++    check('Unicode prefix stays one row without broken glyph or hidden tail', ready && oneRow(lines, h) &&
++      shown(lines[h], '宽前缀') && !lines[h].includes('�') && !has(lines, 'UNICODE_HIDDEN_TAIL'), lines)
++  })
++
++  await scenario('narrow', { columns: 32, rows: 30, initialRows: rows('宽屏测试😀' + '文'.repeat(150) + '\nNARROW_HIDDEN') }, async app => {
++    const ready = await readyEnglish(app), lines = app.screen(), h = headerIndex(lines)
++    // At narrow width not all summary text can fit; do not invent that promise.
++    check('narrow settled row stays one line without broken glyph or tail leak', ready && oneRow(lines, h) &&
++      !lines[h].includes('�') && !has(lines, 'NARROW_HIDDEN'), lines)
++  })
++} finally {
++  setLang('en')
++  cleanup()
++}
++console.log(`\nSETTLED THINKING: ${failed ? `${failed} FAILURE(S)` : skipped ? 'INCOMPLETE' : 'OK'}; ${skipped} skipped`)
++process.exitCode = failed || skipped ? 1 : 0
+diff --git a/scripts/verify-settled-thinking-component.tsx b/scripts/verify-settled-thinking-component.tsx
+new file mode 100644
+index 00000000..1a7a16f7
+--- /dev/null
++++ b/scripts/verify-settled-thinking-component.tsx
+@@ -0,0 +1,85 @@
++// Lightweight single-component renderer check; no Chat, sessions, or PTY.
++// React chooses its build when imported, so set production before imports.
++process.env.NODE_ENV = 'production'
++process.env.DSH_TUI_LANG = 'en'
++const [assertModule, React, { Box }, { TerminalSizeContext }, { renderToScreen }, { cellAtIndex }, { AssistantThinkingMessage }, keymap] = await Promise.all([
++  import('node:assert/strict'), import('react'), import('../src/ui.js'),
++  import('../src/ink/components/TerminalSizeContext.js'), import('../src/ink/render-to-screen.js'),
++  import('../src/ink/screen.js'), import('../src/components/messages/AssistantThinkingMessage.js'),
++  import('../src/utils/keymap.js'),
++])
++const assert = assertModule.default
++function snap(element: React.ReactElement, width: number): string[] {
++  const wrapped = <TerminalSizeContext.Provider value={{ columns: width, rows: 40 }}><Box flexDirection="column" width={width}>{element}</Box></TerminalSizeContext.Provider>
++  const rendered = renderToScreen(wrapped, width)
++  return Array.from({ length: rendered.height }, (_, y) => {
++    let line = ''
++    for (let x = 0; x < width; x++) line += cellAtIndex(rendered.screen, y * width + x).char
++    return line.trimEnd()
++  })
++}
++const sample = 'START思考😀\nBODY_ONLY_MIDDLE\nBODY_ONLY_TAIL'
++const folded = snap(<AssistantThinkingMessage thinking={sample} marginTopOnTurn={false} verbose={false} isSelected onClick={() => {}} />, 100)
++assert.equal(folded.length, 1, JSON.stringify(folded))
++assert.ok(folded[0]?.includes('START思考😀'), JSON.stringify(folded))
++assert.ok(folded[0]?.includes('…'))
++assert.ok(!folded.join('\n').includes('BODY_ONLY_'))
++assert.ok(folded[0]?.toLowerCase().includes('ctrl+o'), JSON.stringify(folded))
++assert.ok(folded[0]?.includes('click to expand'), JSON.stringify(folded))
++const noClick = snap(<AssistantThinkingMessage thinking="short" marginTopOnTurn={false} verbose={false} />, 100)
++assert.ok(!noClick[0]?.includes('click to expand'))
++assert.ok(noClick[0]?.includes('short…'))
++const emptyFirst = snap(<AssistantThinkingMessage thinking={'\nSTART\nBODY_ONLY_TAIL'} marginTopOnTurn={false} verbose={false} />, 100)
++assert.ok(emptyFirst[0]?.includes('START…') && !emptyFirst[0]?.includes('BODY_ONLY_TAIL'), JSON.stringify(emptyFirst))
++const counts = snap(<AssistantThinkingMessage thinking="" reasoningTokens={500} marginTopOnTurn={false} verbose={false} />, 100)
++assert.equal(counts.length, 1)
++assert.ok(counts[0]?.includes('tokens') && !counts[0]?.includes('click to expand') && !counts[0]?.includes('…'), JSON.stringify(counts))
++const thinkingOpen = snap(<AssistantThinkingMessage thinking={sample} marginTopOnTurn={false} verbose={false} preview streaming={false} />, 100)
++assert.equal(thinkingOpen.length, 4, JSON.stringify(thinkingOpen))
++assert.ok(!thinkingOpen[0]?.includes('START'))
++assert.ok(thinkingOpen.slice(1).some(x => x.includes('BODY_ONLY_')), JSON.stringify(thinkingOpen))
++const live = snap(<AssistantThinkingMessage thinking={sample} marginTopOnTurn={false} verbose={false} streaming />, 100)
++assert.ok(!live.join('\n').includes('START'), JSON.stringify(live))
++// The helper reads source via charCodeAt; neither live branch should touch the
++// full source this way. The ticker's split lines differ from the full source.
++const readUnit = String.prototype.charCodeAt
++try {
++  String.prototype.charCodeAt = function(index: number) {
++    assert.notEqual(String(this), sample, 'live or thinkingOpen branch scanned settled summary')
++    return readUnit.call(this, index)
++  }
++  snap(<AssistantThinkingMessage thinking={sample} marginTopOnTurn={false} verbose={false} streaming />, 100)
++  snap(<AssistantThinkingMessage thinking={sample} marginTopOnTurn={false} verbose={false} preview streaming={false} />, 100)
++} finally {
++  String.prototype.charCodeAt = readUnit
++}
++const expanded = snap(<AssistantThinkingMessage thinking={sample} marginTopOnTurn={false} verbose />, 100)
++assert.ok(expanded.join('\n').includes('BODY_ONLY_TAIL'), JSON.stringify(expanded))
++for (const width of [4, 6, 12, 20, 40, 60]) {
++  const output = snap(<AssistantThinkingMessage thinking={'👩‍👩‍👧‍👦e\u0301🇨🇳'.repeat(10)} marginTopOnTurn={false} verbose={false} onClick={() => {}} />, width)
++  assert.equal(output.length, 1, `${width}: ${JSON.stringify(output)}`)
++}
++// Override only in this process; unsafe key bytes must not crash or be painted.
++try {
++  for (const key of ['\x1b', '\x00', '\x7f', '\x9b']) {
++    const unsafe = `ctrl+${key}`
++    assert.ok(keymap.parseCombo(unsafe), 'test must exercise a currently accepted combo')
++    keymap.setKeymapOverrides({ transcript: unsafe })
++    assert.equal(keymap.primaryComboString('transcript'), unsafe)
++    const row = snap(<AssistantThinkingMessage thinking="short" marginTopOnTurn={false} verbose={false} onClick={() => {}} />, 100)
++    assert.equal(row.length, 1)
++    assert.ok(row[0]?.includes('short…') && row[0]?.includes('click to expand'), JSON.stringify(row))
++    assert.ok(!row[0]?.includes('ctrl+o'), 'must not fabricate the default binding')
++    assert.doesNotMatch(row.join(''), /[\x00-\x1f\x7f-\x9f]/u)
++    const noHandler = snap(<AssistantThinkingMessage thinking="short" marginTopOnTurn={false} verbose={false} />, 100)
++    assert.equal(noHandler.length, 1)
++    assert.ok(noHandler[0]?.includes('short…') && !noHandler[0]?.includes('click to expand'))
++    assert.doesNotMatch(noHandler.join(''), /[\x00-\x1f\x7f-\x9f]/u)
++  }
++  keymap.setKeymapOverrides({ transcript: 'alt+x' })
++  const remap = snap(<AssistantThinkingMessage thinking="short" marginTopOnTurn={false} verbose={false} />, 100)
++  assert.ok(remap[0]?.includes('alt+x'), JSON.stringify(remap))
++} finally {
++  keymap.resetKeymapOverrides()
++}
++console.log('PASS: settled, clickable, selection, count-only, thinkingOpen preview, streaming, expanded, narrow row, and safe keymap hints')
+diff --git a/scripts/verify-settled-thinking-summary.mjs b/scripts/verify-settled-thinking-summary.mjs
+new file mode 100644
+index 00000000..da7bf257
+--- /dev/null
++++ b/scripts/verify-settled-thinking-summary.mjs
+@@ -0,0 +1,122 @@
++/** Bounded, control-safe first-line digest; includes pre-flattened memory probes.
++ * Run: node --expose-gc --import tsx/esm scripts/verify-settled-thinking-summary.mjs
++ */
++import assert from 'node:assert/strict'
++import { settledThinkingHead as summarize } from '../src/components/messages/settledThinkingSummary.ts'
++const ESC = '\x1b', BEL = '\x07', ST = `${ESC}\\`
++const cases = [
++  ['', '…'], ['hi', 'hi…'], ['  a\r\n\tb  ', 'a…'],
++  ['START\nBODY_ONLY_MIDDLE\nBODY_ONLY_TAIL', 'START…'],
++  ['start\rBODY_ONLY_TAIL', 'start…'],
++  ['start\u2028BODY_ONLY_TAIL', 'start…'],
++  [`start${ESC}]0;ignore\ninside${BEL}end\nBODY_ONLY_TAIL`, 'startend…'],
++  [`start${ESC}Pignore\ninside${ST}end\nBODY_ONLY_TAIL`, 'startend…'],
++  [`start${ESC}[31\nBODY_ONLY_TAIL`, 'start…'],
++  [`start\x9b31\rBODY_ONLY_TAIL`, 'start…'],
++  ['😀猫e\u0301👩‍👩‍👧‍👦!', '😀猫e\u0301👩‍👩‍👧‍👦!…'],
++  [`a${ESC}[31mred${ESC}[0mZ`, 'aredZ…'],
++  [`a${ESC}]0;evil-title${BEL}z`, 'az…'],
++  [`a${ESC}]8;;https://example.test${ST}link${ESC}]8;;${ST}z`, 'alinkz…'],
++  [`a${ESC}]52;c;SECRET${BEL}z`, 'az…'],
++  [`a${ESC}Pprivate${ST}z`, 'az…'],
++  ['a\x9d52;c;SECRET\x9cz', 'az…'],
++  ['a\x9b31mred\x9b0mz', 'aredz…'],
++  [`hi${ESC}]52;c;LEAK`, 'h…'],
++  [`hi${ESC}Punterminated`, 'h…'],
++  [`hi${ESC}[31`, 'h…'],
++  [`hi${ESC}[31${ESC}LEAK`, 'h…'],
++  [`hi${ESC}`, 'h…'],
++  ['a\x00\x07\x7f\x80b', 'ab…'],
++  ['\ud800X\udc00', '�X�…'],
++  ['\u2028\u2029start\u2028next', 'start…'],
++  ['x'.repeat(159)+'😀suffix', 'x'.repeat(159)+'…'],
++  ['x'.repeat(158)+'😀suffix', 'x'.repeat(158)+'😀…'],
++  ['x'.repeat(159)+'e\u0301suffix', 'x'.repeat(159)+'…'],
++  ['x'.repeat(158)+'e\u0301suffix', 'x'.repeat(158)+'e\u0301…'],
++  ['a'+'\u0301'.repeat(1000)+'b', '…'],
++  [' '.repeat(4096)+'tail', '…'],
++  ['x'.repeat(4095)+'\ud83d\ude00', 'x'.repeat(160)+'…'],
++  [`A${ESC}]52;c;${'x'.repeat(5000)}${BEL}SHOULD_NOT_SHOW`, '…'],
++  [`hello${ESC}Psecret${BEL}still-secret${ST}end`, 'helloend…'],
++  [`hello${ESC}]0;secret${ST}end`, 'helloend…'],
++  [`hello${ESC}Xsecret${ST}end`, 'helloend…'],
++  [`hello\x90secret\x9cend`, 'helloend…'],
++  ['x'.repeat(157)+'👩‍💻tail', 'x'.repeat(157)+'…'],
++  ['x'.repeat(155)+'👩‍💻tail', 'x'.repeat(155)+'👩‍💻…'],
++  ['x'.repeat(157)+'🇨🇳tail', 'x'.repeat(157)+'…'],
++  ['x'.repeat(156)+'🇨🇳tail', 'x'.repeat(156)+'🇨🇳…'],
++  ['x'.repeat(159)+'\ud800\udc00tail', 'x'.repeat(159)+'…'],
++]
++for (const [input, expected] of cases) assert.equal(summarize(input), expected, JSON.stringify(input.slice(0, 40)))
++// Every truncation point of each supported escape: no partial payload escapes.
++for (const sequence of [`${ESC}[38;2;255;0;1m`, `${ESC}]0;window-title${BEL}`, `${ESC}]8;;https://secret${ST}`, `${ESC}]52;c;c2VjcmV0${BEL}`, `${ESC}Ppayload${ST}`, `\x9d52;c;secret\x9c`, `\x90payload\x9c`]) {
++  for (let i = 0; i <= sequence.length; i++) {
++    const result = summarize('safe' + sequence.slice(0, i))
++    assert.equal(result, i === 0 || i === sequence.length ? 'safe…' : 'saf…', `control cut ${i} of ${JSON.stringify(sequence)}`)
++    assert.doesNotMatch(result, /[\x00-\x1f\x7f-\x9f]/)
++  }
++}
++// A single pathological unbounded cluster is discarded rather than split.
++assert.equal(summarize('X' + 'a' + '\u0301'.repeat(20_000)), 'X…')
++assert.equal(summarize('X' + '👩' + '\u200d👩'.repeat(10_000)), 'X…')
++// Deliberately naive slicing/regex fails on both ANSI and grapheme boundaries.
++const naive = text => text.slice(0, 160).replace(/\x1b\[[0-9;]*m/g, '').trim() + '…'
++assert.notEqual(naive(`A${ESC}]52;c;SECRET${BEL}B`), 'AB…')
++assert.notEqual(naive('x'.repeat(159)+'😀tail'), summarize('x'.repeat(159)+'😀tail'))
++
++// Independent full-string oracle for short, well-formed generated inputs:
++// remove complete controls, normalize whitespace, segment, then bound result.
++const seg = new Intl.Segmenter('en', { granularity: 'grapheme' })
++function oracle(s) {
++  const clean = s.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
++    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
++    .replace(/\x1bP[^\x1b]*\x1b\\/g, '')
++    .split(/[\r\n\u2028\u2029]/u).find(line => line.trim() !== '') ?? ''
++  const normalized = clean
++    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g, '')
++    .replace(/\s+/gu, ' ').trim()
++  let head = ''
++  for (const {segment} of seg.segment(normalized)) {
++    if (head.length + segment.length > 160) break
++    head += segment
++  }
++  return `${head.trimEnd()}…`
++}
++let seed = 123456789
++const atoms = ['a','中','😀','e\u0301','👩‍💻','🇨🇳',' ','\t','\n','\u2028',`${ESC}[31m`,`${ESC}[0m`,`${ESC}]52;c;abc${BEL}`,`${ESC}]8;;url${ST}`,`${ESC}Pdata${ST}`]
++for (let trial = 0; trial < 5000; trial++) {
++  let input = ''
++  for (let j = 0; j < 12; j++) {
++    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0
++    input += atoms[seed % atoms.length]
++  }
++  assert.equal(summarize(input), oracle(input), `differential trial ${trial}`)
++}
++
++assert.ok(global.gc, 'requires --expose-gc')
++// Count only summary generation after flattening the source, not source setup.
++const flatInput = `hello ${'x'.repeat(8_000_000)}`
++flatInput.charCodeAt(flatInput.length - 1)
++global.gc()
++const generationBefore = process.memoryUsage().heapUsed
++assert.ok(summarize(flatInput).startsWith('hello '))
++const generationDelta = process.memoryUsage().heapUsed - generationBefore
++assert.ok(generationDelta < 1024 * 1024, `unexpected generation allocation ${generationDelta}`)
++function makeRetained() {
++  const results = []
++  for (let i = 0; i < 12; i++) {
++    const input = `${i.toString().padStart(3, '0')}${'x'.repeat(3_000_000)}`
++    input.charCodeAt(input.length - 1) // preflatten to isolate summary generation
++    results.push(summarize(input))
++  }
++  return results
++}
++global.gc()
++const before = process.memoryUsage().heapUsed
++const outputs = makeRetained()
++await new Promise(resolve => setImmediate(resolve))
++global.gc()
++const retained = process.memoryUsage().heapUsed - before
++assert.ok(outputs.every((x, i) => x.startsWith(i.toString().padStart(3, '0'))))
++assert.ok(retained < 2 * 1024 * 1024, `unexpected retention ${retained}`)
++console.log(`PASS: ${cases.length} fixed cases, all control cut points, giant clusters, naive red controls/Unicode, 5000 oracle differential cases; generation delta ${generationDelta} bytes; retained delta ${retained} bytes`)
+diff --git a/scripts/verify-subagent-group-fold.tsx b/scripts/verify-subagent-group-fold.tsx
+new file mode 100644
+index 00000000..8f8c2302
+--- /dev/null
++++ b/scripts/verify-subagent-group-fold.tsx
+@@ -0,0 +1,172 @@
++/**
++ * Subagent fan-out group fold（历史默认只展开高价值行）。
++ *
++ * 一次 fan-out 会连着落下 N 张 `⑂` 子代理卡；逐张读它们几乎不提供组内
++ * 聚合之外的任何信息，却把对话正文推到几屏之外。断言：
++ *   1) 3 张已落定的卡默认折叠成组头一行（正文描述不可见）；
++ *   2) 点击组头展开整组（描述可见、组头变 ▾ 标题），再点收回；
++ *   3) Ctrl+O 展开全部、再按收回；
++ *   4) 组内有 running 成员时不折叠（在跑的工作不许被收起来）。
++ *
++ * 运行：node --import tsx/esm scripts/verify-subagent-group-fold.tsx
++ */
++process.env.FORCE_COLOR = '3'
++process.env.TERM_PROGRAM = 'kitty'
++process.env.DSH_TUI_THEME = 'dark'
++process.env.DSH_TUI_LANG = 'zh'
++
++const [{ PassThrough, Writable }, React, { Terminal: XTerm }, { render, AlternateScreen }, { Chat }, { QuestionStore }, { settled, sleep }] = await Promise.all([
++  import('node:stream'),
++  import('react'),
++  import('@xterm/headless'),
++  import('../src/ui.js'),
++  import('../src/screens/Chat.js'),
++  import('../src/dsh-adapter/questions.js'),
++  import('./lib/term-test.mjs'),
++])
++
++const COLS = 100
++const ROWS = 36
++let failed = 0
++function check(name: string, ok: boolean, extra = ''): void {
++  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${extra ? `  (${extra})` : ''}`)
++  if (!ok) failed += 1
++}
++
++const term = new XTerm({ cols: COLS, rows: ROWS, scrollback: 0, allowProposedApi: true })
++class FakeStdout extends Writable {
++  columns = COLS
++  rows = ROWS
++  isTTY = true
++  _write(chunk: unknown, _e: BufferEncoding, cb: () => void): void { term.write(String(chunk), cb) }
++}
++class FakeStderr extends Writable {
++  isTTY = true
++  _write(_c: unknown, _e: BufferEncoding, cb: () => void): void { cb() }
++}
++class FakeStdin extends PassThrough {
++  isTTY = true
++  setRawMode(): this { return this }
++  ref(): this { return this }
++  unref(): this { return this }
++}
++const stdout = new FakeStdout() as any
++const stderr = new FakeStderr() as any
++const stdin = new FakeStdin() as any
++
++function subagentCard(id: number, agentId: string, status: 'running' | 'completed'): any {
++  const startedAt = Date.now() - 120_000
++  return {
++    id,
++    kind: 'subagent',
++    text: `子任务 ${agentId}：检索并归纳结论`,
++    subagent: {
++      agentId,
++      runId: agentId,
++      description: `工作者${id}：检索并归纳结论`,
++      provider: 'dsh', model: 'deepseek-v4-flash', effort: 'medium',
++      status,
++      startedAt,
++      completedAt: status === 'completed' ? startedAt + 60_000 : undefined,
++      durationMs: status === 'completed' ? 60_000 : undefined,
++      outputLines: status === 'running' ? ['正在读取 src/index.ts', '正在匹配 pattern', '第三行占位输出'] : [],
++      toolCalls: [{ id: `${agentId}-c1`, name: 'Grep', status: 'ok', startedAt }],
++      tokens: { total: 2048 },
++      stopReason: status === 'completed' ? 'completed' : undefined,
++    },
++  }
++}
++
++const listeners = new Set<() => void>()
++const channelRows: any[] = [
++  { id: 0, kind: 'user', text: '开始并行子任务分析' },
++  subagentCard(1, 'sa-1', 'completed'),
++  subagentCard(2, 'sa-2', 'completed'),
++  subagentCard(3, 'sa-3', 'completed'),
++  { id: 90, kind: 'assistant', text: '汇总完成。' },
++]
++const channel: any = {
++  version: 0, rows: channelRows, status: 'idle', sessionTitle: 'subagent-group', agentId: 'x',
++  model: 'deepseek-v4-flash', reasoningEffort: 'max',
++  tokens: { input: 100, output: 40 }, cwd: '/tmp/demo', displayCwd: '/tmp/demo',
++  gitBranch: 'main', working: false, spinnerMode: 'requesting', responseChars: 0,
++  whaleIdle: false,
++  activeToolCount: 0, turnStart: 0, lastUserText: '开始并行子任务分析',
++  pending: [], commandList: [], notifications: [],
++  mode: { plan: false }, effortLevels: undefined,
++  subscribe(cb: () => void) { listeners.add(cb); return () => listeners.delete(cb) },
++  submit: () => {}, cancel: () => {}, clear: () => {}, notify: () => {},
++  listModels: () => Promise.resolve([]), listSessions: () => [],
++  setResumeTarget: () => {}, loadOlder: () => {}, mcpStatus: () => [],
++}
++const bump = (): void => { channel.version++; for (const cb of listeners) (cb as () => void)() }
++
++await render(
++  <AlternateScreen>
++    <Chat channel={channel} questionStore={new QuestionStore()} />
++  </AlternateScreen>,
++  { stdout, stdin, stderr, exitOnCtrlC: false, patchConsole: false },
++)
++// 固定窗:pacing 等开机动画与首帧上屏，无单一可轮询锚点。
++await sleep(1800)
++
++const lines = (): string[] => {
++  const buf = term.buffer.active
++  return Array.from({ length: ROWS }, (_, y) => buf.getLine(buf.baseY + y)?.translateToString(true) ?? '')
++}
++const foldedRow = (ls: string[]): number => ls.findIndex(line => line.includes('已折叠 3 个子代理'))
++const openRow = (ls: string[]): number => ls.findIndex(line => line.includes('子代理 ×3'))
++const visibleDescriptions = (ls: string[]): number => ls.filter(line => line.includes('工作者')).length
++/** 点击后的重绘在高负载下可能晚于任何固定等待：按结果轮询，超时才判失败。 */
++const waitFor = (pred: () => boolean, ms = 3000): Promise<boolean> => settled(pred, { timeoutMs: ms })
++
++// ---- 1. 默认折叠 ----
++await waitFor(() => foldedRow(lines()) >= 0)
++let ls = lines()
++check('已落定的 3 张子代理卡默认折叠成组头一行', foldedRow(ls) >= 0, foldedRow(ls) >= 0 ? `行${foldedRow(ls)}` : '未找到')
++check('折叠时不再逐张展示子代理卡', visibleDescriptions(ls) === 0, `cards=${visibleDescriptions(ls)}`)
++
++// ---- 2. 点击组头展开，再点收回 ----
++stdin.write(`\x1b[<0;3;${foldedRow(ls) + 1}M`)
++stdin.write(`\x1b[<0;3;${foldedRow(ls) + 1}m`)
++await waitFor(() => visibleDescriptions(lines()) === 3)
++ls = lines()
++check('点击组头展开整组', visibleDescriptions(ls) === 3, `cards=${visibleDescriptions(ls)}`)
++check('展开后组头改为标题行', openRow(ls) >= 0, openRow(ls) >= 0 ? `行${openRow(ls)}` : '未找到')
++
++// 双连击会被判双击选词，先等过 500ms 多击窗。
++await sleep(600) // 固定窗:墙钟 多击判定窗本身是被测语义（500ms 内第二次点按算双击选词）。
++const openIdx = openRow(lines())
++stdin.write(`\x1b[<0;3;${openIdx + 1}M`)
++stdin.write(`\x1b[<0;3;${openIdx + 1}m`)
++await waitFor(() => foldedRow(lines()) >= 0)
++ls = lines()
++check('再点收回折叠行', foldedRow(ls) >= 0 && visibleDescriptions(ls) === 0,
++  `folded=${foldedRow(ls)} cards=${visibleDescriptions(ls)}`)
++
++// ---- 3. Ctrl+O 展开 / 收回 ----
++stdin.write('\x0f')
++await waitFor(() => visibleDescriptions(lines()) === 3)
++check('Ctrl+O 展开全部子代理组', visibleDescriptions(lines()) === 3, `cards=${visibleDescriptions(lines())}`)
++stdin.write('\x0f')
++await waitFor(() => foldedRow(lines()) >= 0)
++check('再按 Ctrl+O 收回', foldedRow(lines()) >= 0 && visibleDescriptions(lines()) === 0,
++  `folded=${foldedRow(lines())} cards=${visibleDescriptions(lines())}`)
++
++// ---- 4. 有 running 成员时不折叠 ----
++// 换一批新行对象再 bump：投影的落定是**替换**行对象，原地改字段不换数组
++// 身份会让窗口缓存继续吃旧切片。
++channel.rows = channelRows.map((row: any) => {
++  if (row.kind !== 'subagent') return row
++  const { completedAt: _c, durationMs: _d, stopReason: _s, ...rest } = row.subagent
++  return { ...row, subagent: { ...rest, status: 'running' } }
++})
++bump()
++await waitFor(() => openRow(lines()) >= 0 && visibleDescriptions(lines()) === 3)
++ls = lines()
++check('组内有 running 成员时保持展开', visibleDescriptions(ls) === 3, `cards=${visibleDescriptions(ls)}`)
++check('运行中的组头报告 live 数', ls.some(line => line.includes('运行中')), openRow(ls) >= 0 ? `行${openRow(ls)}` : '未找到')
++check('运行中的组不会被折叠行替代', foldedRow(ls) === -1, `folded=${foldedRow(ls)}`)
++
++console.log(failed === 0 ? '\nSUBAGENT GROUP FOLD OK' : `\n${failed} 项失败`)
++process.exit(failed === 0 ? 0 : 1)
+diff --git a/scripts/verify-subagent-settled-no-scan.mjs b/scripts/verify-subagent-settled-no-scan.mjs
+new file mode 100644
+index 00000000..bfeaca93
+--- /dev/null
++++ b/scripts/verify-subagent-settled-no-scan.mjs
+@@ -0,0 +1,171 @@
++/*
++ * Settled subagent cards must not traverse their unused call history.
++ * Run: node --import tsx/esm scripts/verify-subagent-settled-no-scan.mjs
++ * React is loaded dynamically after the production environment is set.
++ * Real production component and Chat; no loader hooks and no forced redraw.
++ * The pre-fix code must fail the settled element-access assertion. Proxy counts
++ * are not timing measurements. A private scratch directory survives any error.
++ */
++import assert from 'node:assert/strict'
++import { mkdtempSync, realpathSync, lstatSync, fstatSync, readdirSync, rmSync, openSync, closeSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { dirname, join } from 'node:path'
++import { PassThrough, Writable } from 'node:stream'
++
++// No React or application module has been imported yet.
++process.env.NODE_ENV = 'production'
++const windows = process.platform === 'win32'
++if (!windows && (typeof process.getuid !== 'function' || typeof process.getgid !== 'function')) throw new Error('POSIX uid/gid required')
++// Only select the existing temporary parent, then create a distinct scratch
++// with mkdtemp. Its origin may be an inherited OS temp setting; we do not read
++// any other children. Windows ACL privacy of that parent is NOT established.
++const tmp = realpathSync(tmpdir())
++const scratch = mkdtempSync(join(tmp, 'verify-subagent-no-scan-'))
++const rootIdentity = lstatSync(scratch)
++const sameIdentity = (a, b) => a.dev === b.dev && a.ino === b.ino && (windows || (a.uid === b.uid && a.gid === b.gid))
++if (!rootIdentity.isDirectory() || (!windows && (rootIdentity.uid !== process.getuid() || rootIdentity.gid !== process.getgid() || (rootIdentity.mode & 0o777) !== 0o700))) throw new Error(`unsafe scratch retained: ${scratch}`)
++// Clear inherited app settings and credentials before application imports.
++// Keep only platform startup essentials and PATH; no user profile is retained.
++const retainedEnv = Object.fromEntries(['PATH', ...(windows ? ['SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT'] : [])].filter(k => process.env[k] !== undefined).map(k => [k, process.env[k]]))
++for (const key of Object.keys(process.env)) delete process.env[key]
++Object.assign(process.env, retainedEnv, {
++  NODE_ENV: 'production', TZ: 'UTC', TERM: 'xterm-256color', HOME: scratch, USERPROFILE: scratch,
++  DSH_HOME: join(scratch, 'dsh'), XDG_CONFIG_HOME: join(scratch, 'config'),
++  XDG_CACHE_HOME: join(scratch, 'cache'), XDG_DATA_HOME: join(scratch, 'data'),
++  XDG_STATE_HOME: join(scratch, 'state'), XDG_RUNTIME_DIR: join(scratch, 'runtime'),
++  XDG_CONFIG_DIRS: join(scratch, 'config'), XDG_DATA_DIRS: join(scratch, 'data'),
++  TMPDIR: scratch, TMP: scratch, TEMP: scratch, DSH_TUI_LANG: 'en', FORCE_COLOR: '0',
++})
++// Watchdog is a failure deadline, not an assertion window. No forced redraw.
++const watchdog = setTimeout(() => {
++  console.error(`TIMEOUT: scratch retained at ${scratch}`)
++  process.exit(1)
++}, 60000)
++
++// Validate the root and every descendant before removing a private tree. No
++// symlink, special file, owner mismatch, replaced root, or unexpected parent.
++// A concurrent process running as the same uid is outside this private-dir
++// isolation model; all writes in this test are synchronous or awaited.
++function verifyTree(path) {
++  const stat = lstatSync(path)
++  if (stat.isSymbolicLink() || stat.uid !== rootIdentity.uid || stat.gid !== rootIdentity.gid) throw new Error(`unsafe scratch member: ${path}`)
++  if (stat.isDirectory()) for (const name of readdirSync(path)) verifyTree(join(path, name))
++  else if (!stat.isFile()) throw new Error(`unexpected scratch member: ${path}`)
++}
++function removeVerifiedScratch() {
++  let now = lstatSync(scratch)
++  if (dirname(scratch) !== tmp || realpathSync(scratch) !== scratch || !sameIdentity(now, rootIdentity) || !now.isDirectory() || (now.mode & 0o777) !== 0o700) throw new Error('scratch root changed; retained')
++  verifyTree(scratch)
++  now = lstatSync(scratch)
++  if (!sameIdentity(now, rootIdentity) || (now.mode & 0o777) !== 0o700) throw new Error('scratch root changed during inspection; retained')
++  rmSync(scratch, { recursive: true })
++}
++
++const COLS = 120, ROWS = 40
++class Input extends PassThrough { isTTY = true; setRawMode() { return this }; ref() { return this }; unref() { return this } }
++function sample(status) {
++  const calls = Array.from({ length: 1000 }, (_, i) => ({ id: `tool-${i}`, name: `tool${i}`, status: 'ok', startedAt: 1 }))
++  calls[9] = { id: 'first-prev', name: 'FirstPredecessor', status: 'ok', startedAt: 1 }
++  const duplicate = { id: 'dup', name: 'RunningProbe', status: 'running', startedAt: 1 }
++  calls[10] = duplicate
++  calls[999] = duplicate
++  const reads = { iterator: 0, index: 0 }
++  const toolCalls = new Proxy(calls, { get(target, key, receiver) {
++    if (key === Symbol.iterator) reads.iterator++
++    if (typeof key === 'string' && /^(0|[1-9]\d*)$/.test(key)) reads.index++
++    return Reflect.get(target, key, receiver)
++  } })
++  const startedAt = Date.now() - 2000
++  return { reads, sub: { agentId: 'child-probe', runId: 'run-probe', description: 'SUBAGENT-PROBE', provider: 'dsh', model: 'probe', status,
++    startedAt, completedAt: status === 'running' ? undefined : startedAt + 1000, durationMs: 1000,
++    outputLines: ['live one', 'live two', 'live three'], output: [], outputEvents: [], summary: 'DETAIL-SUMMARY-PROBE', toolCalls,
++    tokens: { total: 12 }, ...(status === 'failed' ? { error: 'ERROR-PROBE' } : {}) } }
++}
++
++let succeeded = false
++try {
++  // Imports are deliberately relative to scripts/, not to this draft's /tmp.
++  const [React, { Terminal }, { render, AlternateScreen, useInput }, { SubagentMessage }, { Chat }, { QuestionStore }, { settled }] = await Promise.all([
++    import('react'), import('@xterm/headless'), import('../src/ui.js'), import('../src/components/Chat/SubagentMessage.js'),
++    import('../src/screens/Chat.js'), import('../src/dsh-adapter/questions.js'), import('./lib/term-test.mjs'),
++  ])
++  const labels = { completed: ['🟢', 'completed'], failed: ['🔴', 'failed'], cancelled: ['🔴', 'Cancelled'], unknown: ['⚪', 'status unknown'] }
++  async function exercise(status, surface) {
++    const { sub, reads } = sample(status)
++    const term = new Terminal({ cols: COLS, rows: ROWS, scrollback: 0, allowProposedApi: true })
++    const fd = openSync(join(scratch, `${surface}-${status}.reset`), 'wx', 0o600)
++    const fdIdentity = fstatSync(fd)
++    let pendingWrites = 0, frames = 0, clicked = false, app
++    class Output extends Writable {
++      isTTY = true; columns = COLS; rows = ROWS; fd = fd
++      _write(chunk, _encoding, done) { pendingWrites++; term.write(String(chunk), () => { pendingWrites--; done() }) }
++    }
++    class ErrorSink extends Writable { isTTY = true; _write(_chunk, _encoding, done) { done() } }
++    const stdin = new Input(), stdout = new Output(), stderr = new ErrorSink()
++    const screen = () => Array.from({ length: ROWS }, (_, y) => term.buffer.active.getLine(term.buffer.active.baseY + y)?.translateToString(true) ?? '')
++    const listeners = new Set()
++    const channel = { version: 0, rows: [{ id: 1, kind: 'subagent', text: sub.description, subagent: sub }], subagents: [sub],
++      agentId: 'synthetic-parent', sessionId: 'synthetic-session', status: 'idle', working: false, whale: false, whaleIdle: false,
++      model: 'probe', provider: 'probe', reasoningEffort: 'high', tokens: { input: 0, output: 0 }, cwd: scratch, displayCwd: scratch,
++      gitBranch: 'main', spinnerMode: 'responding', responseChars: 0, activeToolCount: 0, turnStart: 0,
++      pending: [], notifications: [], commandList: [], mode: { plan: false },
++      subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn) }, submit() {}, cancel() {}, clear() {}, notify() {}, loadOlder() {}, setResumeTarget() {},
++      listModels: async () => [], listSessions: async () => [], mcpStatus: () => [] }
++    function ComponentHarness() { useInput(() => {}); return React.createElement(SubagentMessage, { subagent: sub, marginTopOnTurn: false, isExpanded: false, onClick: () => { clicked = true } }) }
++    const tree = surface === 'component' ? React.createElement(ComponentHarness) : React.createElement(Chat, { channel, questionStore: new QuestionStore(), fullscreen: true, trajectorySeen: true })
++    try {
++      assert.ok(fdIdentity.isFile() && (windows || (fdIdentity.uid === rootIdentity.uid && fdIdentity.gid === rootIdentity.gid && (fdIdentity.mode & 0o777) === 0o600)), 'unsafe reset fd')
++      app = await render(React.createElement(AlternateScreen, null, tree), { stdout, stdin, stderr, patchConsole: false, exitOnCtrlC: false, onFrame: () => { frames++ } })
++      assert.ok(await settled(() => frames > 0 && pendingWrites === 0 && screen().some(line => line.includes('SUBAGENT-PROBE'))), `${surface}/${status}: painted frame`)
++      const lines = screen(), y = lines.findIndex(line => line.includes('SUBAGENT-PROBE'))
++      assert.ok(stdin.listenerCount('readable') > 0, `${surface}/${status}: input parser not attached`)
++      assert.ok(lines[y].includes('1000 tools'), `${surface}/${status}: count missing: ${lines[y]}`)
++      if (status !== 'running') {
++        const [glyph, label] = labels[status]
++        const expected = `  ${glyph} Subagent: SUBAGENT-PROBE · probe · 1s · 12 tok · 1000 tools · ${label}`
++        assert.equal(lines[y].trimEnd(), expected + (surface === 'chat' ? '  ⤢' : ''), `${surface}/${status}: settled card changed`)
++        if (status === 'failed') assert.ok(lines[y + 1].includes('ERROR-PROBE'), `${surface}: failed error hidden`)
++        assert.deepEqual(reads, { iterator: 0, index: 0 }, `${surface}/${status}: settled card accessed elements`)
++      } else {
++        const visible = lines.join('\n')
++        assert.ok(visible.includes('FirstPredecessor') && visible.includes('RunningProbe'), `${surface}: duplicate-call prior tool semantics changed`)
++        assert.ok(visible.includes('live one') && visible.includes('live three'), `${surface}: live waterfall changed`)
++        // Do not require any specific traversal implementation for running.
++      }
++      const line = term.buffer.active.getLine(term.buffer.active.baseY + y), marker = 'SUBAGENT-PROBE'
++      let x = -1
++      for (let col = 0; col <= COLS - marker.length; col++) {
++        let text = ''
++        for (let i = 0; i < marker.length; i++) text += line?.getCell(col + i)?.getChars() ?? ''
++        if (text === marker) { x = col; break }
++      }
++      assert.ok(x >= 0, `${surface}/${status}: marker cell missing`)
++      stdin.write(`\x1b[<0;${x + 1};${y + 1}M`)
++      stdin.write(`\x1b[<0;${x + 1};${y + 1}m`)
++      assert.ok(await settled(() => surface === 'component' ? clicked : pendingWrites === 0 && screen().some(line => line.includes('DETAIL-SUMMARY-PROBE')) && screen().some(line => line.includes('1000 tools'))), `${surface}/${status}: click/detail`)
++      console.log(`PASS ${surface}/${status}`)
++    } finally {
++      try { if (app !== undefined) await app.unmount() } finally {
++        term.dispose()
++        const beforeClose = fstatSync(fd)
++        closeSync(fd)
++        assert.ok(beforeClose.isFile() && sameIdentity(fdIdentity, beforeClose) && (windows || (beforeClose.mode & 0o777) === 0o600), 'reset fd changed identity/mode; scratch retained')
++      }
++    }
++  }
++  for (const status of ['completed', 'failed', 'cancelled', 'unknown', 'running']) {
++    for (const surface of ['component', 'chat']) await exercise(status, surface)
++  }
++  succeeded = true
++} catch (error) {
++  console.error(error)
++  process.exitCode = 1
++} finally {
++  clearTimeout(watchdog)
++  if (succeeded && !windows) {
++    try { removeVerifiedScratch() } catch (error) { console.error(error); process.exitCode = 1 }
++  }
++  if (windows || !succeeded || process.exitCode) {
++    console.error(`scratch retained: ${scratch}${windows ? ' (Windows ACL not verified; retained even on success)' : ''}`)
++  }
++}
+diff --git a/scripts/verify-thinking-ticker-render.tsx b/scripts/verify-thinking-ticker-render.tsx
+new file mode 100644
+index 00000000..c4848c33
+--- /dev/null
++++ b/scripts/verify-thinking-ticker-render.tsx
+@@ -0,0 +1,91 @@
++/** Real Ink/xterm coverage for the live thinking ticker and spinner.
++ * Run: node --import tsx/esm scripts/verify-thinking-ticker-render.tsx
++ */
++import assert from 'node:assert/strict'
++import { Writable } from 'node:stream'
++
++process.env.DSH_TUI_LANG = 'en'
++process.env.FORCE_COLOR = '3'
++const [React, { Terminal }, { render, Box, Text }, { AssistantThinkingMessage }, { settled }] = await Promise.all([
++  import('react'), import('@xterm/headless'), import('../src/ui.js'),
++  import('../src/components/messages/AssistantThinkingMessage.js'), import('./lib/term-test.mjs'),
++])
++
++const COLS = 70, ROWS = 12
++const term = new Terminal({ cols: COLS, rows: ROWS, scrollback: 0, allowProposedApi: true })
++let pending = 0
++class FakeStdout extends Writable {
++  columns = COLS
++  rows = ROWS
++  isTTY = true
++  override _write(chunk: unknown, _encoding: BufferEncoding, done: () => void) {
++    pending++
++    term.write(String(chunk), () => { pending--; done() })
++  }
++}
++const output = new FakeStdout()
++const screen = () => Array.from({ length: ROWS }, (_, y) => term.buffer.active.getLine(y)?.translateToString(true) ?? '')
++const full = `${'unseen reasoning\n'.repeat(1000)}VISIBLE-FIRST\nVISIBLE-MIDDLE\nVISIBLE-LAST`
++const updated = `${'old line\n'.repeat(4)}NEW-FIRST\n\n`
++const originalSplit = String.prototype.split
++let fullSplits = 0, updatedSplits = 0
++String.prototype.split = function (...args: Parameters<typeof originalSplit>) {
++  const value = String(this)
++  if (value === full) fullSplits++
++  if (value === updated) updatedSplits++
++  return originalSplit.apply(this, args)
++}
++let app: Awaited<ReturnType<typeof render>> | undefined
++try {
++  app = await render(
++    <Box flexDirection="column" width={COLS}>
++      <AssistantThinkingMessage thinking="REVEALED-ONLY" textFull={full} marginTopOnTurn={false} verbose={false} streaming preview />
++      <Text>AFTER-TICKER</Text>
++    </Box>,
++    { stdout: output as never, exitOnCtrlC: false, patchConsole: false },
++  )
++  const firstReady = await settled(() => pending === 0 && screen().some(line => line.includes('VISIBLE-LAST')) && screen().some(line => line.includes('AFTER-TICKER')), { timeoutMs: 5000 })
++  assert.ok(firstReady, 'full arrived text and the following row must be painted')
++  const lines = screen()
++  const header = lines.findIndex(line => line.includes('Thinking'))
++  assert.ok(header >= 0, 'streaming header must be visible')
++  assert.ok(lines[header + 1]?.includes('…VISIBLE-FIRST'), 'first visible line must carry the clipping marker')
++  assert.ok(lines[header + 2]?.includes('VISIBLE-MIDDLE'), 'second visible line must remain intact')
++  assert.ok(lines[header + 3]?.includes('VISIBLE-LAST'), 'third visible line must follow arrived text')
++  assert.ok(lines[header + 4]?.includes('AFTER-TICKER'), 'ticker height must remain three rows')
++  assert.ok(!lines.some(line => line.includes('unseen reasoning') || line.includes('REVEALED-ONLY')), 'offscreen reasoning and the lagging revealed text must not replace the ticker')
++  const firstHeader = lines[header]
++  assert.ok(await settled(() => pending === 0 && screen()[header] !== firstHeader && screen()[header]!.includes('Thinking'), { timeoutMs: 5000 }), 'the real spinner must advance and repaint')
++  assert.equal(fullSplits, 0, 'spinner must not split the entire arrived reasoning into lines')
++  app.rerender(
++    <Box flexDirection="column" width={COLS}>
++      <AssistantThinkingMessage thinking="REVEALED-ONLY" textFull={updated} marginTopOnTurn={false} verbose={false} streaming preview />
++      <Text>AFTER-TICKER</Text>
++    </Box>,
++  )
++  assert.ok(await settled(() => pending === 0 && screen().some(line => line.includes('NEW-FIRST')) && !screen().some(line => line.includes('VISIBLE-LAST')), { timeoutMs: 5000 }), 'updated arrived text must repaint')
++  const updatedLines = screen()
++  const updatedHeader = updatedLines.findIndex(line => line.includes('Thinking'))
++  assert.ok(updatedHeader >= 0 && updatedLines[updatedHeader + 1]?.includes('…NEW-FIRST'), 'updated first line must retain the clipping marker')
++  assert.equal(updatedLines[updatedHeader + 2]?.trim(), '│', 'middle empty line must remain empty')
++  assert.equal(updatedLines[updatedHeader + 3]?.trim(), '│', 'trailing newline must keep the final empty line')
++  assert.ok(updatedLines[updatedHeader + 4]?.includes('AFTER-TICKER'), 'updated ticker must retain its fixed height')
++  const updatedHeaderText = updatedLines[updatedHeader]
++  assert.ok(await settled(() => pending === 0 && screen()[updatedHeader] !== updatedHeaderText && screen()[updatedHeader]!.includes('Thinking'), { timeoutMs: 5000 }), 'spinner must advance after the text update')
++  assert.equal(updatedSplits, 0, 'updated arrived reasoning must not be split into a full line array')
++  app.rerender(
++    <Box flexDirection="column" width={COLS}>
++      <AssistantThinkingMessage thinking="REVEALED-ONLY" textFull="" marginTopOnTurn={false} verbose={false} streaming preview />
++      <Text>AFTER-TICKER</Text>
++    </Box>,
++  )
++  const emptyReady = await settled(() => pending === 0 && !screen().some(line => line.includes('NEW-FIRST')) && screen().some(line => line.includes('AFTER-TICKER')), { timeoutMs: 5000 })
++  if (!emptyReady) console.error(JSON.stringify({ pending, screen: screen() }))
++  assert.ok(emptyReady, 'empty arrived text must repaint')
++  assert.ok(!screen().some(line => line.includes('REVEALED-ONLY')), 'empty textFull must not fall back to revealed text')
++  console.log('thinking ticker render: content, fixed height, spinner, empty textFull and bounded line array passed')
++} finally {
++  String.prototype.split = originalSplit
++  await app?.unmount()
++  term.dispose()
++}
+diff --git a/scripts/verify-thinking-ticker-tail.ts b/scripts/verify-thinking-ticker-tail.ts
+new file mode 100644
+index 00000000..f55693b8
+--- /dev/null
++++ b/scripts/verify-thinking-ticker-tail.ts
+@@ -0,0 +1,40 @@
++/** Differential coverage for the live thinking ticker's bounded line array.
++ * Run: node --import tsx/esm scripts/verify-thinking-ticker-tail.ts
++ */
++import assert from 'node:assert/strict'
++import { thinkingTickerTail } from '../src/components/messages/thinkingTicker.js'
++
++function oldTail(text: string, count: number) {
++  const lines = text.split('\n')
++  const visible = lines.slice(-count)
++  return { lines: visible, clipped: lines.length > visible.length }
++}
++
++let checked = 0
++const alphabet = ['x', '\n', '\r', '😀', '\u2028']
++function check(text: string) {
++  for (let count = 1; count <= 5; count++) {
++    assert.deepEqual(thinkingTickerTail(text, count), oldTail(text, count), `count=${count} text=${JSON.stringify(text)}`)
++    checked++
++  }
++}
++function enumerate(prefix: string, remaining: number) {
++  check(prefix)
++  if (remaining > 0) for (const char of alphabet) enumerate(prefix + char, remaining - 1)
++}
++enumerate('', 6)
++for (const text of ['', '\n', '\n\n', '\n\n\n', 'a\n', 'a\r\nb\n', '\0\n\ud800\n\udc00', 'z'.repeat(50_000), ('line\n').repeat(20_000)]) check(text)
++
++// The new implementation must not allocate one array entry per old line.
++const originalSplit = String.prototype.split
++const sentinel = `prefix-${'line\n'.repeat(100)}tail`
++try {
++  String.prototype.split = function (...args: Parameters<typeof originalSplit>) {
++    if (String(this) === sentinel) throw new Error('split the entire ticker')
++    return originalSplit.apply(this, args)
++  }
++  assert.deepEqual(thinkingTickerTail(sentinel, 3), { lines: ['line', 'line', 'tail'], clipped: true })
++} finally {
++  String.prototype.split = originalSplit
++}
++console.log(`thinking ticker tail: ${checked} differential checks passed`)
+diff --git a/scripts/verify-thinking-virtualization.mjs b/scripts/verify-thinking-virtualization.mjs
+new file mode 100644
+index 00000000..35fd1835
+--- /dev/null
++++ b/scripts/verify-thinking-virtualization.mjs
+@@ -0,0 +1,125 @@
++// Run: node scripts/verify-thinking-virtualization.mjs --run
++// Production child with synthetic scratch and an allowlisted environment.
++// Windows and non-Linux runtime behavior has not been verified.
++import { spawn } from 'node:child_process'
++import { lstatSync, mkdtempSync, mkdirSync, realpathSync, rmSync } from 'node:fs'
++import { createRequire } from 'node:module'
++import { tmpdir } from 'node:os'
++import { basename, dirname, join } from 'node:path'
++import { fileURLToPath } from 'node:url'
++
++if (process.argv.length !== 3 || process.argv[2] !== '--run') throw new Error('Usage: node scripts/verify-thinking-virtualization.mjs --run')
++const repoRoot = new URL('../', import.meta.url)
++const probe = fileURLToPath(new URL('scripts/thinking-virtualization-probe.mjs', repoRoot))
++const require = createRequire(new URL('package.json', repoRoot))
++const loader = require.resolve('tsx/esm')
++const tempRoot = realpathSync(tmpdir())
++const prefix = 'dsh-thinking-virtual-'
++const scratch = mkdtempSync(join(tempRoot, prefix))
++const original = lstatSync(scratch)
++const verifyScratch = () => {
++  const current = lstatSync(scratch)
++  if (dirname(scratch) !== tempRoot || !basename(scratch).startsWith(prefix) ||
++      realpathSync(dirname(scratch)) !== tempRoot || realpathSync(scratch) !== scratch ||
++      !current.isDirectory() || current.dev !== original.dev || current.ino !== original.ino) {
++    throw new Error('refusing to use or clean a replaced scratch directory')
++  }
++  if (process.platform !== 'win32' && (typeof process.getuid !== 'function' ||
++      current.uid !== process.getuid() || (current.mode & 0o077) !== 0)) {
++    throw new Error('scratch directory must be private and owned by the current user')
++  }
++}
++verifyScratch()
++for (const dir of ['home', 'dsh', 'config', 'cache', 'data', 'state', 'runtime', 'tmp']) mkdirSync(join(scratch, dir))
++const env = {
++  NODE_ENV: 'production', HOME: join(scratch, 'home'), USERPROFILE: join(scratch, 'home'), DSH_HOME: join(scratch, 'dsh'),
++  XDG_CONFIG_HOME: join(scratch, 'config'), XDG_CACHE_HOME: join(scratch, 'cache'),
++  XDG_DATA_HOME: join(scratch, 'data'), XDG_STATE_HOME: join(scratch, 'state'), XDG_RUNTIME_DIR: join(scratch, 'runtime'),
++  XDG_CONFIG_DIRS: join(scratch, 'config'), XDG_DATA_DIRS: join(scratch, 'data'),
++  TMPDIR: join(scratch, 'tmp'), TMP: join(scratch, 'tmp'), TEMP: join(scratch, 'tmp'),
++  DSH_TUI_GEOMETRY_TRACE: join(scratch, 'geometry.jsonl'),
++  DSH_TUI_THEME: 'dark', DSH_TUI_LANG: 'en', FORCE_COLOR: '3',
++  DSH_THINK_SCRATCH: scratch, DSH_THINK_TEMP_ROOT: tempRoot,
++  PATH: process.platform === 'win32' ? '' : '/usr/bin:/bin', LANG: 'C.UTF-8', TERM: 'xterm-256color',
++}
++if (process.platform === 'win32') {
++  // Windows process startup may require these, but no other inherited user
++  // environment (including credentials) is forwarded to the child.
++  for (const key of ['SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT']) {
++    if (process.env[key] !== undefined) env[key] = process.env[key]
++  }
++}
++const TIMEOUT_MS = 45_000, GRACE_MS = 2_000, LIMIT = 200_000
++let stopCurrent = null, interrupted = null
++for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { interrupted ??= signal; stopCurrent?.(`parent-${signal}`) })
++const result = await new Promise(resolve => {
++  const child = spawn(process.execPath, ['--import', loader, probe], {
++    cwd: scratch, env, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'],
++  })
++  const streams = Object.fromEntries(['stdout', 'stderr'].map(key => [key, { chunks: [], stored: 0, observed: 0, overflow: false }]))
++  let error = null, reason = null, escalation = null, drainTimer = null
++  let exitObserved = false, closed = false, drainTimedOut = false
++  const signals = []
++  const leaderRunning = () => !closed && !exitObserved && child.exitCode === null && child.signalCode === null && Boolean(child.pid)
++  const killGroup = signal => {
++    if (!leaderRunning()) return
++    try {
++      // POSIX detached child leads its own group. On Windows signal only the
++      // still-live child we created; no process-tree guarantee is implied.
++      const sent = process.platform === 'win32' ? child.kill(signal) : process.kill(-child.pid, signal)
++      signals.push({ signal, sent })
++    } catch (err) { signals.push({ signal, sent: false, error: String(err) }) }
++  }
++  const stop = why => {
++    if (!leaderRunning()) return
++    reason ??= why
++    if (escalation !== null) return
++    killGroup('SIGTERM')
++    escalation = setTimeout(() => killGroup('SIGKILL'), GRACE_MS)
++  }
++  stopCurrent = stop
++  const timeout = setTimeout(() => stop('timeout'), TIMEOUT_MS)
++  for (const key of ['stdout', 'stderr']) {
++    child[key].on('data', chunk => {
++      const state = streams[key]
++      state.observed += chunk.length
++      const remaining = LIMIT - state.stored
++      if (remaining > 0) { const kept = chunk.subarray(0, remaining); state.chunks.push(kept); state.stored += kept.length }
++      if (state.observed > LIMIT && !state.overflow) { state.overflow = true; stop(`${key}-output-limit`) }
++    })
++    child[key].on('error', err => { error ??= `${key}: ${String(err)}`; stop(`${key}-pipe-error`) })
++  }
++  child.on('error', err => { error ??= String(err) })
++  child.on('exit', () => {
++    exitObserved = true
++    clearTimeout(timeout)
++    if (escalation !== null) clearTimeout(escalation)
++    // Never signal a process group after its leader exits. An inherited pipe
++    // held open by an unknown process is a failure, not grounds to guess PID.
++    drainTimer = setTimeout(() => { drainTimedOut = true; child.stdout.destroy(); child.stderr.destroy() }, GRACE_MS)
++  })
++  child.on('close', (code, signal) => {
++    closed = true
++    clearTimeout(timeout)
++    if (escalation !== null) clearTimeout(escalation)
++    if (drainTimer !== null) clearTimeout(drainTimer)
++    stopCurrent = null
++    resolve({ code, signal, error, reason, exitObserved, closeObserved: true, drainTimedOut, signals, streams })
++  })
++  if (interrupted) stop(`parent-${interrupted}`)
++})
++for (const key of ['stdout', 'stderr']) process.stdout.write(Buffer.concat(result.streams[key].chunks))
++const output = Object.fromEntries(Object.entries(result.streams).map(([key, state]) => [key, { observed: state.observed, stored: state.stored, overflow: state.overflow }]))
++let failed = result.code !== 0 || Boolean(result.error || result.reason || result.drainTimedOut || interrupted) || Object.values(output).some(s => s.overflow)
++let cleanupError = null, scratchRetained = true
++if (!failed && result.closeObserved) {
++  try {
++    // Never clean up after a pipe-drain timeout or any other failed run.
++    // Recheck the original owned directory immediately before removal.
++    verifyScratch()
++    rmSync(scratch, { recursive: true })
++    scratchRetained = false
++  } catch (err) { cleanupError = String(err); failed = true }
++}
++console.log(`SUPERVISOR ${JSON.stringify({ code: result.code, signal: result.signal, error: result.error, reason: result.reason, exitObserved: result.exitObserved, closeObserved: result.closeObserved, drainTimedOut: result.drainTimedOut, signals: result.signals, output, interrupted, scratch, scratchRetained, cleanupError })}`)
++if (failed) process.exitCode = 1
+diff --git a/src/components/Chat/SubagentGroupHeader.tsx b/src/components/Chat/SubagentGroupHeader.tsx
+new file mode 100644
+index 00000000..1cfc23b9
+--- /dev/null
++++ b/src/components/Chat/SubagentGroupHeader.tsx
+@@ -0,0 +1,96 @@
++import React from 'react'
++import { Box, Text, useAnimationFrame } from '../../ui.js'
++import type { SubagentGroupRow } from '../../adapter/ports/channel-view.js'
++import { formatDuration } from '../../trajectory/format.js'
++import { t } from '../../i18n.js'
++import { isMinimalUiMode } from '../../minimalUiMode.js'
++
++/** One summary chip: the count text plus the color that carries its meaning. */
++type Chip = { key: string; text: string; color: 'warning' | 'error' | 'success' | undefined }
++
++/**
++ * Header line of a consecutive-subagent group (`row.subagentGroup`): the run
++ * summary while the group is open, and the fold line once it is closed.
++ *
++ *   ▾ 子代理 ×6 · 4 已完成 · 合计 1m32s
++ *   ▸ 已折叠 6 个子代理 · 全部完成 · 合计 2m05s · 点击展开
++ *
++ * A fan-out of parallel workers is one unit of work: reading a dozen `⑂`
++ * cards one by one tells you almost nothing the aggregate does not, and it
++ * buries the conversation. The fold line keeps the header's row and glyph
++ * slot so a settling group reads as the SAME block tucking its body away —
++ * the thinking/compact fold convention — instead of a new row appearing.
++ *
++ * The line is clickable and brightens on hover (Ctrl+O expands every group at
++ * once). Failures stay LOUD while folded: failed/cancelled workers paint in
++ * the error color, because folding must never bury a subagent that died.
++ */
++export function SubagentGroupHeader({ group, onToggle }: {
++  group: SubagentGroupRow
++  onToggle?(): void
++}): React.ReactNode {
++  const minimalUi = isMinimalUiMode()
++  const [hovered, setHovered] = React.useState(false)
++  // Only a LIVE group ticks: a settled run's duration is frozen, so it must
++  // not keep re-rendering the row.
++  const [tickRef] = useAnimationFrame(group.live > 0 ? 1000 : null)
++  const clickable = onToggle !== undefined
++  const endedAt = group.endedAt ?? Date.now()
++  const duration = formatDuration(Math.max(0, endedAt - group.startedAt))
++  const chipColor = (color: Chip['color']): Chip['color'] => minimalUi ? undefined : color
++
++  const chips: Chip[] = []
++  if (group.live > 0) chips.push({ key: 'live', text: t('subagents-group-live', { count: group.live }), color: chipColor('warning') })
++  if (group.failed > 0) chips.push({ key: 'failed', text: t('subagents-group-failed', { count: group.failed }), color: chipColor('error') })
++  if (group.folded && group.live === 0 && group.failed === 0) {
++    // Folded and clean: "全部完成" says more than "6 已完成" — the group is
++    // the unit being reported on now.
++    chips.push({ key: 'all', text: t('subagents-group-all-completed'), color: chipColor('success') })
++  } else if (group.completed > 0) {
++    chips.push({ key: 'completed', text: t('subagents-group-completed', { count: group.completed }), color: undefined })
++  }
++
++  // The mouse affordance: a folded line always teaches the way back in; an
++  // open group only says it while hovered (its ▾ already carries the hint).
++  const hint = group.folded
++    ? t('subagents-group-hint-expand')
++    : hovered && clickable ? t('subagents-group-hint-fold') : undefined
++
++  return (
++    <Box
++      flexDirection="row"
++      gap={1}
++      ref={tickRef}
++      onClick={clickable ? onToggle : undefined}
++      onMouseEnter={clickable ? (): void => setHovered(true) : undefined}
++      onMouseLeave={clickable ? (): void => setHovered(false) : undefined}
++    >
++      <Text color={hovered && clickable && !minimalUi ? 'accent' : 'inactive'}>
++        {group.folded ? '▸' : '▾'}
++      </Text>
++      <Text
++        wrap="truncate-end"
++        color={hovered && clickable ? 'text' : undefined}
++        dimColor={!(hovered && clickable)}
++      >
++        {group.folded
++          ? t('subagents-group-folded', { count: group.count })
++          : t('subagents-group-title', { count: group.count })}
++      </Text>
++      {chips.map(chip => (
++        <React.Fragment key={chip.key}>
++          <Text color="inactive">·</Text>
++          <Text color={chip.color} dimColor={chip.color === undefined}>{chip.text}</Text>
++        </React.Fragment>
++      ))}
++      <Text color="inactive">·</Text>
++      <Text dimColor>{t('subagents-group-elapsed', { duration })}</Text>
++      {hint !== undefined && (
++        <React.Fragment>
++          <Text color="inactive">·</Text>
++          <Text color={group.folded ? 'inactive' : 'accent'}>{hint}</Text>
++        </React.Fragment>
++      )}
++    </Box>
++  )
++}
+diff --git a/src/components/Chat/SubagentMessage.tsx b/src/components/Chat/SubagentMessage.tsx
+index 75c370b5..43cc0742 100644
+--- a/src/components/Chat/SubagentMessage.tsx
++++ b/src/components/Chat/SubagentMessage.tsx
+@@ -80,8 +80,10 @@ export function SubagentMessage({ subagent, marginTopOnTurn, activityFrames, onC
+   const [hovered, setHovered] = React.useState(false)
+   const clickable = onClick !== undefined
+   const elapsed = subagent.completedAt ? subagent.durationMs : Date.now() - subagent.startedAt
+-  const lastRunning = [...subagent.toolCalls].reverse().find(tool => tool.status === 'running')
+-  const previousDone = lastRunning
++  // Settled cards never paint the waterfall or current/previous tool. Avoid
++  // copying the entire call history just to discard that information.
++  const lastRunning = settled ? undefined : [...subagent.toolCalls].reverse().find(tool => tool.status === 'running')
++  const previousDone = settled ? undefined : lastRunning
+     ? subagent.toolCalls[subagent.toolCalls.indexOf(lastRunning) - 1]
+     : subagent.toolCalls[subagent.toolCalls.length - 1]
+   const preset = React.useMemo(() => resolvePreset(activityFrames), [activityFrames])
+diff --git a/src/components/SubagentDetailScene.tsx b/src/components/SubagentDetailScene.tsx
+index 00cf8d74..073f5539 100644
+--- a/src/components/SubagentDetailScene.tsx
++++ b/src/components/SubagentDetailScene.tsx
+@@ -704,7 +704,21 @@ export function SubagentDetailScene({
+                         )
+                       }
+                       if (row.kind === 'thinking') {
+-                        return <ThinkingLeafRow key={`think-${row.key}`} thinking={row.text} marginTopOnTurn={margin} verbose={thinkingOpen} />
++                        // Per-leaf click, same state as tool leaves: a settled
++                        // thinking summary is a silent ellipsis otherwise (the
++                        // global Enter/Ctrl+O toggle is not discoverable from
++                        // the row). `thinkingOpen` still expands every leaf.
++                        const open = thinkingOpen || expandedLeaf === row.key
++                        return (
++                          <ThinkingLeafRow
++                            key={`think-${row.key}`}
++                            thinking={row.text}
++                            marginTopOnTurn={margin}
++                            verbose={open}
++                            isSelected={expandedLeaf === row.key}
++                            onClick={() => setExpandedLeaf(prev => prev === row.key ? null : row.key)}
++                          />
++                        )
+                       }
+                       if (row.kind === 'thinking-unavailable') {
+                         return (
+diff --git a/src/components/messages/AssistantTextMessage.tsx b/src/components/messages/AssistantTextMessage.tsx
+index f156fc06..88d151ea 100644
+--- a/src/components/messages/AssistantTextMessage.tsx
++++ b/src/components/messages/AssistantTextMessage.tsx
+@@ -2,6 +2,7 @@ import React from 'react'
+ import { Box, NoSelect, Text } from '../../ui.js'
+ import { BLACK_CIRCLE } from '../../terminal-utils/figures.js'
+ import { Markdown } from '../Markdown.js'
++import type { ClickEvent } from '../../ink/events/click-event.js'
+ 
+ type Props = {
+   text: string
+@@ -11,6 +12,11 @@ type Props = {
+   isSelected?: boolean
+   /** Row expanded on its own (persistent hover-grey background). */
+   isExpanded?: boolean
++  /** Fold fenced code to one-row digests (settled historical rows). */
++  foldedCode?: boolean
++  expandedCodePaths?: ReadonlySet<string>
++  closedGlobalCodePaths?: ReadonlySet<string>
++  onToggleCodePath?: (path: string, event: ClickEvent) => void
+ }
+ 
+ /**
+@@ -25,6 +31,10 @@ export function AssistantTextMessage({
+   marginTopOnTurn,
+   isSelected = false,
+   isExpanded = false,
++  foldedCode = false,
++  expandedCodePaths,
++  closedGlobalCodePaths,
++  onToggleCodePath,
+ }: Props): React.ReactNode {
+   return (
+     <Box
+@@ -46,7 +56,7 @@ export function AssistantTextMessage({
+           <Text color={isSelected ? 'suggestion' : 'text'}>{BLACK_CIRCLE}</Text>
+         </NoSelect>
+         <Box flexDirection="column">
+-          <Markdown>{text}</Markdown>
++          <Markdown foldedCode={foldedCode} expandedCodePaths={expandedCodePaths} closedGlobalCodePaths={closedGlobalCodePaths} onToggleCodePath={onToggleCodePath}>{text}</Markdown>
+         </Box>
+       </Box>
+     </Box>
+diff --git a/src/components/messages/AssistantThinkingMessage.tsx b/src/components/messages/AssistantThinkingMessage.tsx
+index 4ce37afd..cc6d0cbe 100644
+--- a/src/components/messages/AssistantThinkingMessage.tsx
++++ b/src/components/messages/AssistantThinkingMessage.tsx
+@@ -1,6 +1,6 @@
+ import React from 'react'
+ import chalk from 'chalk'
+-import { Box, Text } from '../../ui.js'
++import { Box, Text, useTerminalSize } from '../../ui.js'
+ import { t } from '../../i18n.js'
+ import { StreamingMarkdown } from '../StreamingMarkdown.js'
+ import { formatDuration, formatTokens } from '../../terminal-utils/format.js'
+@@ -14,6 +14,8 @@ import { interpolateColor } from '../Spinner/spinnerUtils.js'
+ import { isMinimalUiMode } from '../../minimalUiMode.js'
+ import type { ClickEvent } from '../../ink/events/click-event.js'
+ import { primaryComboString } from '../../utils/keymap.js'
++import { fitThinkingRow, settledThinkingHead } from './settledThinkingSummary.js'
++import { thinkingTickerTail } from './thinkingTicker.js'
+ 
+ /** Preview body rows — a FIXED row count (kimicode-style constant-height
+  *  ticker). Ink's truncate slices the whole string across newlines as one
+@@ -55,12 +57,12 @@ type Props = {
+ }
+ 
+ /**
+- * Thinking block: settled rows fold to `⚓ Thinking` plus the localized
+- * ctrl+o expand hint (hint-expand-ctrl-o);
+- * streaming rows switch between a three-line preview and the full reasoning
+- * text on click. The live leading mark is a rotating braille spinner
+- * (`⠋⠙⠹…`, Kimi Code style), settling back to the static anchor (`⚓`). When
+- * the channel records the reasoning duration, the label carries it
++ * Thinking block: settled rows fold to a bounded, sanitized first-nonblank-line
++ * preview with localized expansion hints; streaming rows switch between a
++ * three-line preview and the full reasoning text on click. The live leading
++ * mark is a rotating braille spinner (`⠋⠙⠹…`, Kimi Code style), settling
++ * back to the static anchor (`⚓`). When the channel records the reasoning
++ * duration, the label carries it
+  * (`⚓ Thinking · 12s …`) — dsh-tui's take on making thinking time visible in
+  * the transcript.
+  */
+@@ -142,9 +144,7 @@ export function AssistantThinkingMessage({
+     // from the start (leading ellipsis) so the newest tokens — which grow
+     // at the line's end — stay visible while the line is longer than the
+     // width.
+-    const lines = tickerText.split('\n')
+-    const visible = lines.slice(-PREVIEW_ROWS)
+-    const clipped = lines.length > visible.length
++    const { lines: visible, clipped } = thinkingTickerTail(tickerText, PREVIEW_ROWS)
+     // Pad with single spaces — an empty-string Text renders with zero
+     // height in ink, so '' padding would not hold the row open.
+     const rows = Array.from(
+@@ -197,7 +197,15 @@ export function AssistantThinkingMessage({
+         onClick={onClick}
+         {...hoverProps}
+       >
+-        {header}
++        {streaming ? header : (
++          <SettledThinkingHeader
++            thinking={thinking}
++            label={`${t('thinking-label')}${duration}`}
++            marker={minimalUi ? '*' : THINKING_SETTLED_MARKER}
++            hovered={hovered}
++            clickable={onClick !== undefined}
++          />
++        )}
+       </Box>
+     )
+   }
+@@ -223,6 +231,38 @@ export function AssistantThinkingMessage({
+   )
+ }
+ 
++/** Mounted only for settled, folded text, never for a live preview. */
++function SettledThinkingHeader({ thinking, label, marker, hovered, clickable }: {
++  thinking: string
++  label: string
++  marker: string
++  hovered: boolean
++  clickable: boolean
++}): React.ReactNode {
++  const { columns } = useTerminalSize()
++  const preview = React.useMemo(() => settledThinkingHead(thinking), [thinking])
++  const key = primaryComboString('transcript')
++  // Configurable bindings can currently contain control characters. Omit an
++  // unsafe hint instead of emitting control sequences or inventing a binding.
++  const safeKey = key.length > 0 && key.length <= 128 && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/u.test(key)
++  const row = fitThinkingRow({
++    marker,
++    label,
++    preview,
++    ctrlHint: safeKey ? t('hint-expand-ctrl-o', { key }) : '',
++    clickHint: clickable ? t('code-fence-folded-expand') : '',
++    // Chat's timeline/scrollbar gutter can occupy two cells. Context already
++    // accounts for page margins and side panels; this reserve is conservative
++    // when the gutter is hidden or bleeds into a page margin.
++    width: Math.max(0, columns - 2),
++  })
++  return (
++    <Box height={1} overflow="hidden">
++      <Text italic dimColor={!hovered} color={hovered ? 'text' : undefined}>{row}</Text>
++    </Box>
++  )
++}
++
+ /**
+  * Count-only thinking: the backend streams an
+  * estimated token count but no thinking text. One header line in the same
+diff --git a/src/components/messages/AssistantToolUseMessage.tsx b/src/components/messages/AssistantToolUseMessage.tsx
+index 1ba2b8bc..0c4f8314 100644
+--- a/src/components/messages/AssistantToolUseMessage.tsx
++++ b/src/components/messages/AssistantToolUseMessage.tsx
+@@ -90,6 +90,10 @@ type Props = {
+    *  (`tool.liveOutput`: 8 instead of 5; the whole retained tail when
+    *  verbose/expanded). */
+   fullscreen?: boolean
++  /** Collapsed body budget for a restored history row (1): the card reads as
++   *  a digest and the row click expands it. Undefined keeps the live card's
++   *  three-line (text) / eight-line (diff) budget. */
++  digestLines?: number
+ }
+ 
+ /** Tool display names localize through the `tool-name-*` dictionary family
+@@ -420,7 +424,7 @@ function foldHintParts(hiddenLines: number, hiddenChars: number): string {
+  *  A lines-only fold keeps the historical shared hint (lines-folded-expand)
+  *  byte-identical; a fold that also (or only) clipped CHARACTERS inside long
+  *  lines uses the combined indicator so the hidden volume stays honest. */
+-function capLines(lines: BodyLine[], max: number, verbose: boolean, hiddenChars: number): BodyLine[] {
++function capLines(lines: BodyLine[], max: number, verbose: boolean, hiddenChars: number, click = false): BodyLine[] {
+   if (verbose || lines.length <= max) return lines
+   if (lines.length - max === 1) return lines
+   const hiddenLines = lines.length - max
+@@ -429,9 +433,13 @@ function capLines(lines: BodyLine[], max: number, verbose: boolean, hiddenChars:
+   // clipped characters of the sliced-away rows included — so "how much is
+   // hidden" answers in one place. A lines-only fold keeps the historical
+   // shared hint byte-identical.
++  // A digest row (restored history) is itself the click target, so its hint
++  // names the click as well as the keyboard path.
++  const linesKey = click ? 'lines-folded-expand-click' : 'lines-folded-expand'
++  const charsKey = click ? 'tool-card-lines-hidden-click' : 'tool-card-lines-hidden'
+   const hint = hiddenChars > 0
+-    ? { ...dim(t('tool-card-lines-hidden', { parts: foldHintParts(hiddenLines, hiddenChars), key: primaryComboString('transcript') })), revealOnHover: true }
+-    : { ...dim(t('lines-folded-expand', { n: hiddenLines, key: primaryComboString('transcript') })), revealOnHover: true }
++    ? { ...dim(t(charsKey, { parts: foldHintParts(hiddenLines, hiddenChars), key: primaryComboString('transcript') })), revealOnHover: true }
++    : { ...dim(t(linesKey, { n: hiddenLines, key: primaryComboString('transcript') })), revealOnHover: true }
+   return [...lines.slice(0, max), hint]
+ }
+ 
+@@ -549,10 +557,15 @@ function toolCardMetaTooltip(tool: ToolRow, isRunning: boolean, isError: boolean
+   return parts.join(' · ')
+ }
+ 
+-function HeaderTitle({ name, title, isTerminal, folded, displayArgs, argsLanguage, nameColor, filePath, onOpenFile, metaTooltip, headerTextBudget }: {
++function HeaderTitle({ name, title, isTerminal, folded, full, displayArgs, argsLanguage, nameColor, filePath, onOpenFile, metaTooltip, headerTextBudget }: {
+   name: string
+   title: string | undefined
+   isTerminal: boolean
++  /** Row is expanded (verbose): the non-terminal one-line title WRAPS
++   *  instead of truncate-end, so a header cut by layout width shows its
++   *  whole text — and the click that expands it is the only affordance,
++   *  since that cut carries no visible marker. */
++  full: boolean
+   /** Terminal-card fold result (multi-line title, folding on, not verbose). */
+   folded: FoldedTitle | undefined
+   displayArgs: string
+@@ -608,11 +621,17 @@ function HeaderTitle({ name, title, isTerminal, folded, displayArgs, argsLanguag
+           <Text bold color={nameColor} wrap="truncate-end">{name}</Text>
+         </Box>
+         {displayArgs !== '' && (
+-          <Box flexWrap="nowrap" {...headerTooltip}>
+-            <Text>(</Text>
+-            <SyntaxText text={clipHeaderArgs(displayArgs)} sourceText={displayArgs} language={argsLanguage} />
+-            <Text>)</Text>
+-          </Box>
++          full ? (
++            <Box flexShrink={1}>
++              <Text dimColor wrap="wrap">{`(${displayArgs})`}</Text>
++            </Box>
++          ) : (
++            <Box flexWrap="nowrap" {...headerTooltip}>
++              <Text>(</Text>
++              <SyntaxText text={clipHeaderArgs(displayArgs)} sourceText={displayArgs} language={argsLanguage} />
++              <Text>)</Text>
++            </Box>
++          )
+         )}
+       </>
+     )
+@@ -651,10 +670,33 @@ function HeaderTitle({ name, title, isTerminal, folded, displayArgs, argsLanguag
+   // clickable. The click stops propagation so the row's fold toggle does
+   // not fire. indexOf keeps the split exact even for paths with regex
+   // metacharacters.
+-  if (onOpenFile !== undefined && filePath !== undefined && filePath !== '' && trimmed.includes(filePath)) {
++  // A title cut by layout width is the one header state with no visible
++  // affordance of its own: the whole point of this card is that a click
++  // reveals what the `…` hid. So a truncated title's path segment must NOT
++  // swallow the click into the file menu (the body's `path` rows still open
++  // the file); only a fully visible title keeps the old path click.
++  const widthCut = !isTerminal && stringWidth(trimmed) > headerTextBudget
++  if (onOpenFile !== undefined && filePath !== undefined && filePath !== '' && trimmed.includes(filePath)
++    && !widthCut) {
+     const at = trimmed.indexOf(filePath)
+     const before = trimmed.slice(0, at)
+     const after = trimmed.slice(at + filePath.length)
++    if (full) {
++      // Expanded: stack the segments instead of sharing one row, so the long
++      // path wraps on its own lines. A row cannot do this — `after`
++      // (`(1 - 100)`) would float beside the wrapped path box. The path is
++      // deliberately NOT clickable here: the whole card is one fold toggle
++      // while expanded, and a click on the only line that revealed the
++      // hidden tail must collapse it again, not open a file menu. File
++      // opening stays one collapse-click away (and in the body's path lines).
++      return (
++        <Box flexDirection="column" flexShrink={1} {...headerTooltip}>
++          {before.trim() !== '' && <Text bold color={nameColor}>{before.trimEnd()}</Text>}
++          <Text underline wrap="wrap">{filePath}</Text>
++          {after.trim() !== '' && <Text color="text" wrap="wrap">{after.trimStart()}</Text>}
++        </Box>
++      )
++    }
+     return (
+       <Box flexWrap="nowrap" {...headerTooltip}>
+         <Text bold color={nameColor} wrap="truncate-end">{before}</Text>
+@@ -681,8 +723,8 @@ function HeaderTitle({ name, title, isTerminal, folded, displayArgs, argsLanguag
+   const head = cut === -1 ? trimmed : trimmed.slice(0, cut)
+   const tail = cut === -1 ? '' : trimmed.slice(cut)
+   return (
+-    <Box flexWrap="nowrap" {...headerTooltip}>
+-      <Text bold color={nameColor} wrap="truncate-end">
++    <Box flexWrap="nowrap" flexShrink={full ? 1 : undefined} {...headerTooltip}>
++      <Text bold color={nameColor} wrap={full ? 'wrap' : 'truncate-end'}>
+         {head}
+         <Text bold={false} color="text">{tail}</Text>
+       </Text>
+@@ -713,6 +755,7 @@ export function AssistantToolUseMessage({
+   revealVersion,
+   sourceFolded = false,
+   fullscreen = false,
++  digestLines,
+ }: Props): React.ReactNode {
+   // MessageList owns the single production subscription and passes a version
+   // prop only to active reveal rows. Standalone consumers keep the fallback
+@@ -849,7 +892,9 @@ export function AssistantToolUseMessage({
+       body = [dim(t('tool-running-elapsed', { duration: formatDuration(Math.max(0, Date.now() - (tool.startedAt ?? Date.now()))) }))]
+     }
+   }
+-  const cap = view?.card === 'diff' ? DIFF_BODY_MAX_LINES : TEXT_BODY_MAX_LINES
++  // Restored history rows read as a one-line digest (the whole block below is
++  // mounted at once during a chunk reveal); a click shows the full body.
++  const cap = digestLines ?? (view?.card === 'diff' ? DIFF_BODY_MAX_LINES : TEXT_BODY_MAX_LINES)
+   // 展开态（点击/verbose）的 SendMessage 卡不截断——raw 层就是「全量」。
+   const bodyUncapped = verbose || sendMessageRawOpen
+   // Long-line clip before anything downstream reads the body: the syntax
+@@ -859,7 +904,7 @@ export function AssistantToolUseMessage({
+   const bodyLines = foldedBody.lines
+   const bodySource = bodyLines.map(line => line.text).join('\n')
+   const argsLanguage = jsonArgsLanguage(displayArgs)
+-  const capped = capLines(bodyLines, cap, bodyUncapped, foldedBody.hiddenChars)
++  const capped = capLines(bodyLines, cap, bodyUncapped, foldedBody.hiddenChars, digestLines !== undefined)
+   // Verbose bodies walk a bounded window (see VERBOSE_BODY_WINDOW): the tail
+   // stays in the retained source, and the card says what it is showing.
+   const lines = verbose && capped.length > VERBOSE_BODY_WINDOW
+@@ -979,7 +1024,7 @@ export function AssistantToolUseMessage({
+             isError={isError}
+             toolName={tool.name}
+           />
+-          <HeaderTitle name={name} title={headerTitle} isTerminal={headerIsTerminal} folded={foldedHeader} displayArgs={displayArgs} argsLanguage={argsLanguage} nameColor={toolNameColor(tool.name, view?.category ?? tool.callView?.category)} filePath={filePath} onOpenFile={onOpenFile} metaTooltip={() => toolCardMetaTooltip(tool, isRunning, isError)} headerTextBudget={headerTextBudget} />
++          <HeaderTitle name={name} title={headerTitle} isTerminal={headerIsTerminal} folded={foldedHeader} full={verbose} displayArgs={displayArgs} argsLanguage={argsLanguage} nameColor={toolNameColor(tool.name, view?.category ?? tool.callView?.category)} filePath={filePath} onOpenFile={onOpenFile} metaTooltip={() => toolCardMetaTooltip(tool, isRunning, isError)} headerTextBudget={headerTextBudget} />
+           {!isRunning && (
+             <Box flexWrap="nowrap">
+               <Text dimColor={!hovered}>{elapsedText}</Text>
+diff --git a/src/components/messages/TranscriptLeaves.tsx b/src/components/messages/TranscriptLeaves.tsx
+index c9308154..15e59f43 100644
+--- a/src/components/messages/TranscriptLeaves.tsx
++++ b/src/components/messages/TranscriptLeaves.tsx
+@@ -158,6 +158,7 @@ export function ToolLeafRow({
+   suppressImageGraphics,
+   sourceFolded,
+   fullscreen,
++  digestLines,
+ }: {
+   tool: ToolRow
+   marginTopOnTurn: boolean
+@@ -180,6 +181,8 @@ export function ToolLeafRow({
+   sourceFolded?: boolean
+   /** Fullscreen layout (more live output lines on a running card). */
+   fullscreen?: boolean
++  /** Restored history row: the collapsed body reads as one line. */
++  digestLines?: number
+ }): React.ReactNode {
+   return (
+     <>
+@@ -200,6 +203,7 @@ export function ToolLeafRow({
+         onOpenFile={onOpenFile}
+         sourceFolded={sourceFolded}
+         fullscreen={fullscreen}
++        digestLines={digestLines}
+       />
+       {images !== undefined && <TranscriptImages images={images} indent={4} onPreview={onPreviewImage} suppressGraphics={suppressImageGraphics} />}
+     </>
+@@ -212,11 +216,19 @@ export function AssistantTextLeafRow({
+   marginTopOnTurn,
+   isSelected = false,
+   isExpanded = false,
++  foldedCode = false,
++  expandedCodePaths,
++  closedGlobalCodePaths,
++  onToggleCodePath,
+ }: {
+   text: string
+   marginTopOnTurn: boolean
+   isSelected?: boolean
+   isExpanded?: boolean
++  foldedCode?: boolean
++  expandedCodePaths?: ReadonlySet<string>
++  closedGlobalCodePaths?: ReadonlySet<string>
++  onToggleCodePath?: (path: string, event: ClickEvent) => void
+ }): React.ReactNode {
+   return (
+     <AssistantTextMessage
+@@ -224,6 +236,10 @@ export function AssistantTextLeafRow({
+       marginTopOnTurn={marginTopOnTurn}
+       isSelected={isSelected}
+       isExpanded={isExpanded}
++      foldedCode={foldedCode}
++      expandedCodePaths={expandedCodePaths}
++      closedGlobalCodePaths={closedGlobalCodePaths}
++      onToggleCodePath={onToggleCodePath}
+     />
+   )
+ }
+diff --git a/src/components/messages/settledThinkingSummary.ts b/src/components/messages/settledThinkingSummary.ts
+new file mode 100644
+index 00000000..d5eb5d70
+--- /dev/null
++++ b/src/components/messages/settledThinkingSummary.ts
+@@ -0,0 +1,148 @@
++import { getGraphemeSegmenter } from '../../utils/intl.js'
++import { stringWidth } from '../../ink/stringWidth.js'
++
++// Bounded independently of the source size, including pathological clusters
++// and unterminated terminal strings. The preview copies, never slices, input.
++const RAW_LIMIT = 4096
++const CLEAN_LIMIT = 512
++const OUTPUT_LIMIT = 160
++
++/** Return the sanitized beginning of the first nonblank line, plus an ellipsis. */
++export function settledThinkingHead(input: string): string {
++  let state: 'ground' | 'string' | 'csi' | 'escape' | 'escape-intermediate' = 'ground'
++  let osc = false
++  let stringEscape = false
++  let pos = 0
++  let clean = ''
++  let pendingSpace = false
++  let cut = false
++  let lineEnded = false
++
++  while (pos < input.length && pos < RAW_LIMIT) {
++    const n = input.charCodeAt(pos++)
++    if (state === 'string') {
++      if (n === 0x9c || (stringEscape && n === 0x5c) || (osc && n === 0x07)) {
++        state = 'ground'
++        stringEscape = false
++      } else {
++        stringEscape = n === 0x1b
++      }
++      continue
++    }
++    if (state === 'csi') {
++      // CR/LF are executable C0 controls even inside a CSI.
++      if (n === 0x0a || n === 0x0d) { state = 'ground'; lineEnded = true; break }
++      if (n >= 0x40 && n <= 0x7e) state = 'ground'
++      else if (!((n >= 0x20 && n <= 0x3f) || (n < 0x20 && n !== 0x1b))) break
++      continue
++    }
++    if (state === 'escape') {
++      if (n === 0x5b) state = 'csi'
++      else if (n === 0x5d || n === 0x50 || n === 0x58 || n === 0x5e || n === 0x5f) {
++        state = 'string'
++        osc = n === 0x5d
++        stringEscape = false
++      } else if (n >= 0x20 && n <= 0x2f) state = 'escape-intermediate'
++      else if (n >= 0x30 && n <= 0x7e) state = 'ground'
++      else break
++      continue
++    }
++    if (state === 'escape-intermediate') {
++      if (n >= 0x30 && n <= 0x7e) state = 'ground'
++      else if (!(n >= 0x20 && n <= 0x2f)) break
++      continue
++    }
++    if (n === 0x1b) { state = 'escape'; continue }
++    if (n === 0x9b) { state = 'csi'; continue }
++    if (n === 0x90 || n === 0x98 || n === 0x9d || n === 0x9e || n === 0x9f) {
++      state = 'string'
++      osc = n === 0x9d
++      stringEscape = false
++      continue
++    }
++    // Skip blank leading body lines; never cross a line after content begins.
++    // Newlines inside OSC/DCS were already consumed as string payload.
++    if (n === 0x0a || n === 0x0d || n === 0x2028 || n === 0x2029) {
++      if (clean !== '') { lineEnded = true; break }
++      continue
++    }
++    if (n === 0x20 || n === 0x09 || (n > 0x9f && String.fromCharCode(n).trim() === '')) {
++      if (clean) pendingSpace = true
++      continue
++    }
++    if (n < 0x20 || (n >= 0x7f && n <= 0x9f)) continue
++    let out: string
++    if (n >= 0xd800 && n <= 0xdbff) {
++      const next = pos < input.length && pos < RAW_LIMIT ? input.charCodeAt(pos) : -1
++      if (next >= 0xdc00 && next <= 0xdfff) { out = String.fromCharCode(n, next); pos++ }
++      else { out = '\ufffd'; if (pos < input.length && pos >= RAW_LIMIT) cut = true }
++    } else if (n >= 0xdc00 && n <= 0xdfff) out = '\ufffd'
++    else out = String.fromCharCode(n)
++    if (clean.length + (pendingSpace ? 1 : 0) + out.length > CLEAN_LIMIT) { cut = true; break }
++    if (pendingSpace) { clean += ' '; pendingSpace = false }
++    clean += out
++  }
++  if ((!lineEnded && pos < input.length) || state !== 'ground') cut = true
++  // A budget cut or incomplete sequence may hide a continuation of the final
++  // grapheme. Drop it rather than splitting a combining/ZWJ/flag sequence.
++  const parts = [...getGraphemeSegmenter().segment(clean)]
++  if (cut) parts.pop()
++  let head = ''
++  for (const { segment } of parts) {
++    if (head.length + segment.length > OUTPUT_LIMIT) break
++    head += segment
++  }
++  return `${head.trimEnd()}…`
++}
++
++function clip(value: string, limit: number): { output: string; used: number; clipped: boolean } {
++  let output = ''
++  let used = 0
++  let clipped = false
++  for (const { segment } of getGraphemeSegmenter().segment(value)) {
++    const width = stringWidth(segment)
++    if (used + width > limit) { clipped = true; break }
++    output += segment
++    used += width
++  }
++  return { output, used, clipped }
++}
++
++/** Fit a pre-sanitized one-line digest, preserving complete graphemes.
++ * Marker and whole hints take priority over the label and preview. */
++export function fitThinkingRow({ marker, label, preview, ctrlHint, clickHint, width }: {
++  marker: string
++  label: string
++  preview: string
++  ctrlHint: string
++  clickHint: string
++  width: number
++}): string {
++  for (const value of [marker, label, preview, ctrlHint, clickHint]) {
++    if (/[\r\n\u2028\u2029\x00-\x1f\x7f-\x9f]/u.test(value)) throw new Error('thinking row must be single-line and control-free')
++  }
++  const budget = Math.max(0, Math.floor(width))
++  const mark = clip(marker, budget)
++  const ctrl = ctrlHint ? ` ${ctrlHint}` : ''
++  const click = clickHint ? ` ${clickHint}` : ''
++  let room = budget - mark.used
++  const ctrlWidth = stringWidth(ctrl)
++  const clickWidth = stringWidth(click)
++  const selectedCtrl = ctrl && ctrlWidth <= room ? ctrl : ''
++  if (selectedCtrl) room -= ctrlWidth
++  const selectedClick = click && clickWidth <= room ? click : ''
++  if (selectedClick) room -= clickWidth
++  const fittedLabel = clip(label ? ` ${label}` : '', room)
++  room -= fittedLabel.used
++  let body = ''
++  if (preview && room > 1) {
++    const full = ` ${preview}`
++    const fitted = clip(full, room)
++    if (!fitted.clipped) body = full
++    else {
++      const prefix = clip(` ${preview.endsWith('…') ? preview.slice(0, -1) : preview}`, room - 1)
++      body = (prefix.output.trimEnd() || ' ') + '…'
++    }
++  }
++  return mark.output + fittedLabel.output.trimEnd() + body + selectedCtrl + selectedClick
++}
+diff --git a/src/components/messages/thinkingTicker.ts b/src/components/messages/thinkingTicker.ts
+new file mode 100644
+index 00000000..fbaf81ef
+--- /dev/null
++++ b/src/components/messages/thinkingTicker.ts
+@@ -0,0 +1,13 @@
++/** Return the final lines used by the live thinking ticker without splitting
++ *  or allocating an array for every earlier line. `count` must be a positive integer. */
++export function thinkingTickerTail(text: string, count: number): { lines: string[]; clipped: boolean } {
++  const lines: string[] = []
++  let end = text.length
++  while (lines.length < count) {
++    const separator = end > 0 ? text.lastIndexOf('\n', end - 1) : -1
++    lines.push(text.slice(separator + 1, end))
++    if (separator < 0) return { lines: lines.reverse(), clipped: false }
++    end = separator
++  }
++  return { lines: lines.reverse(), clipped: true }
++}

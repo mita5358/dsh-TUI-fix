@@ -1,0 +1,461 @@
+From ab7fa0d31be9417c0a3e468789faaae73167f52f Mon Sep 17 00:00:00 2001
+From: mita5358 <kafitcohr@outlook.com>
+Date: Fri, 30 Oct 2026 23:07:22 +0800
+Subject: [PATCH 05/20] fix(dsh): reveal one chunk when the rail jumps to a
+ folded turn
+
+A tick on a turn older than the open fold forced showAllMessages and a
+full-history relayout, so on a titan record the click froze the TUI. The
+click now asks the extension for the chunk that owns the placeholder row,
+projects only that chunk over its placeholders, and seeks the projected
+twin by event seq (placeholder ids do not survive materialisation).
+---
+ package.json                              |   1 +
+ scripts/run-verify-build.mjs              |   1 +
+ scripts/verify-history-chunks.ts          | 179 ++++++++++++++++++++++
+ src/adapter/channel/ui-policy.ts          |   1 +
+ src/adapter/ports/channel-ui.ts           |   8 +
+ src/dsh-adapter/backend/history-chunks.ts |  40 ++++-
+ src/dsh-adapter/channel/core/compose.ts   |   8 +
+ src/dsh-adapter/channel/extensions.ts     |  58 +++++--
+ src/screens/Chat.tsx                      |   6 +-
+ 9 files changed, 289 insertions(+), 13 deletions(-)
+ create mode 100644 scripts/verify-history-chunks.ts
+
+diff --git a/package.json b/package.json
+index ceb55fa0..bdeb075d 100644
+--- a/package.json
++++ b/package.json
+@@ -280,6 +280,7 @@
+     "verify:plugin-catalog-extraction": "node --import tsx/esm scripts/verify-plugin-catalog-extraction.ts",
+     "verify:channel-composition": "node --import tsx/esm scripts/verify-channel-composition.ts",
+     "verify:channel-trace-read": "node --import tsx/esm scripts/verify-channel-trace-read.ts",
++    "verify:history-chunks": "node --import tsx/esm scripts/verify-history-chunks.ts",
+     "verify:activity-store": "node --import tsx/esm scripts/verify-activity-store.ts",
+     "verify:activity-store-render": "node --import tsx/esm scripts/verify-activity-store-render.tsx",
+     "verify:status-fields": "node --import tsx/esm scripts/verify-status-fields.tsx",
+diff --git a/scripts/run-verify-build.mjs b/scripts/run-verify-build.mjs
+index bd0d2c9d..e1803d1b 100644
+--- a/scripts/run-verify-build.mjs
++++ b/scripts/run-verify-build.mjs
+@@ -114,6 +114,7 @@ const GATES = [
+   'verify:plugin-catalog-extraction',
+   'verify:session-reset',
+   'verify:channel-ui',
++  'verify:history-chunks',
+   'verify:adapter-detection',
+   'verify:adapter-replay-harness',
+   'verify:adapter-channel-conformance',
+diff --git a/scripts/verify-history-chunks.ts b/scripts/verify-history-chunks.ts
+new file mode 100644
+index 00000000..08f0d83d
+--- /dev/null
++++ b/scripts/verify-history-chunks.ts
+@@ -0,0 +1,179 @@
++/**
++ * Chunked history: the cut plan, the collapsed placeholder rows, and the
++ * placeholder → projected-row mapping a rail reveal depends on
++ * (`ChannelUi.revealRow`, implemented by the DSH extension's `revealChunkRow`).
++ *
++ * The regression this guards: a timeline tick on a turn inside a collapsed
++ * chunk used to expand the WHOLE record (`showAllMessages`, a 27,907-row
++ * relayout, 5.6 GB RSS before the process was killed). A reveal must project
++ * only the owning chunk, and must land on the turn's real row — placeholder
++ * ids are positional and do not survive materialization, so the mapping is the
++ * subtle part.
++ */
++import assert from 'node:assert/strict'
++import { readFileSync } from 'node:fs'
++import type { AgentEvent } from '../src/agent/events.js'
++import {
++  CHUNK_ROUNDS,
++  OPEN_ROUNDS,
++  chunkForRow,
++  placeholderEvent,
++  placeholderRows,
++  planChunks,
++  promptsTurnRow,
++  type HistoryChunk,
++} from '../src/dsh-adapter/backend/history-chunks.js'
++import { projectHistorySlice } from '../src/channel/history-restore.js'
++
++const digest = (chunk: HistoryChunk): string => `⏸ rounds ${chunk.fromRound}–${chunk.toRound}`
++
++const prompt = (seq: number, text: string, source: 'user' | 'team-message' = 'user'): AgentEvent => ({
++  type: 'user.message',
++  id: `m${seq}`,
++  anchor: String(seq),
++  seq,
++  time: seq,
++  source,
++  text,
++  blocks: [],
++})
++const answer = (seq: number, text: string): AgentEvent => ({
++  type: 'assistant.message',
++  seq,
++  anchor: String(seq),
++  attemptId: `a${seq}`,
++  time: seq,
++  blocks: [{ type: 'text', text }],
++  canonical: true,
++})
++const toolCall = (seq: number, turn: number, step: number): AgentEvent => ({
++  type: 'tool.call',
++  seq,
++  turn,
++  step,
++  callId: `c${seq}`,
++  name: 'read_file',
++  argsJson: '{"path":"src/index.ts"}',
++  time: seq,
++})
++
++// ── the cut plan ──────────────────────────────────────────────────────────
++assert.deepEqual(planChunks([]), [], 'an empty record plans no chunk')
++
++const noPrompt: AgentEvent[] = [toolCall(0, 1, 1), toolCall(1, 1, 1)]
++const lone = planChunks(noPrompt)
++assert.equal(lone.length, 1, 'a record with no user message is one chunk')
++assert.deepEqual([lone[0]!.start, lone[0]!.end, lone[0]!.rounds], [0, 2, 0])
++
++// 120 rounds with invisible user messages mixed in: every user message opens a
++// round, but only prompts and team messages paint a placeholder row.
++const entries: AgentEvent[] = []
++const prompts: AgentEvent[] = []
++let seq = 0
++for (let round = 0; round < 120; round += 1) {
++  const text = `round ${round} ${'x'.repeat(80)}`
++  const event = prompt(seq, text, round % 10 === 3 ? 'team-message' : 'user')
++  entries.push(event)
++  prompts.push(event)
++  seq += 1
++  entries.push(answer(seq, `answer ${round} ${'y'.repeat(80)}`))
++  seq += 1
++  // A goal continuation starts a round (so a long goal run still cuts) but is
++  // represented by the digest line alone.
++  entries.push(prompt(seq, '', 'injected'))
++  seq += 1
++}
++
++const chunks = planChunks(entries)
++assert.ok(chunks.length >= 2, 'a long record is cut into several chunks')
++for (let index = 0; index < chunks.length; index += 1) {
++  const chunk = chunks[index]!
++  assert.equal(chunk.index, index, 'chunk indices are conversation-ordered')
++  assert.equal(chunk.start, index === 0 ? 0 : chunks[index - 1]!.end, 'chunks cover the record contiguously')
++  assert.equal(entries[chunk.start]!.type, 'user.message', 'a chunk starts at a round')
++  assert.ok(chunk.idBase < 0, 'chunk ids sit below every live row')
++  assert.equal(chunk.idBase, -(chunks.length - index) * 1_000_000, 'one id stride per chunk, ordered by index')
++  assert.ok(chunk.rounds >= 1 && chunk.rounds <= CHUNK_ROUNDS, 'older chunks stay inside the older budget')
++}
++assert.equal(chunks.at(-1)!.end, entries.length, 'the newest chunk closes the record')
++assert.ok(chunks.at(-1)!.rounds <= OPEN_ROUNDS, 'the newest chunk is the small open budget')
++// Deterministic for this record: 240 rounds (a prompt and a goal continuation
++// each open one) cut as newest 10, then 50 + 50 + 50 + 50, then the oldest 30.
++assert.equal(chunks.length, 6, '240 rounds cut at the older budget make six chunks')
++
++// ── collapsed rows ────────────────────────────────────────────────────────
++for (const chunk of chunks) {
++  const rows = placeholderRows(chunk, entries, digest)
++  assert.equal(rows[0]!.id, chunk.idBase, 'the digest line owns idBase')
++  assert.equal(rows[0]!.kind, 'notice', 'a collapsed chunk is text only')
++  assert.equal(rows[0]!.text, digest(chunk), 'the digest line names its rounds')
++  let expected = 0
++  for (let index = chunk.start; index < chunk.end; index += 1) if (promptsTurnRow(entries[index]!)) expected += 1
++  assert.equal(rows.length, expected + 1, 'one placeholder prompt row per prompt event')
++  for (let index = 0; index < rows.length; index += 1) {
++    assert.equal(rows[index]!.id, chunk.idBase + index, 'placeholder ids are positional')
++    assert.equal(rows[index]!.seq, undefined, 'a placeholder carries no seq (no rewind anchor)')
++  }
++}
++
++// ── which chunk owns a row ────────────────────────────────────────────────
++for (const chunk of chunks) {
++  assert.equal(chunkForRow(chunks, chunk.idBase), chunk, 'a chunk owns its digest line')
++  assert.equal(chunkForRow(chunks, chunk.idBase + 1), chunk, 'and its prompt rows')
++  assert.equal(chunkForRow(chunks, chunk.idBase + 999_999), chunk, 'up to its whole id stride')
++}
++assert.equal(chunkForRow(chunks, 0), undefined, 'live rows belong to no chunk')
++assert.equal(chunkForRow(chunks, 27_907), undefined, 'live row ids are never in a chunk range')
++
++// ── placeholder → event → projected row ───────────────────────────────────
++const oldest = chunks[0]!
++assert.equal(placeholderEvent(oldest, entries, oldest.idBase), undefined, 'the digest line stands for no event')
++
++// A long prompt is capped on the placeholder and restored in full after load:
++// that is the point of the reveal (a text-capped digest line is not content).
++const longEntryIndex = oldest.end - 1
++const longText = 'z'.repeat(5_000)
++entries[longEntryIndex] = prompt(entries[longEntryIndex]!.seq, longText)
++const rowsAfter = placeholderRows(oldest, entries, digest)
++const longRow = rowsAfter.at(-1)!
++assert.ok(longRow.text.length <= 601, 'a placeholder prompt line is capped')
++
++const projected = projectHistorySlice(entries.slice(oldest.start, oldest.end), 'preview')
++const projectedIds = projected.map((row, index) => ({ row, id: oldest.idBase + 1 + index }))
++for (let index = 1; index < rowsAfter.length; index += 1) {
++  const rowId = rowsAfter[index]!.id
++  const event = placeholderEvent(oldest, entries, rowId)
++  assert.ok(event !== undefined, 'every placeholder prompt row stands for an event')
++  assert.equal(promptsTurnRow(event), true, 'and that event is a prompt-row event')
++  const twin = projectedIds.find(entry => entry.row.seq === event.seq)
++  assert.ok(twin !== undefined, `placeholder ${rowId} maps onto a projected row`)
++  assert.equal(twin.row.kind, 'user', 'the twin is a prompt row')
++  assert.ok(twin.id >= oldest.idBase + 1 && twin.id < oldest.idBase + 1_000_000, 'the twin stays inside the chunk id stride')
++}
++const longEvent = placeholderEvent(oldest, entries, rowsAfter.at(-1)!.id)!
++assert.equal(longEvent.text.length, 5_000, 'the reveal resolves the untruncated event')
++assert.equal(projected.find(row => row.seq === longEvent.seq)!.text.length, 5_000, 'and the projected row carries it in full')
++
++// Distinct placeholder rows must map onto distinct projected rows: the rail
++// jumps to one turn, not to the first row that shares its text.
++const mapped = rowsAfter.slice(1).map((row, index) => projectedIds.find(entry => entry.row.seq === placeholderEvent(oldest, entries, rowsAfter[index + 1]!.id)!.seq)!.id)
++assert.equal(new Set(mapped).size, mapped.length, 'each prompt maps onto its own projected row')
++
++// ── the click path ────────────────────────────────────────────────────────
++// The rail's reveal must ask the channel to load the owning region instead of
++// expanding the fold over the whole record.
++const chat = readFileSync(new URL('../src/screens/Chat.tsx', import.meta.url), 'utf8')
++assert.match(
++  chat,
++  /const revealAndSeekRow = \(rowId: number\): void => \{[\s\S]{0,500}?channel\.revealRow\(rowId\)[\s\S]{0,300}?seekRow\(revealed === 0 \? rowId : revealed\)/u,
++  'a rail reveal loads the row\'s owning region and seeks its loaded twin',
++)
++
++// …and the region it loads is one chunk: expanding every older chunk is the
++// freeze this replaced.
++const extensions = readFileSync(new URL('../src/dsh-adapter/channel/extensions.ts', import.meta.url), 'utf8')
++const reveal = /const revealChunkRow = \([\s\S]*?\n  \}\n/u.exec(extensions)?.[0] ?? ''
++assert.match(reveal, /materializeChunk\(chunk\)/u, 'a reveal projects the one owning chunk')
++assert.doesNotMatch(reveal, /loadOlder|planChunks\(|state\.rows = /u, 'and never expands or rebuilds the record')
++
++console.log(`verify-history-chunks OK (${chunks.length} chunks over ${entries.length} events, ${prompts.length} prompts)`)
+diff --git a/src/adapter/channel/ui-policy.ts b/src/adapter/channel/ui-policy.ts
+index a2a876be..50416982 100644
+--- a/src/adapter/channel/ui-policy.ts
++++ b/src/adapter/channel/ui-policy.ts
+@@ -90,6 +90,7 @@ export const CHANNEL_UI_EFFECTS = Object.freeze({
+   'switchPreset': 'mutate',
+   'clear': 'mutate',
+   'loadOlder': 'mutate',
++  'revealRow': 'mutate',
+   'notify': 'mutate',
+   'setActivityFrames': 'mutate',
+   'listModels': 'read-only',
+diff --git a/src/adapter/ports/channel-ui.ts b/src/adapter/ports/channel-ui.ts
+index 2770fb47..b2f9d097 100644
+--- a/src/adapter/ports/channel-ui.ts
++++ b/src/adapter/ports/channel-ui.ts
+@@ -662,6 +662,14 @@ export interface ChannelUi {
+    * the whole log is already materialized.
+    */
+   loadOlder(): number
++  /**
++   * Bring the region that owns `rowId` into the transcript before seeking it:
++   * a backend that collapses history into summaries loads just the collapsed
++   * part the row belongs to. Returns the row id to seek — the loaded twin of
++   * `rowId`, which need not survive loading — or 0 when nothing had to be
++   * loaded (the row is already live, or no backend owns it).
++   */
++  revealRow(rowId: number): number
+   /** Push a transient notification above the prompt input. Returns an
+    *  early-dismiss handle (the auto-timeout still runs as the backstop). */
+   notify(text: string, options?: { color?: NotificationItem['color']; timeoutMs?: number }): () => void
+diff --git a/src/dsh-adapter/backend/history-chunks.ts b/src/dsh-adapter/backend/history-chunks.ts
+index 3acca0f4..0a7b4b3b 100644
+--- a/src/dsh-adapter/backend/history-chunks.ts
++++ b/src/dsh-adapter/backend/history-chunks.ts
+@@ -197,13 +197,47 @@ function measure(
+ 
+ /** True on a user message that paints a prompt row: a human prompt or a team
+  *  message. A compaction notice, a replay of terminal output or a goal
+- *  continuation does not — it is represented by the digest line alone. */
+-function promptRow(event: AgentEvent): boolean {
++ *  continuation does not — it is represented by the digest line alone. Both
++ *  the collapsed placeholder rows and the projected slice use this rule, so a
++ *  placeholder's position maps onto the row it stands for. */
++export function promptsTurnRow(event: AgentEvent): event is Extract<AgentEvent, { type: 'user.message' }> {
+   if (event.type !== 'user.message') return false
+   if (event.source === 'team-message') return true
+   return event.source === 'user' && (event.text !== '' || (event.images?.length ?? 0) > 0)
+ }
+ 
++/** The chunk that owns a row id, undefined for a live row: ids are reserved
++ *  per chunk (`ID_STRIDE` ranges, negative), so a reveal can find the owning
++ *  chunk without scanning the record. */
++export function chunkForRow(chunks: readonly HistoryChunk[], rowId: number): HistoryChunk | undefined {
++  for (const chunk of chunks) {
++    if (rowId >= chunk.idBase && rowId < chunk.idBase + ID_STRIDE) return chunk
++  }
++  return undefined
++}
++
++/**
++ * The event a collapsed prompt row stands for. Ids are positional inside a
++ * chunk (`idBase` is the digest line, then one row per prompt), so the offset
++ * picks the k-th prompt event — the identity a reveal needs once the chunk's
++ * projected rows carry their own ids and seqs. Undefined for the digest row.
++ */
++export function placeholderEvent(
++  chunk: HistoryChunk,
++  entries: readonly AgentEvent[],
++  rowId: number,
++): Extract<AgentEvent, { type: 'user.message' }> | undefined {
++  let ordinal = rowId - chunk.idBase - 1
++  if (ordinal < 0) return undefined
++  for (let index = chunk.start; index < chunk.end; index += 1) {
++    const event = entries[index]!
++    if (!promptsTurnRow(event)) continue
++    if (ordinal === 0) return event
++    ordinal -= 1
++  }
++  return undefined
++}
++
+ /** Cap a placeholder prompt line: the record still holds the full text. */
+ function placeholderText(text: string): string {
+   if (text.length <= PLACEHOLDER_TEXT_LIMIT) return text
+@@ -240,7 +274,7 @@ export function placeholderRows(
+       })
+       continue
+     }
+-    if (!promptRow(event)) continue
++    if (!promptsTurnRow(event)) continue
+     rows.push({ id: chunk.idBase + rows.length, kind: 'user', text: placeholderText(event.text), ...images, restored: true })
+   }
+   return rows
+diff --git a/src/dsh-adapter/channel/core/compose.ts b/src/dsh-adapter/channel/core/compose.ts
+index c38aaa5c..4d0c2756 100644
+--- a/src/dsh-adapter/channel/core/compose.ts
++++ b/src/dsh-adapter/channel/core/compose.ts
+@@ -96,6 +96,11 @@ export interface ChannelExtension {
+    *  extension whose `loadOlder` restores history no `folded` row marks
+    *  (DSH: history chunks not yet expanded). */
+   hasOlderHistory?(): boolean
++  /** Bring one older row into the transcript on demand — the rail's jump to a
++   *  turn that sits behind a collapsed region rather than a `folded` row.
++   *  Returns the id the jump should seek: the loaded twin of the row asked for
++   *  (its id need not survive loading), or 0 when nothing had to be loaded. */
++  revealRow?(rowId: number): number
+   /** The extension projects subagents and
+    *  its host services): the core's event-driven activity projection stays
+    *  inert and its controls are the extension's. */
+@@ -510,6 +515,9 @@ export function createCoreChannel(
+       if (extension.hasOlderHistory?.() === true) return true
+       return extension.loadOlder === undefined && !viewCleared() && (binding.session.capabilities.transcript?.hasOlder() ?? false)
+     },
++    // Only an extension that collapses history on its own can name the loaded
++    // twin of a collapsed row; every other backend keeps ids stable.
++    revealRow: (rowId: number): number => extension.revealRow?.(rowId) ?? 0,
+     backendInit: () => {
+       const fence = mcpFence()
+       const init = fence.session.capabilities.init
+diff --git a/src/dsh-adapter/channel/extensions.ts b/src/dsh-adapter/channel/extensions.ts
+index 61318d19..3988c71f 100644
+--- a/src/dsh-adapter/channel/extensions.ts
++++ b/src/dsh-adapter/channel/extensions.ts
+@@ -37,7 +37,7 @@ import { touchSession } from '../../sessionHistory.js'
+ import { snapshotLiveSessionEvents } from '../compat/liveSession.js'
+ import { DEFAULT_SESSION_MODES, resolveSessionModes } from '../../sessionModes.js'
+ import { installedMeetsVersion } from '../contract.js'
+-import { planChunks, placeholderRows, type HistoryChunk } from '../backend/history-chunks.js'
++import { chunkForRow, placeholderEvent, planChunks, placeholderRows, type HistoryChunk } from '../backend/history-chunks.js'
+ import { createDshSession } from '../backend/session.js'
+ import { createDshTranslator, dshPricingWindow } from '../backend/translate.js'
+ import { concreteService } from '../host-access.js'
+@@ -408,6 +408,20 @@ export function attachDshExtensions(
+     ]
+   }
+ 
++  /** Project one planned chunk in place over its placeholder rows. Returns
++   *  the rows spliced in, 0 when the chunk has no placeholder left to replace
++   *  (a stale plan) — the caller reads that as "nothing to load". */
++  const materializeChunk = (chunk: HistoryChunk): number => {
++    const at = state.rows.findIndex(row => row.id === chunk.idBase)
++    if (at < 0) return 0
++    const rows = chunkRows(chunk)
++    state.rows.splice(at, placeholderCounts.get(chunk.index) ?? 1, ...rows)
++    loadedChunks.add(chunk.index)
++    placeholderCounts.delete(chunk.index)
++    markChannelReadDirty(state.rows)
++    return rows.length
++  }
++
+   /**
+    * Load the next older chunk in place, replacing its placeholder rows —
+    * "load earlier" for a chunked seed. Returns the rows that materialized so
+@@ -418,14 +432,37 @@ export function attachDshExtensions(
+     for (let index = seedChunks.length - 1; index >= 0; index -= 1) {
+       const chunk = seedChunks[index]!
+       if (loadedChunks.has(chunk.index)) continue
+-      const at = state.rows.findIndex(row => row.id === chunk.idBase)
+-      if (at < 0) return 0
+-      const rows = chunkRows(chunk)
+-      state.rows.splice(at, placeholderCounts.get(chunk.index) ?? 1, ...rows)
+-      loadedChunks.add(chunk.index)
+-      placeholderCounts.delete(chunk.index)
+-      markChannelReadDirty(state.rows)
+-      return rows.length
++      return materializeChunk(chunk)
++    }
++    return 0
++  }
++
++  /**
++   * Reveal one row of a collapsed chunk — the timeline rail's tick for a turn
++   * older than the fold window. Only the chunk that owns the row is projected
++   * (never the rest of the history: expanding all of it is what made a tick
++   * on a titan record crawl), and the returned id is the projected row the
++   * clicked placeholder stands for, so the caller seeks real content instead
++   * of a text-capped digest line. 0 = nothing to reveal (a live row, a row
++   * that already owns its chunk's place in the transcript, or a stale plan).
++   */
++  const revealChunkRow = (rowId: number): number => {
++    if (seedChunks === undefined) return 0
++    const chunk = chunkForRow(seedChunks, rowId)
++    if (chunk === undefined || loadedChunks.has(chunk.index)) return 0
++    // Resolve the clicked placeholder to the event it stands for, then to that
++    // event's own projected row by seq — unique per event, and stable even for
++    // a row the projector drops (an empty team message).
++    const event = placeholderEvent(chunk, seedEntries, rowId)
++    if (event === undefined) return 0
++    const seq = event.seq
++    const loaded = materializeChunk(chunk)
++    if (loaded === 0) return 0
++    const at = state.rows.findIndex(row => row.id === chunk.idBase)
++    if (at < 0) return 0
++    for (let index = at; index < at + loaded; index += 1) {
++      const row = state.rows[index]!
++      if (row.seq === seq) return row.id
+     }
+     return 0
+   }
+@@ -453,6 +490,9 @@ export function attachDshExtensions(
+     conversationKey: session => session.capabilities.native.dsh?.agent ?? session,
+     flushDeferred: () => subagentProjection.flush(),
+     loadOlder: dshLocal.loadOlder,
++    // A timeline tick on a turn that a collapsed chunk only sketches: project
++    // that one chunk and hand back the projected row to seek.
++    revealRow: revealChunkRow,
+     // Unloaded chunks sit in the transcript as digest rows, so no folded row
+     // announces them: ask the chunk plan instead (the load-earlier divider).
+     hasOlderHistory: () => seedChunks !== undefined && seedChunks.some(chunk => !loadedChunks.has(chunk.index)),
+diff --git a/src/screens/Chat.tsx b/src/screens/Chat.tsx
+index f1e2149f..2e248bb9 100644
+--- a/src/screens/Chat.tsx
++++ b/src/screens/Chat.tsx
+@@ -4754,8 +4754,12 @@ export function Chat({
+    * for an already-revealed row is harmless.
+    */
+   const revealAndSeekRow = (rowId: number): void => {
++    // A backend that collapses history loads only the region holding the row
++    // (DSH: the one chunk, never the whole record) and reports the id of the
++    // loaded twin — a collapsed row's id need not survive loading.
++    const revealed = channel.revealRow(rowId)
+     if (!showAllMessages) setShowAllMessages(true)
+-    seekRow(rowId)
++    seekRow(revealed === 0 ? rowId : revealed)
+   }
+   React.useLayoutEffect(() => {
+     if (forceMountRowId === null) return

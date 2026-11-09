@@ -1,0 +1,2228 @@
+From 1ad3a6444c90a9405f371dcbfe71eb93a0ffef92 Mon Sep 17 00:00:00 2001
+From: mita5358 <kafitcohr@outlook.com>
+Date: Mon, 9 Nov 2026 13:00:50 +0800
+Subject: [PATCH 18/20] fix(input): keep the caret and the paste in one bounded
+ row
+
+---
+ scripts/perf-input-external.tsx              | 722 +++++++++++++++++++
+ scripts/perf-input-latency.tsx               | 640 ++++++++++++++++
+ scripts/repro-paste-fold.tsx                 |  17 +-
+ scripts/verify-btw.tsx                       | 145 ++--
+ scripts/verify-input-bound-images.mjs        |  81 +++
+ scripts/verify-input-fold-threshold.mjs      |  87 +++
+ scripts/verify-input-grapheme-lazy.mjs       |  97 +++
+ scripts/verify-input-selection.tsx           |  19 +
+ scripts/verify-launchpad-onboarding-chat.tsx |   7 +
+ src/components/ModelPicker.tsx               |   6 +-
+ src/components/PromptInput.tsx               |  81 ++-
+ 11 files changed, 1813 insertions(+), 89 deletions(-)
+ create mode 100644 scripts/perf-input-external.tsx
+ create mode 100644 scripts/perf-input-latency.tsx
+ create mode 100644 scripts/verify-input-bound-images.mjs
+ create mode 100644 scripts/verify-input-fold-threshold.mjs
+ create mode 100644 scripts/verify-input-grapheme-lazy.mjs
+
+diff --git a/scripts/perf-input-external.tsx b/scripts/perf-input-external.tsx
+new file mode 100644
+index 00000000..b25ce6fc
+--- /dev/null
++++ b/scripts/perf-input-external.tsx
+@@ -0,0 +1,722 @@
++/**
++ * External-clock input probe (not part of the default install or test suite).
++ * Run serially: node --import tsx/esm scripts/perf-input-external.tsx
++ * MODE=idle|stream (default idle); SMOOTH=1|0 (default 1, production setting);
++ * TAIL_KIND=plain|rich|fence; TAIL_SIZE=0..1000000 ASCII payload characters
++ * (fence adds its opening delimiter outside that size);
++ * TURNS=0..1000, KEYS=1..50, KEY_INTERVAL_MS=1..5000,
++ * STREAM_INTERVAL_MS=1..5000, TIMEOUT_MS=100..60000; PROFILE=0|1, TRACE=0|1,
++ * PRELOAD_HIGHLIGHT=0|1 (all default 0). Preload is a benchmark-only control,
++ * shifts loader cost before the window, and is not a product fix.
++ * PROFILE=1 uses a local inspector CPU sampler; it perturbs the timings and is
++ * for attribution only, never an A/B latency threshold. Its window starts before
++ * stream setup/seed and ends after freeze stops production; CPU/ELU separately
++ * cover child ready→freeze and include the parent's pre-key wait.
++ * TRACE=1 adds bounded timestamp/IPC overhead and is diagnostic, not a gate.
++ * Same-host hrtime relates writes and callbacks; a readable event after a send
++ * is only a temporal candidate, not proof that a particular byte was read.
++ * Each invocation is one isolated case. Compare fresh processes serially.
++ * The child uses NODE_ENV=production before loading React, matching the default
++ * package entry's force-production-react behavior rather than the dev build.
++ *
++ * Parent writes keys on its own event loop, at absolute scheduled offsets. Its
++ * send timestamp immediately precedes stdin.write, not the intended deadline;
++ * scheduling lateness and pipe backpressure are reported separately. An xterm
++ * child Out._write calls are length-framed on an isolated pipe. The parent
++ * checks xterm after EACH original write callback, even if the pipe merged writes.
++ * Cumulative prefixes in one original write acknowledge their keys together.
++ * Framing copies each write and adds a 4-byte header plus parent parsing cost;
++ * pipe and xterm backpressure can perturb the child; this is not zero overhead.
++ * Percentiles cover ONLY on-time observations and always state the denominator;
++ * late, timeout, unsent, process failures and every planned sample are reported.
++ * This is a pipe plus headless emulator, not a physical terminal or real IME.
++ * A separate event loop includes child blocking that began before a key was sent,
++ * but not parent scheduling delay before the actual send, OS keyboard handling,
++ * screen presentation, or real backend/network workload. Never attaches to a
++ * user process or session. Child services, history and stream are synthetic.
++ */
++import { spawn } from 'node:child_process'
++import { closeSync, createWriteStream, mkdtempSync, openSync, realpathSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { basename, dirname, join } from 'node:path'
++import { fileURLToPath } from 'node:url'
++import { Readable, Writable } from 'node:stream'
++import { finished } from 'node:stream/promises'
++import { EventEmitter } from 'node:events'
++
++// Bounded per original output write; oversize is a hard failure, never truncated.
++const COLS = 120, ROWS = 40, MAX_FRAME_BYTES = 16 * 1024 * 1024
++// Each side retains at most 1000 records; every additional event is counted.
++const TRACE_SIDE_LIMIT = 1000
++type TraceEntry = { kind: 'readable'; timeNs: string; unreadBytes: number } | { kind: 'write'; timeNs: string; writeIndex: number }
++type ChildTrace = { entries: TraceEntry[]; droppedReadable: number; droppedWrites: number }
++const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmn'
++const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
++// Event notifications plus one deadline; no periodic child-process polling.
++function waitFor(signal: EventEmitter, predicate: () => boolean, timeoutMs: number, stop: () => boolean = () => false): Promise<boolean> {
++  return new Promise(resolve => {
++    const finish = (value: boolean) => { clearTimeout(timer); signal.off('change', check); resolve(value) }
++    const check = () => { if (predicate()) finish(true); else if (stop()) finish(false) }
++    const timer = setTimeout(() => finish(predicate()), timeoutMs)
++    signal.on('change', check)
++    check()
++  })
++}
++const configNumber = (name: string, fallback: number, min: number, max: number) => {
++  const value = Number(process.env[name] ?? fallback)
++  if (!Number.isInteger(value) || value < min || value > max) throw new Error(`${name} must be an integer in ${min}..${max}`)
++  return value
++}
++const choose = (name: string, fallback: string, options: string[]) => {
++  const value = process.env[name] ?? fallback
++  if (!options.includes(value)) throw new Error(`${name} must be one of ${options.join(', ')}`)
++  return value
++}
++const config = {
++  mode: choose('MODE', 'idle', ['idle', 'stream']),
++  smooth: choose('SMOOTH', '1', ['0', '1']) === '1',
++  profile: choose('PROFILE', '0', ['0', '1']) === '1',
++  trace: choose('TRACE', '0', ['0', '1']) === '1',
++  preloadHighlight: choose('PRELOAD_HIGHLIGHT', '0', ['0', '1']) === '1',
++  tailKind: choose('TAIL_KIND', 'plain', ['plain', 'rich', 'fence']),
++  tailSize: configNumber('TAIL_SIZE', 0, 0, 1_000_000),
++  turns: configNumber('TURNS', 0, 0, 1000),
++  keys: configNumber('KEYS', 20, 1, 50),
++  keyIntervalMs: configNumber('KEY_INTERVAL_MS', 50, 1, 5000),
++  streamIntervalMs: configNumber('STREAM_INTERVAL_MS', 16, 1, 5000),
++  timeoutMs: configNumber('TIMEOUT_MS', 10000, 100, 60000),
++}
++
++if (process.argv.includes('--child')) await childMain()
++else await parentMain()
++
++// Only created in the isolated child when explicitly requested; Session.connect
++// is in-process and opens no inspector listening socket. Never emit raw paths,
++// URLs, arbitrary function names, or the raw profile.
++async function createCpuProfiler() {
++  const inspector = await import('node:inspector')
++  const session = new inspector.Session()
++  const allowed = new Set([
++    'PromptInput', 'Chat', 'MessageList', 'StreamingMarkdown', 'MarkdownImpl', 'CodeBlockFrame',
++    'analyzeStableBoundary', 'analyzeSuffixStart', 'lexWithCache', 'renderTokensToNodes',
++    'lex', 'lexer', 'blockTokens', 'inlineTokens', 'tokenize', 'parse', 'highlight',
++    'caretInText', 'wrapLineRows', 'wrapToWidth', 'visualLineRanges', 'clickToCursorOffset',
++    'wrapText', 'wrapTextLines', 'measureText', 'measureTextDimensions', 'measureDecoratedText',
++    'wrapAnsiNpmIncremental', 'wrapDecoratedLine', 'wrapHangLine', 'renderToScreen',
++    'renderChildren', 'renderScrolledChildren', 'renderFrameSlice',
++    'diffSpan', 'recordDraftEdit', 'setInput', 'stringWidth', 'stringWidthJavaScript', 'layoutNode',
++    'renderNodeToOutput', 'render', 'onRender', 'calculateLayout', 'workLoopSync', 'performUnitOfWork',
++    'beginWork', 'completeWork', 'commitRoot', 'flushSyncWorkAcrossRoots_impl',
++    '(idle)', '(program)', '(garbage collector)',
++  ])
++  type CallFrame = { functionName: string; url?: string }
++  type CpuProfile = { nodes: Array<{ id: number; children?: number[]; callFrame: CallFrame }>; samples?: number[]; startTime: number; endTime: number }
++  // Only these static prefixes/package names are ever reported. The original
++  // inspector URL is used transiently for matching and is never included in JSON.
++  const sourceRoots = [
++    ['ink', new URL('../src/ink/', import.meta.url).href],
++    ['native-ts-yoga', new URL('../src/native-ts/', import.meta.url).href],
++    ['terminal-utils', new URL('../src/terminal-utils/', import.meta.url).href],
++    ['components', new URL('../src/components/', import.meta.url).href],
++    ['screens', new URL('../src/screens/', import.meta.url).href],
++    ['channel', new URL('../src/channel/', import.meta.url).href],
++    ['dsh-adapter', new URL('../src/dsh-adapter/', import.meta.url).href],
++  ] as const
++  const classify = (frame: CallFrame): { key: string; kind: 'function' | 'module' } => {
++    if (allowed.has(frame.functionName)) return { key: frame.functionName, kind: 'function' }
++    const url = frame.url ?? ''
++    for (const [label, prefix] of sourceRoots) if (url.startsWith(prefix)) return { key: `[module:${label}]`, kind: 'module' }
++    if (/^(?:node:|internal\/)/.test(url)) return { key: '[module:node-internal-or-builtin]', kind: 'module' }
++    if (/(?:^|\/)node_modules\/(?:react|react-dom|react-reconciler|scheduler)\//.test(url)) return { key: '[module:react-reconciler]', kind: 'module' }
++    if (/(?:^|\/)node_modules\/marked\//.test(url)) return { key: '[module:marked]', kind: 'module' }
++    if (/(?:^|\/)node_modules\/(?:cli-highlight|highlight\.js|escape-html|html-entities|entities|htmlparser2|domhandler|domutils|dom-serializer|parse5)\//.test(url)) return { key: '[module:highlight-escape]', kind: 'module' }
++    if (/(?:^|\/)node_modules\/(?:wrap-ansi|strip-ansi|ansi-regex|ansi-styles|string-width|slice-ansi|get-east-asian-width|emoji-regex|chalk|@alcalzone\/ansi-tokenize)\//.test(url)) return { key: '[module:ansi-wrap-width]', kind: 'module' }
++    if (url === '' || /^(?:wasm:|native\b)/.test(url)) return { key: '[module:native-or-anonymous]', kind: 'module' }
++    return { key: '[module:other]', kind: 'module' }
++  }
++  const summarize = (profile: CpuProfile) => {
++    const samples = profile.samples ?? []
++    if (!samples.length) throw new Error('CPU profiler returned no samples')
++    const nodes = new Map(profile.nodes.map(node => [node.id, node]))
++    const parents = new Map<number, number>()
++    for (const node of profile.nodes) for (const child of node.children ?? []) parents.set(child, node.id)
++    const counts = new Map<string, { kind: 'function' | 'module'; selfSamples: number; inclusiveSamples: number }>()
++    const bucket = (frame: CallFrame) => {
++      const { key, kind } = classify(frame)
++      const value = counts.get(key) ?? { kind, selfSamples: 0, inclusiveSamples: 0 }
++      counts.set(key, value)
++      return { key, value }
++    }
++    for (const id of samples) {
++      const node = nodes.get(id)
++      if (!node) throw new Error('CPU profile refers to an unknown sample node')
++      bucket(node.callFrame).value.selfSamples++
++      const seen = new Set<string>(), visited = new Set<number>()
++      let cursor: number | undefined = id
++      while (cursor !== undefined) {
++        if (visited.has(cursor)) throw new Error('CPU profile contains a stack cycle')
++        visited.add(cursor)
++        const current = nodes.get(cursor)
++        if (!current) throw new Error('CPU profile refers to an unknown stack node')
++        const { key, value } = bucket(current.callFrame)
++        if (!seen.has(key)) { value.inclusiveSamples++; seen.add(key) }
++        cursor = parents.get(cursor)
++      }
++    }
++    const items = [...counts].map(([functionName, count]) => ({ functionName, ...count }))
++    return {
++      sampleCount: samples.length, durationMs: (profile.endTime - profile.startTime) / 1000,
++      samplingIntervalUs: 10_000,
++      attribution: 'sample counts, not durations; inclusive counts each bucket at most once per stack; named functions merge by name; module buckets aggregate unknown functions by fixed URL class and are not exact functions',
++      topSelf: [...items].sort((a, b) => b.selfSamples - a.selfSamples || b.inclusiveSamples - a.inclusiveSamples).slice(0, 15),
++      topInclusive: [...items].sort((a, b) => b.inclusiveSamples - a.inclusiveSamples || b.selfSamples - a.selfSamples).slice(0, 15),
++    }
++  }
++  let connected = false, enableAttempted = false, startAttempted = false
++  let closePromise: Promise<ReturnType<typeof summarize> | undefined> | undefined
++  return {
++    async start() {
++      session.connect(); connected = true
++      enableAttempted = true
++      await new Promise<void>((resolve, reject) => session.post('Profiler.enable', error => error ? reject(error) : resolve()))
++      await new Promise<void>((resolve, reject) => session.post('Profiler.setSamplingInterval', { interval: 10_000 }, error => error ? reject(error) : resolve()))
++      startAttempted = true
++      await new Promise<void>((resolve, reject) => session.post('Profiler.start', error => error ? reject(error) : resolve()))
++    },
++    stop() {
++      if (closePromise) return closePromise
++      closePromise = (async () => {
++        const failures: unknown[] = []
++        let profile: CpuProfile | undefined
++        if (connected && startAttempted) try {
++          profile = await new Promise<CpuProfile>((resolve, reject) => session.post('Profiler.stop', (error, result) => error ? reject(error) : resolve(result.profile as CpuProfile)))
++        } catch (error) { failures.push(error) }
++        if (connected && enableAttempted) try {
++          await new Promise<void>((resolve, reject) => session.post('Profiler.disable', error => error ? reject(error) : resolve()))
++        } catch (error) { failures.push(error) }
++        if (connected) try { session.disconnect() } catch (error) { failures.push(error) }
++        connected = false
++        if (failures.length) throw new AggregateError(failures, 'CPU profiler cleanup failed')
++        return profile ? summarize(profile) : undefined
++      })()
++      return closePromise
++    },
++  }
++}
++
++async function parentMain() {
++  const { Terminal } = await import('@xterm/headless')
++  const tempRoot = realpathSync(tmpdir())
++  const scratch = mkdtempSync(join(tempRoot, 'dsh-external-input-'))
++  const scratchReal = realpathSync(scratch)
++  if (dirname(scratchReal) !== tempRoot || !basename(scratchReal).startsWith('dsh-external-input-')) throw new Error('unsafe scratch path')
++  const env: NodeJS.ProcessEnv = {
++    PATH: process.env.PATH, HOME: scratchReal, USERPROFILE: scratchReal,
++    NODE_ENV: 'production',
++    XDG_CONFIG_HOME: join(scratchReal, 'config'), XDG_CACHE_HOME: join(scratchReal, 'cache'),
++    XDG_DATA_HOME: join(scratchReal, 'data'), XDG_STATE_HOME: join(scratchReal, 'state'),
++    TMPDIR: scratchReal, DSH_HOME: join(scratchReal, 'dsh'), DSH_TUI_LANG: 'zh', FORCE_COLOR: '3',
++    MODE: config.mode, SMOOTH: config.smooth ? '1' : '0', PROFILE: config.profile ? '1' : '0', TRACE: config.trace ? '1' : '0', PRELOAD_HIGHLIGHT: config.preloadHighlight ? '1' : '0', TAIL_KIND: config.tailKind,
++    TAIL_SIZE: String(config.tailSize), TURNS: String(config.turns), KEYS: String(config.keys),
++    KEY_INTERVAL_MS: String(config.keyIntervalMs), STREAM_INTERVAL_MS: String(config.streamIntervalMs), TIMEOUT_MS: String(config.timeoutMs),
++  }
++  const term = new Terminal({ cols: COLS, rows: ROWS, scrollback: 0, allowProposedApi: true })
++  type Sample = { index: number; key: string; scheduledMs: number; sentMs: number | null; sentNs?: string; scheduleDriftMs: number | null; observedMs: number | null; observedWrite: number | null; latencyMs: number | null; status: string; backpressure: boolean | null }
++  const samples: Sample[] = Array.from({ length: config.keys }, (_, i) => ({ index: i + 1, key: alphabet[i]!, scheduledMs: i * config.keyIntervalMs, sentMs: null, scheduleDriftMs: null, observedMs: null, observedWrite: null, latencyMs: null, status: 'unsent', backpressure: null }))
++  let child: ReturnType<typeof spawn> | undefined
++  let exited = false, closed = false, spawnFailed = false, fatal = '', ready = false, verification: Record<string, unknown> | undefined
++  let start = 0, parsed = 0, outputBytes = 0, backpressureCount = 0, markerVisible = false
++  let transportEnded = false, transportBusy = false, transportDrained = false, transportFailed = false, unexpectedStdoutBytes = 0
++  let transportError: string | null = null
++  let transport: Readable | undefined, parserStopped = false, transportAborted = false
++  let freezeSent = false
++  let childTrace: ChildTrace | undefined, droppedCallbacks = 0
++  let highlightPreload: Record<string, unknown> = { requested: config.preloadHighlight, status: config.preloadHighlight ? 'pending' : 'disabled', elapsedMs: null }
++  const traceCallbacks: Array<{ writeIndex: number; timeNs: string }> = []
++  const pulse = new EventEmitter()
++  const childReaped = () => !child || exited || (spawnFailed && closed)
++  const transportVerification = () => transportFailed ? 'failed' : transportDrained ? 'complete' : 'incomplete'
++  const waitState = (predicate: () => boolean, ms: number) => waitFor(pulse, predicate, ms)
++  // A timed-out child remains referenced: never claim it was reaped, never
++  // unref it or delete its scratch. No polling; its OS handle keeps Node alive.
++  const finishChild = async () => {
++    const c = child
++    if (!c) return
++    if (!childReaped() && !await waitState(childReaped, 5000)) {
++      c.kill('SIGTERM')
++      if (!await waitState(childReaped, 2000)) {
++        c.kill('SIGKILL')
++        if (!await waitState(childReaped, 2000)) fatal ||= 'child exit not observed after SIGKILL; child remains tracked'
++      }
++    }
++    // EOF and xterm callbacks have their own deadline even after child exit.
++    if (!transportFailed && !transportDrained && !await waitState(() => transportDrained || transportFailed, 5000)) {
++      fatal ||= 'framed output verification incomplete: drain deadline'
++      parserStopped = true; transportAborted = true; transport?.destroy()
++    }
++    if (!await waitState(() => closed, 2000)) {
++      fatal ||= 'child close deadline; closing owned pipes'
++      parserStopped = true
++      if (!transportDrained && !transportFailed) transportAborted = true
++      for (const stream of c.stdio) stream?.destroy()
++      if (c.connected) try { c.disconnect() } catch (error) { fatal ||= `IPC disconnect failed: ${String(error)}` }
++      if (!await waitState(() => closed, 2000)) fatal ||= 'child close not observed after pipe destruction'
++    }
++  }
++  const lines = () => Array.from({ length: ROWS }, (_, y) => term.buffer.active.getLine(term.buffer.active.baseY + y)?.translateToString(true) ?? '')
++  const inspect = () => {
++    const now = performance.now()
++    const b = term.buffer.active
++    const line = b.getLine(b.baseY + b.cursorY)
++    // Keys are ASCII and constrained to fit on a single line. Only accept an
++    // exact cumulative suffix ending at the active cursor, never transcript text.
++    let preceding = ''
++    for (let x = 0; x < b.cursorX; x++) preceding += line?.getCell(x)?.getChars() || ' '
++    for (let n = samples.length; n > 0; n--) {
++      if (samples[n - 1]!.sentMs === null || !preceding.endsWith(alphabet.slice(0, n))) continue
++      for (let i = 0; i < n; i++) {
++        const sample = samples[i]!
++        if (sample.sentMs === null || sample.observedMs !== null) continue
++        sample.observedMs = now - start
++        sample.observedWrite = parsed
++        sample.latencyMs = sample.observedMs - sample.sentMs
++        sample.status = sample.latencyMs <= config.timeoutMs ? 'observed' : 'late'
++      }
++      break
++    }
++    if (freezeSent && lines().some(line => line.includes('EXTTAILMARKER'))) markerVisible = true
++  }
++  const reportSamples = () => config.trace ? samples.map(({ key: _key, ...sample }) => sample) : samples
++  const buildTrace = () => {
++    if (!config.trace) return undefined
++    const ns = (value: unknown): bigint | undefined => typeof value === 'string' && /^\d+$/.test(value) ? BigInt(value) : undefined
++    const ms = (later: bigint, earlier: bigint) => Number(later - earlier) / 1e6
++    const events = childTrace?.entries ?? []
++    const childWrites = new Map<number, bigint>()
++    const reads: Array<{ at: bigint; unreadBytes: number }> = []
++    for (const entry of events) {
++      const at = ns(entry.timeNs)
++      if (at === undefined) continue
++      if (entry.kind === 'write') childWrites.set(entry.writeIndex, at)
++      else if (entry.kind === 'readable' && entry.unreadBytes > 0) reads.push({ at, unreadBytes: entry.unreadBytes })
++    }
++    const callbacks = new Map<number, bigint>()
++    for (const entry of traceCallbacks) { const at = ns(entry.timeNs); if (at !== undefined) callbacks.set(entry.writeIndex, at) }
++    const perKey = samples.map(sample => {
++      const sent = ns(sample.sentNs)
++      const childWrite = sample.observedWrite === null ? undefined : childWrites.get(sample.observedWrite)
++      const callback = sample.observedWrite === null ? undefined : callbacks.get(sample.observedWrite)
++      const missing: string[] = []
++      if (sent === undefined) missing.push('unsent')
++      if (sample.observedWrite === null) missing.push('no-observed-write')
++      if (sample.observedWrite !== null && childWrite === undefined) missing.push('child-write-not-retained')
++      if (sample.observedWrite !== null && callback === undefined) missing.push('callback-not-retained')
++      const ordered = childWrite !== undefined && callback !== undefined && callback >= childWrite && (sent === undefined || childWrite >= sent)
++      if (childWrite !== undefined && callback !== undefined && callback < childWrite) missing.push('write-callback-clock-order')
++      const candidate = sent !== undefined && childWrite !== undefined && childWrite >= sent
++        ? reads.find(read => read.at >= sent && read.at <= childWrite) : undefined
++      if (!candidate && sent !== undefined) missing.push('no-temporal-readable-candidate')
++      if (sent !== undefined && childWrite !== undefined && childWrite < sent) missing.push('write-before-send')
++      return { index: sample.index, observedWrite: sample.observedWrite, sentNs: sample.sentNs ?? null,
++        firstReadableAfterSendNs: candidate?.at.toString() ?? null, unreadBytes: candidate?.unreadBytes ?? null,
++        firstReadableAfterSendMs: candidate && sent !== undefined ? ms(candidate.at, sent) : null,
++        childWriteNs: childWrite?.toString() ?? null, xtermCallbackNs: callback?.toString() ?? null,
++        childWriteToXtermMs: ordered ? ms(callback!, childWrite!) : null, missing }
++    })
++    const summarize = (values: number[]) => {
++      values.sort((a, b) => a - b)
++      const p = (q: number) => values.length ? values[Math.ceil(values.length * q) - 1] : null
++      return { n: values.length, missing: samples.length - values.length, p50: p(.5), p95: p(.95), p99: p(.99), max: p(1) }
++    }
++    return { clock: 'same-host process.hrtime.bigint monotonic nanoseconds',
++      limitation: 'TRACE changes scheduling, framing and IPC costs; diagnosis only, not a latency gate. First readable after send is a temporal candidate, not proof that the particular key was present, read or handled; bytes and events can coalesce.',
++      childReceived: childTrace !== undefined, child: childTrace ?? null, parentCallbacks: traceCallbacks,
++      droppedParentCallbacks: droppedCallbacks, truncated: !childTrace || childTrace.droppedReadable > 0 || childTrace.droppedWrites > 0 || droppedCallbacks > 0,
++      firstReadableAfterSendMs: summarize(perKey.flatMap(item => item.firstReadableAfterSendMs === null ? [] : [item.firstReadableAfterSendMs])),
++      childWriteToXtermMs: summarize(perKey.flatMap(item => item.childWriteToXtermMs === null ? [] : [item.childWriteToXtermMs])), perKey }
++  }
++  let signal = ''
++  const onSignal = (s: string) => { signal = s; fatal ||= `parent received ${s}`; child?.kill('SIGTERM'); pulse.emit('change') }
++  const onInt = () => onSignal('SIGINT'), onTerm = () => onSignal('SIGTERM')
++  process.on('SIGINT', onInt); process.on('SIGTERM', onTerm)
++  try {
++    child = spawn(process.execPath, ['--import', import.meta.resolve('tsx/esm'), fileURLToPath(import.meta.url), '--child'], { cwd: scratchReal, env, stdio: ['pipe', 'pipe', 'pipe', 'ipc', 'pipe'] })
++    const c = child
++    c.on('error', error => { if (c.pid === undefined) spawnFailed = true; fatal ||= `child process: ${error.message}`; pulse.emit('change') })
++    c.on('exit', (code, sig) => { exited = true; if (code !== 0 || sig) fatal ||= `child exit code=${code} signal=${sig}`; pulse.emit('change') })
++    c.on('close', () => { closed = true; pulse.emit('change') })
++    c.stdin!.on('error', error => { fatal ||= `stdin: ${error.message}`; pulse.emit('change') })
++    c.stderr!.on('data', data => { process.stderr.write(data) })
++    // Ordinary stdout is deliberately separate: unframed output cannot be
++    // safely inserted into the ordered measured stream or silently ignored.
++    c.stdout!.on('data', (data: Buffer) => { unexpectedStdoutBytes += data.length; fatal ||= 'unexpected unframed child stdout'; c.kill('SIGTERM'); pulse.emit('change') })
++    transport = c.stdio[4] as Readable
++    const framed = transport
++    const header = Buffer.allocUnsafe(4)
++    let headerBytes = 0, payloadBytes = 0, payload: Buffer | undefined
++    let remainder: Buffer | undefined, remainderOffset = 0
++    const failTransport = (reason: string) => {
++      if (transportFailed || transportAborted) return
++      transportFailed = true; transportError = reason; parserStopped = true
++      fatal ||= `framed output: ${reason}`
++      framed.destroy(); c.kill('SIGTERM'); pulse.emit('change')
++    }
++    const finishTransportIfComplete = () => {
++      // EOF may precede xterm's callback for the last complete frame. Only
++      // classify truncation after that callback has drained all buffered bytes.
++      if (!transportEnded || transportBusy || remainder || transportFailed || parserStopped) return
++      if (headerBytes || payload !== undefined) {
++        failTransport(`truncated final frame (header=${headerBytes}, payload=${payloadBytes})`)
++        return
++      }
++      transportDrained = true
++      pulse.emit('change')
++    }
++    // Parse incrementally, buffering at most one bounded payload and one pipe
++    // read. A callback for EVERY original _write precedes parsing the next.
++    const drive = () => {
++      if (parserStopped || transportFailed || transportBusy) return
++      try {
++        while (remainder && remainderOffset < remainder.length) {
++          if (!payload) {
++            const n = Math.min(4 - headerBytes, remainder.length - remainderOffset)
++            remainder.copy(header, headerBytes, remainderOffset, remainderOffset + n)
++            remainderOffset += n; headerBytes += n
++            if (headerBytes < 4) continue
++            const length = header.readUInt32BE(0)
++            if (length > MAX_FRAME_BYTES) return failTransport(`invalid length ${length}`)
++            payload = Buffer.allocUnsafe(length); payloadBytes = 0; headerBytes = 0
++          }
++          const n = Math.min(payload.length - payloadBytes, remainder.length - remainderOffset)
++          remainder.copy(payload, payloadBytes, remainderOffset, remainderOffset + n)
++          remainderOffset += n; payloadBytes += n
++          if (payloadBytes === payload.length) {
++            const complete = payload
++            payload = undefined; payloadBytes = 0; transportBusy = true
++            outputBytes += complete.length
++            term.write(complete, () => {
++              transportBusy = false
++              if (!parserStopped) {
++                parsed++
++                if (config.trace) {
++                  if (traceCallbacks.length < TRACE_SIDE_LIMIT) traceCallbacks.push({ writeIndex: parsed, timeNs: process.hrtime.bigint().toString() })
++                  else droppedCallbacks++
++                }
++                inspect(); pulse.emit('change'); drive()
++              }
++            })
++            return
++          }
++        }
++        remainder = undefined; remainderOffset = 0
++        if (transportEnded) finishTransportIfComplete()
++        else framed.resume()
++      } catch (error) { failTransport(String(error)) }
++    }
++    framed.on('data', (data: Buffer) => {
++      framed.pause()
++      if (remainder || data.length > MAX_FRAME_BYTES + 4) return failTransport('oversized or overlapping transport chunk')
++      remainder = data; remainderOffset = 0; drive()
++    })
++    framed.on('end', () => {
++      transportEnded = true
++      finishTransportIfComplete()
++      pulse.emit('change')
++    })
++    framed.on('error', error => failTransport(error.message))
++    framed.on('close', () => { if (!transportEnded && !transportFailed && !transportAborted) failTransport('pipe closed before EOF'); pulse.emit('change') })
++    c.on('message', (message: unknown) => {
++      const m = message as { type?: string; data?: Record<string, unknown>; error?: string }
++      if (m.type === 'ready') ready = true
++      if (m.type === 'verification') verification = m.data
++      if (config.trace && m.type === 'trace') childTrace = m.data as ChildTrace
++      if (config.preloadHighlight && m.type === 'highlight-preload' && m.data) highlightPreload = m.data
++      if (m.type === 'error') fatal ||= `child: ${m.error}`
++      pulse.emit('change')
++    })
++    const waitUntil = (predicate: () => boolean, ms: number, failFast = true) =>
++      waitFor(pulse, predicate, ms, () => failFast && (exited || Boolean(fatal)))
++    if (!await waitUntil(() => ready && parsed > 0, 15000)) throw new Error(fatal || 'child readiness timeout')
++    start = performance.now() + 100
++    for (const sample of samples) {
++      const delay = start + sample.scheduledMs - performance.now()
++      if (delay > 0) await sleep(delay) // 固定窗:pacing 按绝对时钟发键
++      if (exited || fatal || !c.stdin!.writable) break
++      sample.sentMs = performance.now() - start
++      sample.scheduleDriftMs = sample.sentMs - sample.scheduledMs
++      sample.status = 'pending'
++      if (config.trace) sample.sentNs = process.hrtime.bigint().toString()
++      sample.backpressure = !c.stdin!.write(sample.key)
++      if (sample.backpressure) backpressureCount++
++    }
++    // Wait until each sent key was observed or its own deadline elapsed.
++    await waitUntil(() => samples.every(s => s.sentMs === null || s.observedMs !== null || performance.now() - start - s.sentMs >= config.timeoutMs), config.timeoutMs + 1000)
++    for (const s of samples) if (s.status === 'pending') s.status = 'timeout'
++    if (!exited && c.connected) { freezeSent = true; markerVisible = lines().some(line => line.includes('EXTTAILMARKER')); c.send({ type: 'freeze', expectedDraft: alphabet.slice(0, config.keys) }) }
++    await waitUntil(() => verification !== undefined && markerVisible, Math.min(60000, config.timeoutMs * 3))
++    const screen = lines()
++    const allHistoryVisible = Array.from({ length: config.turns }, (_, i) => i + 1).every(turn =>
++      screen.some(line => new RegExp(`synthetic question ${turn}(?![0-9])`).test(line)) && screen.some(line => new RegExp(`synthetic answer ${turn}(?![0-9])`).test(line)))
++    // One last pass after stream completion; do not relabel expired samples as
++    // successful if their first visible observation arrived after their deadline.
++    if (!exited && c.connected) c.send({ type: 'shutdown' })
++    await finishChild()
++    if (!transportDrained) fatal ||= 'framed output did not fully drain'
++    const valid = samples.filter(s => s.status === 'observed').map(s => s.latencyMs!)
++    const percentile = (p: number) => valid.length ? [...valid].sort((a, b) => a - b)[Math.ceil(valid.length * p) - 1] : null
++    const history = verification?.history as { sourceHistoryExact?: boolean; railIndexComplete?: boolean; allHistoryProjected?: boolean; latestTurnProjected?: boolean } | undefined
++    // Conservative success: collapsed historical answers are not verified by a
++    // rail index; report failure rather than presenting incomplete projection as success.
++    const inputSamplesValid = !fatal && verification?.reactMode === 'production' && samples.every(s => s.status === 'observed') && verification?.draftExact === true
++    const ok = inputSamplesValid && history?.sourceHistoryExact === true && history?.railIndexComplete === true && history?.allHistoryProjected === true && history?.latestTurnProjected === true && verification?.streamExact === true && markerVisible && (config.mode === 'idle' || (typeof verification?.chunksDuringInput === 'number' && verification.chunksDuringInput > 0))
++    console.log(JSON.stringify({ fixture: 'external-clock-real-dsh-synthetic-host', config, ok, inputSamplesValid, fatal: fatal || null, signal: signal || null,
++      n: samples.length, sent: samples.filter(s => s.sentMs !== null).length, onTime: valid.length,
++      timeout: samples.filter(s => s.status === 'timeout' || s.status === 'late').length, unsent: samples.filter(s => s.status === 'unsent').length,
++      latencyMs: { denominator: valid.length, population: 'on-time observed only', p50: percentile(.5), p95: percentile(.95), p99: percentile(.99), max: percentile(1) },
++      samples: reportSamples(), ...(config.trace ? { trace: buildTrace() } : {}), highlightPreload, outputBytes, parsedWrites: parsed, transportEnded, transportVerification: transportVerification(), transportError, childReaped: childReaped(), childClosed: closed, scratchRetained: Boolean(child && (!childReaped() || !closed)), unexpectedStdoutBytes, stdinBackpressure: backpressureCount, markerVisible, allHistoryVisible, verification: verification ?? null,
++      writeBoundary: 'BE32-framed original Out._write calls, each parsed and inspected separately; includes control/startup/shutdown writes, not exclusively diff frames',
++      successDefinition: 'all keys on time; exact draft, source history, rail index, every projected history turn and tail projection; tail marker painted; streaming has input-overlap chunks. A false allHistoryVisible is reported separately: a viewport cannot contain an arbitrarily long history.',
++      limitation: 'framing copies writes and adds parser/header cost and pipe backpressure; pipe/headless xterm is not a physical terminal or IME; independent event loop captures child pre-send blocking, not parent pre-send scheduling or OS/display latency' }))
++    if (!ok) process.exitCode = 1
++  } catch (error) {
++    fatal ||= String(error)
++    // Early failures still allow EOF and callbacks to finish under deadlines.
++    await finishChild()
++    // Even startup failures produce all planned samples and explicit missing data.
++    for (const sample of samples) if (sample.status === 'pending') sample.status = 'timeout'
++    const valid = samples.filter(s => s.status === 'observed').map(s => s.latencyMs!).sort((a, b) => a - b)
++    const percentile = (p: number) => valid.length ? valid[Math.ceil(valid.length * p) - 1] : null
++    console.log(JSON.stringify({ fixture: 'external-clock-real-dsh-synthetic-host', config, ok: false, inputSamplesValid: false, fatal, n: samples.length, sent: samples.filter(s => s.sentMs !== null).length, onTime: valid.length, timeout: samples.filter(s => s.status === 'timeout' || s.status === 'late').length, unsent: samples.filter(s => s.status === 'unsent').length, latencyMs: { denominator: valid.length, population: 'on-time observed only', p50: percentile(.5), p95: percentile(.95), p99: percentile(.99), max: percentile(1) }, samples: reportSamples(), ...(config.trace ? { trace: buildTrace() } : {}), highlightPreload, transportEnded, transportVerification: transportVerification(), transportError, childReaped: childReaped(), childClosed: closed, scratchRetained: Boolean(child && (!childReaped() || !closed)), verification: verification ?? null }))
++    process.exitCode = 1
++  } finally {
++    parserStopped = true
++    term.dispose()
++    process.off('SIGINT', onInt); process.off('SIGTERM', onTerm)
++    // Never remove scratch until the owned child has exited/reaped and closed;
++    // an unreaped child remains referenced, and the report names this retention.
++    if (!child || (childReaped() && closed)) {
++      if (realpathSync(scratch) !== scratchReal || dirname(scratchReal) !== tempRoot) throw new Error('scratch path changed; refusing cleanup')
++      rmSync(scratchReal, { recursive: true, force: true })
++    }
++  }
++}
++
++async function childMain() {
++  // The parent's whitelist env is already isolated before any application import.
++  const scratch = process.env.HOME!
++  const ttyFd = openSync(join(scratch, 'tty-output'), 'w')
++  const frameOutput = createWriteStream('', { fd: 4, autoClose: true })
++  let interval: ReturnType<typeof setInterval> | undefined
++  let profiler: Awaited<ReturnType<typeof createCpuProfiler>> | undefined
++  const traceEntries: TraceEntry[] = []
++  let droppedReadable = 0, droppedWrites = 0
++  const recordTrace = (entry: TraceEntry) => {
++    if (traceEntries.length < TRACE_SIDE_LIMIT) traceEntries.push(entry)
++    else if (entry.kind === 'readable') droppedReadable++
++    else droppedWrites++
++  }
++  const tell = (message: unknown) => { if (process.connected) process.send?.(message) }
++  frameOutput.on('error', error => { tell({ type: 'error', error: `framed pipe: ${error.message}` }); process.exitCode = 1 })
++  try {
++    if (process.env.NODE_ENV !== 'production') throw new Error('child must load the default production React build')
++    const [React, { render, AlternateScreen }, { Chat }, { QuestionStore }, { createChannel }, { mountChannelUi }, { registerTuiChannel }, { bindChannelCommands }] = await Promise.all([
++      import('react'), import('../src/ui.js'), import('../src/screens/Chat.js'), import('../src/dsh-adapter/questions.js'),
++      import('../src/dsh-adapter/channel.js'), import('../src/dsh-adapter/channel-ui.js'), import('../src/adapter/channel/host-registry.js'), import('../src/dsh-adapter/channel/commands.js'),
++    ])
++    if (config.preloadHighlight) {
++      const start = performance.now()
++      try {
++        const { getCliHighlightPromise } = await import('../src/terminal-utils/cliHighlight.js')
++        if (!await getCliHighlightPromise()) throw new Error('unavailable')
++        tell({ type: 'highlight-preload', data: { requested: true, status: 'loaded', elapsedMs: performance.now() - start, limitation: 'await duration before mount and measurement; may be a cache hit; moving this cost is not a product fix' } })
++      } catch {
++        tell({ type: 'highlight-preload', data: { requested: true, status: 'failed', elapsedMs: performance.now() - start } })
++        throw new Error('highlight preload failed or returned null')
++      }
++    }
++    type RawEvent = { type: string; seq: number; time: number; data: Record<string, unknown> }
++    let seq = 0
++    const events: RawEvent[] = []
++    const unit = config.tailKind === 'plain' ? 'plain text ' : config.tailKind === 'rich' ? '**bold** [link](https://example.invalid) `code` ' : 'const value = 42; // synthetic\n'
++    const prefix = config.tailKind === 'fence' ? '```ts\n' : ''
++    const seed = prefix + unit.repeat(Math.ceil(config.tailSize / unit.length)).slice(0, config.tailSize)
++    const event = (type: string, data: Record<string, unknown>): RawEvent => ({ type, seq: ++seq, time: seq, data })
++    for (let turn = 1; turn <= config.turns; turn++) {
++      events.push(event('user/message', { id: `synthetic-user-${turn}`, source: { kind: 'user' }, content: [{ type: 'text', text: `synthetic question ${turn}` }] }))
++      events.push(event('assistant/message', { turn, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: `synthetic answer ${turn}` }] } }))
++    }
++    const historySnapshot = JSON.stringify(events)
++    if (config.mode === 'idle') events.push(event('assistant/message', { turn: config.turns + 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: `${seed}\nEXTTAILMARKER` }] } }))
++    const listeners = new Map<string, Set<(...args: unknown[]) => unknown>>()
++    const cleanups: (() => void)[] = []
++    const agent = { id: 'synthetic-agent', status: 'idle', session: { id: 'synthetic-session', seq, events, header: { cwd: scratch } }, ctx: { on: () => () => undefined }, followup() {}, steer() {}, cancel() {}, inbox: { remove: () => true } }
++    const services: Record<string, unknown> = {
++      settings: { describe: () => [{ ns: 'llm-pi-ai', revision: 1, user: {}, value: {} }, { ns: 'dsh-tui', revision: 1, user: {}, value: { recapOnOpen: false } }], get: () => ({}), mutate: async () => undefined },
++      credentials: { resolve: async () => undefined, set: async () => { throw new Error('credentials forbidden') }, unset: async () => { throw new Error('credentials forbidden') } },
++      llm: { listConfigurableProviders: () => [], discoverModels: async () => [] },
++      agents: { create: async () => { throw new Error('create forbidden') }, resume: async () => { throw new Error('resume forbidden') } },
++    }
++    const ctx = {
++      on(name: string, callback: (...args: unknown[]) => unknown) { const set = listeners.get(name) ?? new Set(); set.add(callback); listeners.set(name, set); return () => { set.delete(callback) } },
++      effect(setup: () => () => void) { cleanups.push(setup()) }, get(name: string) { return services[name] }, logger: { warn() {} },
++    }
++    const raw = createChannel(ctx as never, agent as never, { model: 'synthetic', provider: 'synthetic', cwd: scratch, activity: false, whale: false, whaleIdle: false, minimalUi: true, smoothStreaming: config.smooth })
++    const unregister = registerTuiChannel(ctx, raw)
++    const mount = mountChannelUi(ctx, raw, undefined, 'new')
++    bindChannelCommands(raw, mount.channel)
++    if (mount.channel.smoothStreaming !== config.smooth) throw new Error('smooth configuration mismatch')
++    let writes = 0, chunks = 0, chunksDuringInput = 0, firstInput = false, revision = 0, expected = '', frameCount = 0, notifications = 0
++    let framePressureWindow = false, frameFalseTotal = 0, frameMaxQueuedTotal = 0, frameFalseWindow = 0, frameMaxQueuedWindow = 0
++    const pulse = new EventEmitter()
++    const unsubscribe = mount.channel.subscribe(() => { notifications++; pulse.emit('change') })
++    const deliver = (name: string, ...args: unknown[]) => {
++      const handlers = [...(listeners.get(name) ?? [])]
++      if (!handlers.length) throw new Error(`missing handler ${name}`)
++      for (const handler of handlers) handler(...args)
++    }
++    const appendEvent = (type: string, data: Record<string, unknown>) => {
++      const item = event(type, data); agent.session.seq = item.seq; events.push(item); deliver('session/event', agent.session, item)
++    }
++    const sendFrame = (frame: Record<string, unknown>) => deliver('agent/assistant-stream', { agent, frame })
++    const push = (text: string) => { const index = chunks++; if (firstInput) chunksDuringInput++; expected += text; sendFrame({ type: 'chunk', revision: ++revision, attemptId: 'synthetic-attempt', index, time: Date.now(), chunk: { type: 'text-delta', index: 0, text } }) }
++    // Each _write is a separate BE32 length + payload record on fd 4. The
++    // callback follows the async pipe write, never a parent/xterm round-trip.
++    // Ink's synchronous unmount writes use fd, an owned temporary file; they
++    // are outside the measured window and never mixed into this framed stream.
++    class Out extends Writable {
++      columns = COLS; rows = ROWS; isTTY = true; fd = ttyFd
++      override write(chunk: unknown, encoding?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void): boolean {
++        if (typeof chunk !== 'string' && !(chunk instanceof Uint8Array)) throw new TypeError('unsupported Ink output chunk')
++        const length = typeof chunk === 'string' ? Buffer.byteLength(chunk, typeof encoding === 'string' ? encoding : 'utf8') : chunk.byteLength
++        if (length > MAX_FRAME_BYTES || this.writableLength + length > 2 * MAX_FRAME_BYTES) throw new Error('bounded Ink output queue exceeded')
++        return typeof encoding === 'function' ? super.write(chunk, encoding) : super.write(chunk, encoding, callback)
++      }
++      override _write(data: Buffer, _encoding: BufferEncoding, done: (error?: Error | null) => void) {
++        if (data.length > MAX_FRAME_BYTES) return done(new Error(`output write exceeds ${MAX_FRAME_BYTES} bytes`))
++        writes++
++        if (config.trace) {
++          if (traceEntries.length < TRACE_SIDE_LIMIT) recordTrace({ kind: 'write', writeIndex: writes, timeNs: process.hrtime.bigint().toString() })
++          else droppedWrites++
++        }
++        const record = Buffer.allocUnsafe(data.length + 4)
++        record.writeUInt32BE(data.length, 0); data.copy(record, 4)
++        const accepted = frameOutput.write(record, done)
++        const queued = frameOutput.writableLength
++        if (!accepted) frameFalseTotal++
++        frameMaxQueuedTotal = Math.max(frameMaxQueuedTotal, queued)
++        if (framePressureWindow) {
++          if (!accepted) frameFalseWindow++
++          frameMaxQueuedWindow = Math.max(frameMaxQueuedWindow, queued)
++        }
++      }
++    }
++    const stdout = new Out()
++    stdout.on('error', error => { tell({ type: 'error', error: `Ink output: ${error.message}` }); process.exitCode = 1 })
++    const stdin = Object.assign(process.stdin, { isTTY: true, setRawMode() { return this } })
++    // Observe readiness without reading: Ink's own readable handler remains the
++    // only consumer, and adding a data listener must not switch stdin to flowing mode.
++    stdin.on('readable', () => {
++      const unreadBytes = stdin.readableLength
++      if (config.trace) {
++        if (traceEntries.length < TRACE_SIDE_LIMIT) recordTrace({ kind: 'readable', timeNs: process.hrtime.bigint().toString(), unreadBytes })
++        else droppedReadable++
++      }
++      if (unreadBytes > 0) firstInput = true
++    })
++    const stderr = Object.assign(new Writable({ write(_chunk, _encoding, done) { done() } }), { isTTY: true })
++    const controller: { current: { text(): string } | null } = { current: null }
++    const app = await render(<AlternateScreen><Chat channel={mount.channel} questionStore={new QuestionStore()} fullscreen trajectorySeen promptControllerRef={controller as never} /></AlternateScreen>, { stdout: stdout as never, stdin: stdin as never, stderr: stderr as never, exitOnCtrlC: false, patchConsole: false, onFrame: () => { frameCount++; pulse.emit('change') } })
++    try {
++      // Effects installing the controller may run just after the first frame.
++      setImmediate(() => pulse.emit('change'))
++      if (!await waitFor(pulse, () => Boolean(controller.current && writes && listeners.get('agent/assistant-stream')?.size), 10000)) throw new Error('child composer not ready')
++      await sleep(1000) // 固定窗:pacing 固定预热，减少启动帧对对比的影响
++      let profileStartedAt: number | undefined
++      if (config.profile) {
++        profiler = await createCpuProfiler()
++        await profiler.start()
++        profileStartedAt = performance.now()
++      }
++      if (config.mode === 'stream') {
++        appendEvent('turn/start', { turn: config.turns + 1 })
++        appendEvent('step/start', { turn: config.turns + 1, step: 1 })
++        sendFrame({ type: 'start', revision: ++revision, attemptId: 'synthetic-attempt', turn: config.turns + 1, step: 1 })
++        if (seed) push(seed)
++        interval = setInterval(() => push(' x'), config.streamIntervalMs)
++      }
++      // Broad child-side window, not per-key timing or a CPU profile. It starts
++      // before the ready IPC and includes the parent's ~100 ms pre-key delay.
++      const cpuStart = process.cpuUsage()
++      const eluStart = performance.eventLoopUtilization()
++      const observationStart = performance.now()
++      framePressureWindow = true
++      tell({ type: 'ready' })
++      await new Promise<void>((resolve, reject) => {
++        process.on('disconnect', resolve)
++        process.on('message', async (message: unknown) => {
++          const m = message as { type?: string; expectedDraft?: string }
++          if (m.type === 'shutdown') resolve()
++          if (m.type !== 'freeze') return
++          try {
++            const cpu = process.cpuUsage(cpuStart)
++            const elu = performance.eventLoopUtilization(eluStart)
++            const observationWindow = { elapsedMs: performance.now() - observationStart, cpuUserMs: cpu.user / 1000, cpuSystemMs: cpu.system / 1000, eventLoopActiveMs: elu.active, eventLoopIdleMs: elu.idle, eventLoopUtilization: elu.utilization, limitation: 'child ready-to-freeze, includes pre-key delay and waits; not a CPU profile, ELU alone does not establish cause' }
++            framePressureWindow = false
++            const frameOutputBackpressure = { window: 'child ready-to-freeze', writeReturnedFalse: frameFalseWindow, maxWritableLengthBytes: frameMaxQueuedWindow, sinceChildStartThroughFreeze: { writeReturnedFalse: frameFalseTotal, maxWritableLengthBytes: frameMaxQueuedTotal }, limitation: 'Node writableLength sampled after frameOutput.write, including the 4-byte header; excludes kernel pipe and separately buffered Ink writes; false indicates a high-water mark, not proven parent causality' }
++            if (interval) { clearInterval(interval); interval = undefined }
++            const beforeMarkerChunksDuringInput = chunksDuringInput
++            const stopRequestedAt = performance.now()
++            const summary = profiler ? await profiler.stop() : undefined
++            if (config.profile && !summary) throw new Error('CPU profiler did not return a profile')
++            const cpuProfile = summary ? { ...summary, startsBeforeReadyMs: observationStart - profileStartedAt!, stopRequestedAfterReadyMs: stopRequestedAt - observationStart, window: 'started before synthetic stream setup/seed; stopped after freeze stopped stream production', limitation: 'sampling perturbs timings; attribution only, not an A/B latency threshold' } : undefined
++            if (config.mode === 'stream') push('\nEXTTAILMARKER')
++            // Settled assistant blocks use textOfBlocks(), which trims their
++            // outer whitespace; streamed deltas retain their exact content.
++            const idleText = `${seed}\nEXTTAILMARKER`.trim()
++            const projected = () => config.mode === 'idle'
++              ? mount.channel.rows.some(row => row.kind === 'assistant' && row.text === idleText)
++              : mount.channel.rows.some(row => row.kind === 'assistant' && row.streaming === true && row.text === expected)
++            await waitFor(pulse, projected, Math.min(8000, config.timeoutMs))
++            const draft = controller.current?.text() ?? ''
++            const streamExact = projected()
++            const rows = mount.channel.rows
++            const projectedTurn = (turn: number) => rows.some(row => row.kind === 'user' && row.text === `synthetic question ${turn}`) && rows.some(row => row.kind === 'assistant' && row.text === `synthetic answer ${turn}`)
++            const projectedTurns = Array.from({ length: config.turns }, (_, i) => i + 1).filter(projectedTurn)
++            const indexedSeqs = new Set(rows.flatMap(row => [ ...(row.kind === 'user' && row.seq !== undefined ? [row.seq] : []), ...(row.collapsedTurns ?? []).map(turn => turn.seq) ]))
++            const indexedTurns = Array.from({ length: config.turns }, (_, i) => 2 * i + 1).filter(seq => indexedSeqs.has(seq)).length
++            const sourceHistoryExact = JSON.stringify(events.slice(0, config.turns * 2)) === historySnapshot
++            const allHistoryProjected = projectedTurns.length === config.turns
++            tell({ type: 'verification', data: { reactMode: process.env.NODE_ENV, draftExact: draft === m.expectedDraft, draftLength: draft.length, expectedDraftLength: m.expectedDraft?.length,
++              history: { sourceHistoryExact, sourceEvents: config.turns * 2, indexedTurns, railIndexComplete: indexedTurns === config.turns, projectedTurns: projectedTurns.length, allHistoryProjected, latestTurnProjected: config.turns === 0 || projectedTurn(config.turns), collapsedSections: rows.filter(row => row.collapsed).length,
++                limitation: 'collapsedTurns are rail metadata, not projected transcript text; full collapsed history is not verified' },
++              streamExact, expectedStreamLength: config.mode === 'idle' ? idleText.length : expected.length, chunksDuringInput: beforeMarkerChunksDuringInput, notifications, frameCount, observationWindow, frameOutputBackpressure, ...(cpuProfile ? { cpuProfile } : {}), tailKind: config.tailKind, tailSize: config.tailSize } })
++          } catch (error) { reject(error) }
++        })
++      })
++    } finally {
++      if (interval) clearInterval(interval)
++      // Stop sampling even when the input window aborts before freeze; do this
++      // before unmount, which can itself block on output backpressure.
++      if (profiler) try { await profiler.stop() } catch (error) { tell({ type: 'error', error: `CPU profiler cleanup: ${String(error)}` }); process.exitCode = 1 }
++      try {
++        await app.unmount()
++        stdout.end()
++        await finished(stdout)
++      } finally {
++        unsubscribe(); mount.dispose(); unregister()
++        for (const cleanup of [...cleanups].reverse()) cleanup()
++      }
++    }
++  } catch (error) {
++    tell({ type: 'error', error: String(error) })
++    process.exitCode = 1
++  } finally {
++    // Idempotent: also covers disconnect, render failure and partial startup.
++    if (profiler) try { await profiler.stop() } catch (error) { tell({ type: 'error', error: `CPU profiler cleanup: ${String(error)}` }); process.exitCode = 1 }
++    frameOutput.end()
++    try { await finished(frameOutput) } catch (error) { tell({ type: 'error', error: `framed pipe completion: ${String(error)}` }); process.exitCode = 1 }
++    if (config.trace) tell({ type: 'trace', data: { entries: traceEntries, droppedReadable, droppedWrites } satisfies ChildTrace })
++    closeSync(ttyFd)
++    if (process.connected) process.disconnect()
++  }
++}
+diff --git a/scripts/perf-input-latency.tsx b/scripts/perf-input-latency.tsx
+new file mode 100644
+index 00000000..bfe9d395
+--- /dev/null
++++ b/scripts/perf-input-latency.tsx
+@@ -0,0 +1,640 @@
++/**
++ * Isolated input latency probe: `NODE_ENV=production node --import tsx/esm scripts/perf-input-latency.tsx`
++ * Optional synthetic Chat history: `NODE_ENV=production BENCH_CHAT=1 node --import tsx/esm scripts/perf-input-latency.tsx`
++ * `BENCH_CHAT_BUSY=1` runs matched idle and simulated-streaming Chat fixtures.
++ * `BENCH_DSH_CHANNEL=1` uses real DSH channel/router with synthetic agents and
++ * events. BENCH_CPU_PROFILE=1 adds in-process CPU sampling during each real
++ * channel input window only; no inspector server or profile file is opened.
++ * Env: DRAFT_SIZES=0,1000,5000 (unit repeat counts), DRAFT_UNIT=a,
++ * CHAT_TURNS=0,120,800 REAL_CHANNEL_TURNS=0 KEYS=20 (1..50),
++ * REAL_SMOOTH_STREAMING=1 (0 or 1, matching production's default), and
++ * BUSY_INTERVAL_MS=16 (positive integer, nominal interval; timers may slip).
++ * Real channel accepts one history size per process and cannot share a process
++ * with mock Chat fixtures: reveal cursors are module-global and key on row id.
++ * For comparisons launch separate processes and set the smooth flag explicitly.
++ *
++ * Measures a real PromptInput or Chat and headless xterm (100x40), not a real
++ * terminal, backend, IME, network, streaming transcript, or physical display.
++ * Component drafts are controller-injected, UNFOLDED, and single-line; the
++ * default unit is ASCII 'a', or set DRAFT_UNIT for synthetic Unicode. Each
++ * seed reports the unit, repeat count and UTF-16 length, never the full draft.
++ * This is not the default folded-paste path. Chat uses synthetic static mock rows,
++ * not restored DSH chunks. The busy fixture appends synthetic text to one
++ * assistant row and emits mock channel versions; it does not model network,
++ * backend projection, tool activity or real user data. The DSH fixture uses
++ * real createChannel/registerTuiChannel/mountChannelUi with an in-memory fake
++ * host and injects 0.1.5+ agent/assistant-stream frames, but no real account,
++ * persistence, network, agent, tool or model runs. It counts ingress separately
++ * from real emitStream calls and an added UI subscriber; notifications can
++ * include synchronous session events and other emits, not only stream wakes.
++ * Every chunk must appear in the exact projected and settled synthetic text;
++ * the visible tail marker does not prove the full transcript fits onscreen.
++ * Reveal ticks are observed separately from frames and channel notifications.
++ * The producer stops and the reveal drains before settlement, so this is not
++ * a test of settling while reveal still has a backlog. Each busy key waits
++ * for a new stream event; asynchronous timer scheduling can bunch events and
++ * the idle case does not have that pacing. Clicks reposition the caret inside
++ * already visible input; they do not measure focusing an empty composer.
++ *
++ * Each key is unique and must change the cell immediately before the native
++ * caret, close to the preceding caret; click must move it to the target. Checks
++ * run only after xterm's async write callback, not on an arbitrary Ink frame.
++ * A stream flush marker drains output already queued to the fake stdout between
++ * samples, and stdin/output backpressure indicators are reported. This only
++ * verifies the version xterm has presented by that callback: it cannot prove
++ * no later output will supersede it, nor measure a real terminal's drain,
++ * compositor, network, keyboard, or input-method latency. onFrame durations can
++ * omit input/React work and phase timings can overlap. The optional profiler
++ * adds overhead; sampling includes gated waiting and runtime work. To avoid
++ * exposing user data it outputs only preapproved function names (same-name
++ * functions are combined) and aggregate other/idle/GC buckets, not paths,
++ * arbitrary function names, source, or raw profiles. Inclusive counts are
++ * samples with that function anywhere on stack; self counts are leaf samples.
++ * Repeat fresh processes; sample size, JIT, geometry and load matter.
++ *
++ * HOME, XDG and DSH state are isolated in an owned temporary directory; inherited
++ * DSH_* options (including all log/trace paths) are removed before app imports.
++ * The fake TTY has an owned fd for Ink's synchronous unmount writes, never fd 1.
++ */
++import { closeSync, mkdtempSync, openSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { PassThrough, Writable } from 'node:stream'
++import { settled } from './lib/term-test.mjs'
++
++// JSX runtime imports can load React before the module body. Require the
++// production build in the process environment, as the real package entry does.
++if (process.env.NODE_ENV !== 'production') throw new Error('Set NODE_ENV=production before starting this input benchmark')
++const scratch = mkdtempSync(join(tmpdir(), 'dsh-input-latency-'))
++let ttyFd: number | undefined
++try {
++  for (const key of Object.keys(process.env)) if (key.startsWith('DSH_')) delete process.env[key]
++  process.env.HOME = scratch
++  process.env.USERPROFILE = scratch
++  process.env.XDG_CONFIG_HOME = join(scratch, 'config')
++  process.env.XDG_CACHE_HOME = join(scratch, 'cache')
++  process.env.XDG_DATA_HOME = join(scratch, 'data')
++  process.env.XDG_STATE_HOME = join(scratch, 'state')
++  process.env.DSH_HOME = join(scratch, 'dsh')
++  process.env.FORCE_COLOR = '3'
++  process.env.DSH_TUI_LANG = 'zh'
++  ttyFd = openSync(join(scratch, 'tty-output'), 'w')
++  await main(ttyFd)
++} finally {
++  try { if (ttyFd !== undefined) closeSync(ttyFd) } finally { rmSync(scratch, { recursive: true, force: true }) }
++}
++
++async function main(fd: number): Promise<void> {
++  const [React, { Terminal }, { Box, render, AlternateScreen }, { PromptInput }, { LOCAL_COMMANDS }] = await Promise.all([
++    import('react'), import('@xterm/headless'), import('../src/ui.js'),
++    import('../src/components/PromptInput.js'), import('../src/commands.js'),
++  ])
++  const COLS = 100, ROWS = 40
++  const KEYS = Number(process.env.KEYS ?? 20)
++  const draftUnit = process.env.DRAFT_UNIT ?? 'a'
++  if (draftUnit === '' || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(draftUnit)) throw new Error('DRAFT_UNIT must be nonempty and contain no newline or control characters')
++  if (process.env.BENCH_CPU_PROFILE === '1' && process.env.BENCH_DSH_CHANNEL !== '1') throw new Error('BENCH_CPU_PROFILE=1 requires BENCH_DSH_CHANNEL=1')
++  const busyInterval = Number(process.env.BUSY_INTERVAL_MS ?? 16)
++  const sizes = (process.env.DRAFT_SIZES ?? '0,1000,5000').split(',').map(Number)
++  const turnCounts = (process.env.CHAT_TURNS ?? '0,120,800').split(',').map(Number)
++  const dshTurnCounts = (process.env.REAL_CHANNEL_TURNS ?? '0').split(',').map(Number)
++  const realSmoothOption = process.env.REAL_SMOOTH_STREAMING ?? '1'
++  if (realSmoothOption !== '0' && realSmoothOption !== '1') throw new Error('REAL_SMOOTH_STREAMING must be 0 or 1')
++  const realSmoothStreaming = realSmoothOption === '1'
++  if (process.env.BENCH_DSH_CHANNEL === '1' && (dshTurnCounts.length !== 1 || process.env.BENCH_CHAT === '1' || process.env.BENCH_CHAT_BUSY === '1')) {
++    throw new Error('real channel requires one REAL_CHANNEL_TURNS value and a process without mock Chat fixtures')
++  }
++  if (!Number.isInteger(KEYS) || KEYS < 1 || KEYS > 50 || !Number.isInteger(busyInterval) || busyInterval < 1 || [...sizes, ...turnCounts, ...dshTurnCounts].some(n => !Number.isInteger(n) || n < 0)) {
++    throw new Error('KEYS must be 1..50, BUSY_INTERVAL_MS positive; draft and turn counts must be nonnegative integers')
++  }
++  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmn'
++  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
++  const percentile = (values: number[], p: number) => {
++    const sorted = [...values].sort((a, b) => a - b)
++    return Number((sorted[Math.ceil(sorted.length * p) - 1] ?? 0).toFixed(2))
++  }
++  type Frame = { durationMs: number; phases?: { yoga: number; renderer: number; diff: number; write: number; commit: number } }
++  type Pending = { check: () => boolean; start: number; resolve: (duration: number) => void }
++
++  function makeHarness() {
++    const term = new Terminal({ cols: COLS, rows: ROWS, scrollback: 0, allowProposedApi: true })
++    let pending: Pending | undefined
++    let outputBytes = 0, outputWrites = 0, outputDrainEvents = 0, maxOutputQueuedBytes = 0, stdinBackpressure = 0
++    const lines = () => Array.from({ length: ROWS }, (_, row) => term.buffer.active.getLine(term.buffer.active.baseY + row)?.translateToString(true) ?? '')
++    class Out extends Writable {
++      columns = COLS
++      rows = ROWS
++      isTTY = true
++      fd = fd
++      override _write(chunk: unknown, _encoding: BufferEncoding, done: () => void) {
++        const text = String(chunk)
++        outputWrites++
++        outputBytes += Buffer.byteLength(text)
++        maxOutputQueuedBytes = Math.max(maxOutputQueuedBytes, this.writableLength)
++        term.write(text, () => {
++          if (pending?.check()) {
++            const sample = pending
++            pending = undefined
++            sample.resolve(performance.now() - sample.start)
++          }
++          done()
++        })
++      }
++    }
++    class In extends PassThrough {
++      isTTY = true
++      setRawMode() { return this }
++      override ref() { return this }
++      override unref() { return this }
++    }
++    const stdout = new Out(), stdin = new In()
++    stdout.on('drain', () => { outputDrainEvents++ })
++    const stderr = Object.assign(new Writable({ write(_chunk, _encoding, done) { done() } }), { isTTY: true })
++    const flush = () => new Promise<void>((resolve, reject) => stdout.write('', error => error ? reject(error) : resolve()))
++    const send = (input: string) => { if (!stdin.write(input)) stdinBackpressure++ }
++    const stats = () => ({ outputWrites, outputBytes, outputDrainEvents, maxOutputQueuedBytes, stdinBackpressure })
++    const measure = async (check: () => boolean, trigger: () => void, label: string) => {
++      if (pending) throw new Error('overlapping measurement')
++      let timer: ReturnType<typeof setTimeout> | undefined
++      const result = new Promise<number>((resolve, reject) => {
++        pending = { check, start: performance.now(), resolve }
++        timer = setTimeout(() => { pending = undefined; reject(new Error(`timeout ${label}`)) }, 15_000)
++      })
++      try { trigger(); return await result } finally { clearTimeout(timer); pending = undefined }
++    }
++    const caret = () => ({ x: term.buffer.active.cursorX, y: term.buffer.active.cursorY })
++    const at = (x: number, y: number) => term.buffer.active.getLine(term.buffer.active.baseY + y)?.getCell(x)?.getChars() ?? ''
++    const type = async (label: string, hooks?: { beforeKey?: () => Promise<void>; started?: () => void; finished?: () => void; draftMatches?: (expected: string) => boolean }) => {
++      const samples: number[] = []
++      for (let index = 0; index < KEYS; index++) {
++        await flush()
++        await hooks?.beforeKey?.()
++        const before = caret()
++        // Snapshot terminal cells, not JS string offsets: a CJK/emoji prefix
++        // can make UTF-16 indices disagree with physical terminal columns.
++        const previous = new Map<number, string[]>()
++        for (let row = Math.max(0, before.y - 3); row <= Math.min(ROWS - 1, before.y + 2); row++) {
++          previous.set(row, Array.from({ length: COLS }, (_, col) => at(col, row)))
++        }
++        const character = alphabet[index]!
++        samples.push(await measure(() => {
++          const after = caret()
++          if (after.x === before.x && after.y === before.y) return false
++          if (Math.abs(after.y - before.y) > 2) return false
++          // ASCII input places its newly drawn cell immediately before caret.
++          // For a wrap at column 0 the previous row's last cell is the target.
++          const x = after.x === 0 ? COLS - 1 : after.x - 1
++          const y = after.x === 0 ? after.y - 1 : after.y
++          if (y < 0 || y >= ROWS) return false
++          return at(x, y) === character && previous.get(y)?.[x] !== character && (hooks?.draftMatches?.(alphabet.slice(0, index + 1)) ?? true)
++        }, () => { hooks?.started?.(); send(character) }, `${label} key=${index + 1}`))
++        hooks?.finished?.()
++      }
++      await flush()
++      return samples
++    }
++    return { term, stdout, stdin, stderr, lines, flush, send, stats, measure, caret, at, type }
++  }
++  function report(label: Record<string, unknown>, times: number[], frames: Frame[], stats: ReturnType<ReturnType<typeof makeHarness>['stats']>) {
++    const sum = (phase: 'yoga' | 'renderer' | 'diff' | 'write' | 'commit') => Number(frames.reduce((total, frame) => total + (frame.phases?.[phase] ?? 0), 0).toFixed(2))
++    console.log(JSON.stringify({ ...label, keys: times.length, latencyMs: { p50: percentile(times, 0.5), p95: percentile(times, 0.95), max: percentile(times, 1) }, frames: frames.length, frameP95Ms: percentile(frames.map(frame => frame.durationMs), 0.95), phaseTotalsMs: { yoga: sum('yoga'), renderer: sum('renderer'), diff: sum('diff'), write: sum('write'), commit: sum('commit') }, stream: stats }))
++  }
++
++  for (const draftChars of sizes) {
++    const h = makeHarness()
++    const controller: { current: { append(text: string): string; text(): string } | null } = { current: null }
++    const channel = { whaleIdle: false, mode: { id: 'default', plan: false }, modeIndex: 0, cycleMode() {}, commandList: LOCAL_COMMANDS, commandCompletions: () => [], notifications: [], pending: [], working: false, notify() {}, submit() {}, steer() {}, interruptAndDeliver() { return 0 }, removePending() { return false }, stageImage() {}, listFiles: async () => [], sessionColor: '' }
++    let measuring = false, totalFrames = 0
++    const frames: Frame[] = []
++    const app = await render(<AlternateScreen><Box height={ROWS} flexDirection="column" justifyContent="flex-end"><PromptInput channel={channel as never} helpOpen={false} onToggleHelp={() => {}} onRunCommand={() => false} selectionActive={false} controllerRef={controller as never} /></Box></AlternateScreen>, { stdout: h.stdout as never, stdin: h.stdin as never, stderr: h.stderr as never, exitOnCtrlC: false, patchConsole: false, onFrame: frame => { totalFrames++; if (measuring) frames.push(frame as Frame) } })
++    try {
++      if (!await settled(() => controller.current !== null && h.stats().outputWrites > 0, { timeoutMs: 8000 })) throw new Error('prompt controller unavailable')
++      const seed = draftUnit.repeat(draftChars)
++      const framesBeforeSeed = totalFrames
++      controller.current!.append(seed)
++      if (!await settled(() => controller.current?.text() === seed && (draftChars === 0 || totalFrames > framesBeforeSeed), { timeoutMs: 8000 })) throw new Error('seeded draft did not reach a rendered frame')
++      await sleep(500) // 固定窗:pacing 统一组件预热窗，减少不同草稿首帧和 JIT 干扰
++      await h.flush()
++      measuring = true
++      const times = await h.type(`draft=${draftChars}`)
++      measuring = false
++      const draftInfo = { draftUnit, unitUtf16Length: draftUnit.length, draftRepeatCount: draftChars, draftUtf16Length: seed.length }
++      report({ fixture: 'prompt', ...draftInfo }, times, frames, h.stats())
++      // Verify the ENTIRE synthetic typed suffix backwards from the native
++      // caret, across actual display rows. A cursor column includes the input
++      // gutter: x >= 9 does not imply nine text cells exist on the final row.
++      let typed = alphabet.slice(0, KEYS)
++      const diagnoseGeometry = (reason: string): void => {
++        const cursor = h.caret()
++        const text = controller.current?.text() ?? ''
++        const screen = h.lines()
++        const nearby = Array.from({ length: 6 }, (_, index) => cursor.y - 4 + index)
++          .filter(index => index >= 0 && index < ROWS)
++          .map(index => ({ row: index, text: screen[index], cells: Array.from({ length: COLS }, (_, x) => h.at(x, index)) }))
++        // The channel, seed, and keys are synthetic; never read a real session.
++        console.error(`CLICK_SUFFIX_DIAGNOSTIC ${JSON.stringify({ reason, cursor, typed, draftUtf16Length: text.length, draftTail: text.slice(-80), expectedDraftUtf16Length: seed.length + typed.length, expectedDraft: text === seed + typed, totalFrames, stream: h.stats(), nearby })}`)
++      }
++      const failGeometry = (reason: string): never => { diagnoseGeometry(reason); throw new Error('cursor-anchored click suffix mismatch') }
++      const typedRuns = () => {
++        if (controller.current?.text() !== seed + typed) return failGeometry('composer draft does not contain the exact injected suffix')
++        const cursor = h.caret()
++        let pending = typed.length - 1, row = cursor.y, col = cursor.x - 1
++        const runs: Array<{ row: number; start: number; end: number }> = []
++        while (pending >= 0 && row >= 0) {
++          // A previous wrapped row can have unused right margin. Do not skip
++          // any nonblank cell, or we could conceal a real corrupted redraw.
++          if (row !== cursor.y) while (col >= 0 && (h.at(col, row) === '' || h.at(col, row) === ' ')) col--
++          const end = col
++          while (pending >= 0 && col >= 0 && h.at(col, row) === typed[pending]) { pending--; col-- }
++          if (col === end) return failGeometry('expected typed cell missing at caret or wrapped-row boundary')
++          const start = col + 1
++          runs.push({ row, start, end })
++          if (pending < 0) break
++          const firstContent = Array.from({ length: COLS }, (_, x) => h.at(x, row)).findIndex(cell => cell !== '' && cell !== ' ')
++          if (firstContent !== start) return failGeometry('typed suffix has an internal gap, not a row wrap')
++          row--
++          col = COLS - 1
++        }
++        if (pending >= 0) return failGeometry('typed suffix not fully visible')
++        return runs
++      }
++      let runs = typedRuns()
++      let clickPaddingKeys = 0
++      // Click the CURRENT caret row: selecting an earlier wrapped row can move
++      // the viewport, invalidating physical coordinates. If fewer than four
++      // characters fit there, extend the synthetic draft outside the typing
++      // timing window; record the exact number and verify each extra key.
++      while (runs[0]!.end - runs[0]!.start < 3 && clickPaddingKeys < 7) {
++        await h.flush()
++        const before = h.caret()
++        const next = typed + '~'
++        await h.measure(() => {
++          const after = h.caret()
++          const x = after.x === 0 ? COLS - 1 : after.x - 1
++          const y = after.x === 0 ? after.y - 1 : after.y
++          return (after.x !== before.x || after.y !== before.y) && y >= 0 && h.at(x, y) === '~' && controller.current?.text() === seed + next
++        }, () => h.send('~'), `click precondition draft=${draftChars} key=${clickPaddingKeys + 1}`)
++        typed = next
++        clickPaddingKeys++
++        await h.flush()
++        runs = typedRuns()
++      }
++      const run = runs[0]!
++      if (run.end - run.start < 3) failGeometry('cannot establish two separated interior click targets')
++      const clicks: number[] = []
++      for (let index = 0; index < 10; index++) {
++        await h.flush()
++        // At a wrap join, the boundary at start maps to the preceding row.
++        // Stay inside the run, and separate clicks by >=2 cells to avoid the
++        // composer's double-click word-selection rule.
++        const target = index % 2 === 0 ? run.start + 1 : run.end
++        const before = h.caret()
++        if (before.x === target && before.y === run.row) throw new Error('click must move cursor')
++        try {
++          clicks.push(await h.measure(() => { const after = h.caret(); return after.x === target && after.y === run.row }, () => {
++            h.send(`\x1b[<0;${target + 1};${run.row + 1}M`)
++            h.send(`\x1b[<0;${target + 1};${run.row + 1}m`)
++          }, `click draft=${draftChars} target=${target},${run.row}`))
++        } catch (error) {
++          diagnoseGeometry(`click did not land at ${target},${run.row}`)
++          throw error
++        }
++      }
++      await h.flush()
++      console.log(JSON.stringify({ fixture: 'prompt-click', ...draftInfo, clickPaddingKeys, typedSuffixRuns: runs.length, clicks: clicks.length, clickToCursorMs: { p50: percentile(clicks, 0.5), p95: percentile(clicks, 0.95), max: percentile(clicks, 1) }, stream: h.stats() }))
++    } finally {
++      await app.unmount()
++      await h.flush()
++      h.term.dispose()
++    }
++  }
++
++  const runBusy = process.env.BENCH_CHAT_BUSY === '1'
++  if (process.env.BENCH_CHAT === '1' || runBusy) {
++    const [{ Chat }, { QuestionStore }, { completeCommands }] = await Promise.all([import('../src/screens/Chat.js'), import('../src/dsh-adapter/questions.js'), import('../src/commands.js')])
++    for (const turns of turnCounts) for (const busy of runBusy ? [false, true] : [false]) {
++      const h = makeHarness()
++      const rows: unknown[] = []
++      let id = 0
++      for (let turn = 1; turn <= turns; turn++) {
++        rows.push({ id: ++id, kind: 'user', text: `问题 ${turn}` })
++        for (let tool = 0; tool < 2; tool++) rows.push({ id: ++id, kind: 'tool', text: '', tool: { callId: `${turn}-${tool}`, name: 'Read', argsText: '{"file_path":"/tmp/f.ts"}', argsFull: '{}', status: 'ok', startedAt: 0, durationMs: 30, resultText: '内容行 1\n内容行 2' } })
++        rows.push({ id: ++id, kind: 'assistant', text: `回复 ${turn} 第一行\n回复第二行` })
++      }
++      // The extra assistant row is present in both fixtures. Only the busy
++      // variant mutates its text and emits channel versions during typing.
++      const streamRow = { id: ++id, kind: 'assistant', text: 'synthetic stream: ', streaming: busy }
++      if (runBusy) rows.push(streamRow)
++      const listeners = new Set<() => void>()
++      const channel = { whaleIdle: false, whale: false, version: 0, rows, status: busy ? 'running' : 'idle', sessionTitle: 'probe', agentId: 'probe', model: 'deepseek-v4-flash', provider: 'deepseek', reasoningEffort: 'max', effortLevels: [], tokens: { input: 0, output: 0 }, cwd: '/tmp/demo', displayCwd: '/tmp/demo', gitBranch: 'main', working: busy, spinnerMode: 'requesting', responseChars: 0, activeToolCount: 0, turnStart: 0, pending: [], commandList: LOCAL_COMMANDS, notifications: [], mode: { plan: false }, activityFrames: 'moon8', subagents: [], lastUserText: '', scrollGutter: 'timeline', subscribe(cb: () => void) { listeners.add(cb); return () => listeners.delete(cb) }, submit() {}, cancel() {}, clear() {}, notify() {}, listModels: async () => [], listSessions: async () => [], deleteSession: async () => true, renameSessionTo: async () => true, setResumeTarget() {}, loadOlder() {}, mcpStatus: () => [], pushLocal() {}, commandCompletions: (input: string) => completeCommands(input) }
++      let measuring = false
++      const frames: Frame[] = []
++      let interval: ReturnType<typeof setInterval> | undefined
++      let updates = 0, notifications = 0, updatesInFlight = 0, keysWithOverlap = 0, gatedKeys = 0
++      let inFlight = false, keyStartVersion = 0
++      let nextEvent: (() => void) | undefined
++      const app = await render(<AlternateScreen><Chat channel={channel as never} questionStore={new QuestionStore()} fullscreen trajectorySeen /></AlternateScreen>, { stdout: h.stdout as never, stdin: h.stdin as never, stderr: h.stderr as never, exitOnCtrlC: false, patchConsole: false, onFrame: frame => { if (measuring) frames.push(frame as Frame) } })
++      try {
++        if (!await settled(() => listeners.size > 0 && h.stats().outputWrites > 0, { timeoutMs: 8000 })) throw new Error('chat not subscribed or painted')
++        await sleep(1500) // 固定窗:pacing 统一 Chat 基准预热窗，减少开场动画和 JIT 对组间的干扰
++        await h.flush()
++        if (busy) {
++          interval = setInterval(() => {
++            updates++
++            streamRow.text += ` chunk-${String(updates).padStart(5, '0')}`
++            channel.responseChars = streamRow.text.length
++            channel.version++
++            if (inFlight) updatesInFlight++
++            notifications += listeners.size
++            for (const listener of listeners) listener()
++            const resolve = nextEvent
++            nextEvent = undefined
++            resolve?.()
++          }, busyInterval)
++        }
++        measuring = true
++        const times = await h.type(`chat turns=${turns} busy=${busy}`, busy ? {
++          beforeKey: () => new Promise<void>((resolve, reject) => {
++            const timeout = setTimeout(() => { nextEvent = undefined; reject(new Error('stream event timeout')) }, 15_000)
++            nextEvent = () => { clearTimeout(timeout); gatedKeys++; resolve() }
++          }),
++          started: () => { keyStartVersion = updates; inFlight = true },
++          finished: () => { inFlight = false; if (updates > keyStartVersion) keysWithOverlap++ },
++        } : undefined)
++        measuring = false
++        if (interval !== undefined) { clearInterval(interval); interval = undefined }
++        let visibleConfirmed = false
++        if (busy) {
++          if (updates < KEYS || gatedKeys !== KEYS || notifications < updates) throw new Error(`stream not delivered: updates=${updates} gated=${gatedKeys} notifications=${notifications}`)
++          // The final synthetic marker must reach xterm, not merely mutate the
++          // mock. Timers have stopped; allow the scheduled React render to land.
++          const marker = `chunk-${String(updates).padStart(5, '0')}`
++          visibleConfirmed = await settled(() => h.lines().some(line => line.includes(marker)), { stepMs: 20, timeoutMs: 5000 })
++          if (!visibleConfirmed) throw new Error(`stream final marker not painted: ${marker}`)
++          await h.flush()
++        }
++        report({ fixture: 'chat-mock', phase: busy ? 'simulated-stream' : 'idle', turns, rows: rows.length, ...(busy ? { simulatedStream: { intervalMs: busyInterval, updates, notifications, gatedKeys, updatesInFlight, keysWithOverlap, visibleConfirmed } } : {}) }, times, frames, h.stats())
++      } finally {
++        if (interval !== undefined) clearInterval(interval)
++        await app.unmount()
++        await h.flush()
++        h.term.dispose()
++      }
++    }
++  }
++
++  if (process.env.BENCH_DSH_CHANNEL === '1') {
++    const [{ Chat }, { QuestionStore }, { createChannel }, { mountChannelUi }, { registerTuiChannel }, { bindChannelCommands }, { subscribeReveal, isRevealTimerRunning, resetRevealForTest }] = await Promise.all([
++      import('../src/screens/Chat.js'), import('../src/dsh-adapter/questions.js'), import('../src/dsh-adapter/channel.js'),
++      import('../src/dsh-adapter/channel-ui.js'), import('../src/adapter/channel/host-registry.js'), import('../src/dsh-adapter/channel/commands.js'),
++      import('../src/components/smoothReveal.js'),
++    ])
++    // Import/connect only when explicitly enabled; Session.connect() is local
++    // to this process and does not open an inspector listening socket.
++    const profileInput = process.env.BENCH_CPU_PROFILE === '1' ? await (async () => {
++      const inspector = await import('node:inspector')
++      const allowedFunctions = new Set([
++        'PromptInput', 'Chat', 'caretInText', 'wrapLineRows', 'wrapToWidth', 'visualLineRanges', 'clickToCursorOffset',
++        'diffSpan', 'recordDraftEdit', 'setInput', 'stringWidth', 'stringWidthJavaScript', 'layoutNode',
++        'renderNodeToOutput', 'render', 'onRender', 'calculateLayout', 'workLoopSync', 'performUnitOfWork',
++        'beginWork', 'completeWork', 'commitRoot', 'flushSyncWorkAcrossRoots_impl',
++        '(idle)', '(program)', '(garbage collector)',
++      ])
++      type CpuProfile = { nodes: Array<{ id: number; children?: number[]; callFrame: { functionName: string } }>; samples?: number[]; timeDeltas?: number[]; startTime: number; endTime: number }
++      function summarizeProfile(profile: CpuProfile) {
++        const samples = profile.samples ?? []
++        if (samples.length === 0) throw new Error('CPU profiler returned no samples')
++        const nodes = new Map(profile.nodes.map(node => [node.id, node]))
++        const parents = new Map<number, number>()
++        for (const node of profile.nodes) for (const child of node.children ?? []) parents.set(child, node.id)
++        const counts = new Map<string, { self: number; inclusive: number }>()
++        const bucket = (name: string) => {
++          const current = counts.get(name) ?? { self: 0, inclusive: 0 }
++          counts.set(name, current)
++          return current
++        }
++        for (const id of samples) {
++          const node = nodes.get(id)
++          if (!node) throw new Error('CPU profiler returned an unknown sample node')
++          const name = node.callFrame.functionName
++          bucket(allowedFunctions.has(name) ? name : '(other)').self++
++          const seen = new Set<string>()
++          let cursor: number | undefined = id
++          while (cursor !== undefined) {
++            const current = nodes.get(cursor)
++            if (!current) throw new Error('CPU profiler returned an unknown stack node')
++            const key = current.callFrame.functionName
++            if (allowedFunctions.has(key) && !seen.has(key)) { bucket(key).inclusive++; seen.add(key) }
++            cursor = parents.get(cursor)
++          }
++        }
++        return {
++          sampleCount: samples.length,
++          durationMs: Number(((profile.endTime - profile.startTime) / 1000).toFixed(2)),
++          attribution: 'self samples and inclusive stack samples; names merged; other is self only',
++          functions: [...counts].map(([functionName, count]) => ({ functionName, selfSamples: count.self, inclusiveSamples: count.inclusive })).sort((a, b) => b.inclusiveSamples - a.inclusiveSamples || b.selfSamples - a.selfSamples),
++        }
++      }
++      return async function profileInput(work: () => Promise<number[]>) {
++        const session = new inspector.Session()
++        const failures: unknown[] = []
++        let connected = false, enabled = false, running = false
++        let times: number[] | undefined
++        let profile: CpuProfile | undefined
++        const enable = () => new Promise<void>((resolve, reject) => session.post('Profiler.enable', error => error ? reject(error) : resolve()))
++        const start = () => new Promise<void>((resolve, reject) => session.post('Profiler.start', error => error ? reject(error) : resolve()))
++        const stop = () => new Promise<CpuProfile>((resolve, reject) => session.post('Profiler.stop', (error, result) => error ? reject(error) : resolve(result.profile as CpuProfile)))
++        const disable = () => new Promise<void>((resolve, reject) => session.post('Profiler.disable', error => error ? reject(error) : resolve()))
++        try {
++          session.connect(); connected = true
++          await enable(); enabled = true
++          await start(); running = true
++          times = await work()
++        } catch (error) { failures.push(error) }
++        finally {
++          if (running) try { profile = await stop() } catch (error) { failures.push(error) }
++          if (enabled) try { await disable() } catch (error) { failures.push(error) }
++          if (connected) try { session.disconnect() } catch (error) { failures.push(error) }
++        }
++        if (failures.length === 1) throw failures[0]
++        if (failures.length > 1) throw new AggregateError(failures, 'CPU profiling or input measurement failed')
++        if (times === undefined || profile === undefined) throw new Error('CPU profiling did not produce a result')
++        return { times, cpuProfile: summarizeProfile(profile) }
++      }
++    })() : undefined
++    for (const turns of dshTurnCounts) for (const busy of [false, true]) {
++      type RawEvent = { type: string; seq: number; time: number; data: Record<string, unknown> }
++      const events: RawEvent[] = []
++      let seq = 0
++      const event = (type: string, data: Record<string, unknown>): RawEvent => ({ type, seq: ++seq, time: seq, data })
++      for (let turn = 1; turn <= turns; turn++) {
++        events.push(event('user/message', { id: `synthetic-user-${turn}`, source: { kind: 'user' }, content: [{ type: 'text', text: `synthetic question ${turn}` }] }))
++        events.push(event('assistant/message', { turn, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: `synthetic answer ${turn}` }] } }))
++      }
++      const listeners = new Map<string, Set<(...args: unknown[]) => unknown>>()
++      const cleanups: (() => void)[] = []
++      const agent = { id: 'synthetic-dsh-agent', status: 'idle', session: { id: 'synthetic-dsh-session', seq, events, header: { cwd: scratch } }, ctx: { on: () => () => undefined }, followup() {}, steer() {}, cancel() {}, inbox: { remove: () => true } }
++      const services: Record<string, unknown> = {
++        settings: { describe: () => [{ ns: 'llm-pi-ai', revision: 1, user: {}, value: {} }, { ns: 'dsh-tui', revision: 1, user: {}, value: { recapOnOpen: false } }], get: () => ({}), mutate: async () => undefined },
++        credentials: { resolve: async () => undefined, set: async () => undefined, unset: async () => undefined },
++        llm: { listConfigurableProviders: () => [], discoverModels: async () => [] },
++        agents: { create: async () => { throw new Error('synthetic fixture refuses create') }, resume: async () => { throw new Error('synthetic fixture refuses resume') } },
++      }
++      const ctx = {
++        on(name: string, callback: (...args: unknown[]) => unknown) {
++          const bucket = listeners.get(name) ?? new Set()
++          bucket.add(callback)
++          listeners.set(name, bucket)
++          return () => { bucket.delete(callback) }
++        },
++        effect(setup: () => () => void) { cleanups.push(setup()) },
++        get(name: string) { return services[name] },
++        logger: { warn() {} },
++      }
++      const raw = createChannel(ctx as never, agent as never, { model: 'synthetic', provider: 'synthetic', cwd: scratch, activity: false, whale: false, whaleIdle: false, minimalUi: true, smoothStreaming: realSmoothStreaming })
++      // Count real router calls into the production frame-coalescing emitter;
++      // the wrapper delegates to the original implementation unmodified.
++      let measuring = false, emitStreamCalls = 0, emitStreamCallsDuringTyping = 0
++      const originalEmitStream = raw.emitStream
++      raw.emitStream = () => {
++        emitStreamCalls++
++        if (measuring) emitStreamCallsDuringTyping++
++        originalEmitStream()
++      }
++      const unregister = registerTuiChannel(ctx, raw)
++      const mount = mountChannelUi(ctx, raw, undefined, 'new')
++      bindChannelCommands(raw, mount.channel)
++      if (mount.channel.smoothStreaming !== realSmoothStreaming) throw new Error('real channel smoothStreaming configuration mismatch')
++      let revealTicks = 0, revealTicksDuringTyping = 0
++      const unsubscribeReveal = subscribeReveal(() => { revealTicks++; if (measuring) revealTicksDuringTyping++ })
++      let notifications = 0, notificationsDuringTyping = 0
++      const unsubscribe = mount.channel.subscribe(() => { notifications++; if (measuring) notificationsDuringTyping++ })
++      const h = makeHarness()
++      const controller: { current: { text(): string } | null } = { current: null }
++      const frames: Frame[] = []
++      let totalFrames = 0
++      let interval: ReturnType<typeof setInterval> | undefined
++      let ingressChunks = 0, sessionIngress = 0, startFrames = 0, endFrames = 0, sessionHandlerCalls = 0, streamHandlerCalls = 0, updatesInFlight = 0, keysWithOverlap = 0, gatedKeys = 0
++      let inFlight = false, keyStartCount = 0, revision = 0
++      let nextEvent: (() => void) | undefined
++      let expected = ''
++      const deliver = (name: string, ...args: unknown[]) => {
++        const handlers = [...(listeners.get(name) ?? [])]
++        if (handlers.length === 0) throw new Error(`no real channel handler for ${name}`)
++        for (const handler of handlers) {
++          if (name === 'session/event') sessionHandlerCalls++
++          if (name === 'agent/assistant-stream') streamHandlerCalls++
++          handler(...args)
++        }
++      }
++      const appendEvent = (type: string, data: Record<string, unknown>) => {
++        const item = event(type, data)
++        agent.session.seq = item.seq
++        agent.session.events.push(item)
++        sessionIngress++
++        deliver('session/event', agent.session, item)
++        return item
++      }
++      const sendFrame = (frame: Record<string, unknown>) => {
++        if (frame.type === 'start') startFrames++
++        if (frame.type === 'end') endFrames++
++        deliver('agent/assistant-stream', { agent, frame })
++      }
++      const app = await render(<AlternateScreen><Chat channel={mount.channel} questionStore={new QuestionStore()} fullscreen trajectorySeen promptControllerRef={controller as never} /></AlternateScreen>, {
++        stdout: h.stdout as never, stdin: h.stdin as never, stderr: h.stderr as never, exitOnCtrlC: false, patchConsole: false,
++        onFrame: frame => { totalFrames++; if (measuring) frames.push(frame as Frame) },
++      })
++      try {
++        if (!await settled(() => (listeners.get('agent/assistant-stream')?.size ?? 0) > 0 && h.stats().outputWrites > 0 && controller.current !== null, { timeoutMs: 8000 })) throw new Error('real channel not subscribed, painted or ready for input')
++        await sleep(1500) // 固定窗:pacing 统一真实通道预热窗，降低历史折叠和启动帧对组间的干扰
++        await h.flush()
++        notifications = 0
++        notificationsDuringTyping = 0
++        revealTicks = 0
++        revealTicksDuringTyping = 0
++        emitStreamCalls = 0
++        emitStreamCallsDuringTyping = 0
++        sessionHandlerCalls = 0
++        streamHandlerCalls = 0
++        if (busy) {
++          appendEvent('turn/start', { turn: turns + 1 })
++          appendEvent('step/start', { turn: turns + 1, step: 1 })
++          sendFrame({ type: 'start', revision: ++revision, attemptId: 'synthetic-attempt', turn: turns + 1, step: 1 })
++        }
++        const runInputWindow = async () => {
++          if (busy) {
++            interval = setInterval(() => {
++              const index = ingressChunks++
++              const text = `${index === 0 ? '' : ' '}B${String(index).padStart(5, '0')}`
++              expected += text
++              if (inFlight) updatesInFlight++
++              sendFrame({ type: 'chunk', revision: ++revision, attemptId: 'synthetic-attempt', index, time: Date.now(), chunk: { type: 'text-delta', index: 0, text } })
++              const resolve = nextEvent
++              nextEvent = undefined
++              resolve?.()
++            }, busyInterval)
++          }
++          measuring = true
++          try {
++            return await h.type(`real-dsh turns=${turns} busy=${busy}`, {
++              draftMatches: text => controller.current?.text() === text,
++              ...(busy ? {
++                beforeKey: () => new Promise<void>((resolve, reject) => {
++                  const timeout = setTimeout(() => { nextEvent = undefined; reject(new Error('real channel stream event timeout')) }, 15_000)
++                  nextEvent = () => { clearTimeout(timeout); gatedKeys++; resolve() }
++                }),
++                started: () => { keyStartCount = ingressChunks; inFlight = true },
++                finished: () => { inFlight = false; if (ingressChunks > keyStartCount) keysWithOverlap++ },
++              } : {}),
++            })
++          } finally {
++            measuring = false
++            if (interval !== undefined) { clearInterval(interval); interval = undefined }
++          }
++        }
++        const { times, cpuProfile } = profileInput === undefined
++          ? { times: await runInputWindow(), cpuProfile: undefined }
++          : await profileInput(runInputWindow)
++        let fullProjectedText = false, finalPaint = false, fullSettledText = false, settledFrame = false, settledTailVisible = false, revealTimerDrained = false
++        if (busy) {
++          if (ingressChunks < KEYS || gatedKeys !== KEYS || emitStreamCalls < ingressChunks || notifications === 0) throw new Error(`real channel stream inactive: chunks=${ingressChunks}, gated=${gatedKeys}, emitStream=${emitStreamCalls}, notifications=${notifications}`)
++          if (realSmoothStreaming && revealTicksDuringTyping === 0) throw new Error('smooth reveal did not advance during input')
++          fullProjectedText = await settled(() => mount.channel.rows.some(row => row.kind === 'assistant' && row.streaming === true && row.text === expected), { timeoutMs: 8000 })
++          if (!fullProjectedText) throw new Error(`real channel lost stream text: expected ${expected.length} chars`)
++          const marker = `B${String(ingressChunks - 1).padStart(5, '0')}`
++          finalPaint = await settled(() => h.lines().some(line => line.includes(marker)), { timeoutMs: 30_000 })
++          if (!finalPaint) throw new Error(`real channel stream tail not painted: ${marker}`)
++          revealTimerDrained = await settled(() => !isRevealTimerRunning(), { timeoutMs: 30_000 })
++          if (!revealTimerDrained) throw new Error('smooth reveal timer did not drain')
++          const framesBeforeSettlement = totalFrames
++          const item = appendEvent('assistant/message', { turn: turns + 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: expected }] } })
++          sendFrame({ type: 'end', revision: ++revision, attemptId: 'synthetic-attempt', index: ingressChunks, outcome: { kind: 'committed', eventType: 'assistant/message', seq: item.seq } })
++          fullSettledText = await settled(() => mount.channel.rows.some(row => row.kind === 'assistant' && row.streaming !== true && row.text === expected), { timeoutMs: 8000 })
++          if (!fullSettledText) throw new Error('real channel settlement lost full stream text')
++          settledFrame = await settled(() => totalFrames > framesBeforeSettlement, { timeoutMs: 8000 })
++          if (!settledFrame) throw new Error('no frame after real channel settlement')
++          await h.flush()
++          settledTailVisible = await settled(() => h.lines().some(line => line.includes(marker)), { timeoutMs: 8000 })
++          if (!settledTailVisible) throw new Error('settled stream tail not visible')
++        }
++        await h.flush()
++        if (!realSmoothStreaming && revealTicks !== 0) throw new Error('reveal advanced while smooth streaming disabled')
++        report({ fixture: 'real-dsh-channel-synthetic-host', phase: busy ? 'simulated-stream' : 'idle', turns, smoothStreaming: mount.channel.smoothStreaming, rows: mount.channel.rows.length, revealTicks: { duringTyping: revealTicksDuringTyping, total: revealTicks }, ...(cpuProfile === undefined ? {} : { cpuProfile }), ...(busy ? { realChannelStream: { intervalMs: busyInterval, ingress: { sessionEvents: sessionIngress, startFrames, chunks: ingressChunks, endFrames }, handlerCalls: { session: sessionHandlerCalls, stream: streamHandlerCalls }, emitStreamCalls: { duringTyping: emitStreamCallsDuringTyping, total: emitStreamCalls }, uiNotifications: { duringTyping: notificationsDuringTyping, total: notifications }, gatedKeys, updatesInFlight, keysWithOverlap, fullProjectedText, finalPaint, revealTimerDrained, fullSettledText, settledFrame, settledTailVisible } } : { uiNotifications: notifications }) }, times, frames, h.stats())
++      } finally {
++        if (interval !== undefined) clearInterval(interval)
++        await app.unmount()
++        await h.flush()
++        h.term.dispose()
++        unsubscribe()
++        unsubscribeReveal()
++        mount.dispose()
++        unregister()
++        for (const cleanup of [...cleanups].reverse()) cleanup()
++        // The preceding Chat and its observers are fully unmounted; drain and
++        // clear module-global reveal keys before the next (idle/busy) fixture.
++        if (!await settled(() => !isRevealTimerRunning(), { timeoutMs: 30_000 })) throw new Error('reveal timer remained active after unmount')
++        resetRevealForTest()
++      }
++    }
++  }
++}
+diff --git a/scripts/repro-paste-fold.tsx b/scripts/repro-paste-fold.tsx
+index 8149c109..ec67200c 100644
+--- a/scripts/repro-paste-fold.tsx
++++ b/scripts/repro-paste-fold.tsx
+@@ -19,12 +19,14 @@ process.env.DSH_TUI_LANG = 'en'
+ // Redirect ~/.dsh-tui (history.jsonl / resume.txt / theme.json) into a temp
+ // dir BEFORE any module import resolves utils/paths.js — os.homedir() reads
+ // these env vars, so the submits below never touch the real history.
+-const [{ mkdtempSync, rmSync }, { tmpdir }, { join }] = await Promise.all([
++const [{ lstatSync, mkdtempSync, realpathSync, rmSync }, { tmpdir }, { basename, dirname, join }] = await Promise.all([
+   import('node:fs'),
+   import('node:os'),
+   import('node:path'),
+ ])
+-const dataDir = mkdtempSync(join(tmpdir(), 'repro-paste-fold-data-'))
++const tempRoot = realpathSync(tmpdir())
++const dataDir = mkdtempSync(join(tempRoot, 'repro-paste-fold-data-'))
++const dataDirCreated = lstatSync(dataDir)
+ process.env.HOME = dataDir
+ process.env.USERPROFILE = dataDir
+ 
+@@ -269,6 +271,15 @@ try {
+   check('Esc clears a small (non-foldable) input', await settled(() => !screenHas('tiny')))
+ } finally {
+   await instance.unmount()
+-  rmSync(dataDir, { recursive: true, force: true })
++  const current = lstatSync(dataDir)
++  if (
++    dirname(dataDir) !== tempRoot || !basename(dataDir).startsWith('repro-paste-fold-data-') ||
++    realpathSync(dataDir) !== dataDir || !current.isDirectory() ||
++    current.dev !== dataDirCreated.dev || current.ino !== dataDirCreated.ino ||
++    (process.platform !== 'win32' && (typeof process.getuid !== 'function' ||
++      current.uid !== process.getuid() || (current.mode & 0o077) !== 0))
++  ) throw new Error('refusing to remove a replaced or nonprivate test directory')
++  // The identity check is not dirfd-atomic; leave cleanup to the operator on failure.
++  rmSync(dataDir, { recursive: true })
+ }
+ process.exit(failed)
+diff --git a/scripts/verify-btw.tsx b/scripts/verify-btw.tsx
+index 4b7006fa..28306ad5 100644
+--- a/scripts/verify-btw.tsx
++++ b/scripts/verify-btw.tsx
+@@ -10,22 +10,45 @@
+  *  6. an unresolved tool call in the derived tail never reaches the request,
+  *     and the wrapper names it as still running instead — but only a call of
+  *     the open step; a closed step's orphan is dropped without the note.
+- * Follows smoke.tsx: FakeStdout/FakeStderr/FakeStdin + plainText ANSI wash.
++ * Run: node --import tsx/esm scripts/verify-btw.tsx
+  */
+ import assert from 'node:assert/strict'
++import { mkdtempSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { settled, screenHas, viewportLines } from './lib/term-test.mjs'
+ 
++// Set these before importing the application, even when invoked outside CI.
++// Ignore inherited trace/session paths and temp overrides that may point home.
++for (const key of Object.keys(process.env)) {
++  if (key.startsWith('DSH_TUI_')) delete process.env[key]
++}
++delete process.env.TMPDIR
++delete process.env.TMP
++delete process.env.TEMP
++const fixtureHome = mkdtempSync(join(tmpdir(), 'verify-btw-'))
++process.env.HOME = fixtureHome
++process.env.USERPROFILE = fixtureHome
++process.env.DSH_HOME = join(fixtureHome, '.dsh')
++process.env.XDG_CONFIG_HOME = join(fixtureHome, '.config')
++process.env.XDG_CACHE_HOME = join(fixtureHome, '.cache')
++process.env.XDG_DATA_HOME = join(fixtureHome, '.local', 'share')
++process.env.XDG_STATE_HOME = join(fixtureHome, '.local', 'state')
++process.on('exit', () => rmSync(fixtureHome, { recursive: true, force: true }))
+ process.env.FORCE_COLOR = '3'
+ process.env.DSH_TUI_LANG = 'zh'
+ 
+-const [{ PassThrough, Writable }, React, { render }, { Chat }, { QuestionStore }, { LOCAL_COMMANDS }, { wrapSideQuestion, runSideQuestion, splitUnresolvedToolCalls, openStepToolCallIds }, { applySidePanelPanels }] = await Promise.all([
++const [{ PassThrough, Writable }, React, { Terminal: XTerm }, { render }, { Chat }, { QuestionStore }, { LOCAL_COMMANDS }, { wrapSideQuestion, runSideQuestion, splitUnresolvedToolCalls, openStepToolCallIds }, { applySidePanelPanels }, { btwThreads }] = await Promise.all([
+   import('node:stream'),
+   import('react'),
++  import('@xterm/headless'),
+   import('../src/ui.js'),
+   import('../src/screens/Chat.js'),
+   import('../src/dsh-adapter/questions.js'),
+   import('../src/commands.js'),
+   import('../src/dsh-adapter/sideQuestion.js'),
+   import('../src/tuiDisplayPrefs.js'),
++  import('../src/components/sidePanel/btw/threads.js'),
+ ])
+ 
+ // This script exercises the fallback overlay. The default now enables btw;
+@@ -36,10 +59,10 @@ class FakeStdout extends Writable {
+   columns = 100
+   rows = 28
+   isTTY = true
+-  frames: string[] = []
++  term = new XTerm({ cols: this.columns, rows: this.rows, allowProposedApi: true })
+   _write(chunk: unknown, _encoding: BufferEncoding, callback: () => void) {
+-    this.frames.push(String(chunk))
+-    callback()
++    // Writable completion follows xterm parsing, not just enqueueing the bytes.
++    this.term.write(String(chunk), callback)
+   }
+ }
+ 
+@@ -63,16 +86,10 @@ class FakeStdin extends PassThrough {
+   }
+ }
+ 
+-const plainText = (frames: string[]) => frames
+-  .join('')
+-  .replace(/\x1b\[(\d+)C/g, (_, n) => ' '.repeat(Number(n)))
+-  .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
+-  .replace(/\x1b\]9;[^\x07]*\x07/g, '')
+-
+-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+-
+ /** Fake channel in smoke.tsx's shape, plus the btw seams. */
+ function makeChannel() {
++  let stream: ((delta: string) => void) | undefined
++  let finish: ((result: { answer: string | null }) => void) | undefined
+   return {
+     version: 0,
+     whaleIdle: false, // 探针确定性：鲸鱼闲置动画不进测量窗口
+@@ -102,6 +119,8 @@ function makeChannel() {
+     submitCalls: [] as string[],
+     steerCalls: [] as string[],
+     notifyCalls: [] as string[],
++    sideCalls: [] as string[],
++    sideDeltas: [] as string[],
+     submit(text: string) { this.submitCalls.push(text) },
+     steer(text: string) { this.steerCalls.push(text) },
+     cancel() {},
+@@ -110,18 +129,21 @@ function makeChannel() {
+     listModels: () => Promise.resolve([]),
+     listSessions: () => [],
+     setResumeTarget: () => {},
+-    async sideQuestion(
+-      _question: string,
+-      options?: { onText?: (delta: string) => void },
+-    ): Promise<{ answer: string | null; error?: string }> {
+-      // Deterministic stream: both deltas land within ~60ms, so any overlay
+-      // older than the settle window shows the answer text (the working
+-      // assertion keys on the ANSWER, not the spinner, which the fake's
+-      // near-instant fill would already have replaced).
+-      options?.onText?.('The answer is ')
+-      await delay(40)
+-      options?.onText?.('**42**.')
+-      return { answer: 'The answer is **42**.' }
++    sideQuestion(question: string, options?: { onText?: (delta: string) => void }): Promise<{ answer: string | null }> {
++      this.sideCalls.push(question)
++      stream = options?.onText
++      return new Promise(resolve => { finish = resolve })
++    },
++    emit(delta: string) {
++      assert.ok(stream, 'side question must start before emitting')
++      this.sideDeltas.push(delta)
++      stream(delta)
++    },
++    finish() {
++      assert.ok(finish, 'side question must start before finishing')
++      finish({ answer: 'The answer is **42**.' })
++      finish = undefined
++      stream = undefined
+     },
+   }
+ }
+@@ -135,47 +157,58 @@ function makeChannel() {
+     <Chat channel={channel as never} questionStore={new QuestionStore()} />,
+     { stdout, stdin, stderr: new FakeStderr(), exitOnCtrlC: false, patchConsole: false },
+   )
+-  await delay(400)
++  const screen = () => viewportLines(stdout.term).join('\n')
++  const diagnostics = () => JSON.stringify({ screen: screen(), notifications: channel.notifyCalls, submits: channel.submitCalls, steers: channel.steerCalls, sideCalls: channel.sideCalls, sideDeltas: channel.sideDeltas })
++  const has = (text: string) => screenHas(stdout.term, text)
++  assert.ok(await settled(() => screen().trim().length > 0), 'initial screen must render')
+   stdin.write('/btw what is the answer?')
+-  await delay(100)
++  assert.ok(await settled(() => has('/btw what is the answer?')), `command must reach composer: ${diagnostics()}`)
+   stdin.write('\r')
+-  await delay(700)
+-  const openedMark = stdout.frames.length
+-  const opened = plainText(stdout.frames.slice(0, openedMark)).includes('what is the answer?')
+-  const streamed = plainText(stdout.frames.slice(0, openedMark)).includes('42')
++  const opened = await settled(() => has('what is the answer?') && !has('/btw what is the answer?') && channel.sideCalls.includes('what is the answer?'))
++  assert.ok(opened, `side question must open: ${diagnostics()}`)
++  channel.emit('The answer is ')
++  assert.ok(await settled(() => has('The answer is')), `first streamed delta must be visible before completion: ${diagnostics()}`)
++  channel.emit('**42**.')
++  const streamed = await settled(() => has('The answer is') && has('42'))
++  assert.ok(streamed, `streamed answer must be visible before completion: ${diagnostics()}`)
++  channel.finish()
++  assert.ok(await settled(() => btwThreads.get(channel.agentId)?.turns.at(-1)?.phase === 'completed'), `side question must complete: ${diagnostics()}`)
+   const noTranscript = channel.submitCalls.length === 0 && channel.steerCalls.length === 0
+-  assert.ok(opened && streamed && noTranscript, 'side question must open, stream, and leave the transcript untouched')
+-  console.log('scenario1 idle trigger opens + streams + leaves transcript untouched:',
+-    opened, streamed, noTranscript)
++  assert.ok(noTranscript, `side question must leave the transcript untouched: ${diagnostics()}`)
++  console.log('scenario1 idle trigger opens + streams + leaves transcript untouched:', opened, streamed, noTranscript)
+ 
+   // ── Scenario 2: Space dismisses, then /btw on a working channel ──────
+-  // (assertions read only frames AFTER the close key: the diff renderer
+-  // repaints deltas, so earlier frames still hold the panel text)
+   stdin.write(' ')
+-  await delay(250)
+-  const afterClose = plainText(stdout.frames.slice(openedMark))
+-  const closedOk = !afterClose.includes('what is the answer?')
++  const closedOk = await settled(() => !has('what is the answer?'))
++  assert.ok(closedOk, `Space must close the current screen: ${diagnostics()}`)
+   channel.working = true
+-  const workingMark = stdout.frames.length
+   stdin.write('/btw again?')
+-  await delay(100)
++  assert.ok(await settled(() => has('/btw again?')), `working command must reach composer: ${diagnostics()}`)
+   stdin.write('\r')
+-  await delay(700)
+-  const working = plainText(stdout.frames.slice(workingMark))
+-  const workingOk = working.includes('again?') && working.includes('42')
++  assert.ok(await settled(() => has('again?') && !has('/btw again?') && channel.sideCalls.some(question => question.endsWith('again?'))), `working side question must open: ${diagnostics()}`)
++  channel.emit('The answer is ')
++  channel.emit('**42**.')
++  // The fallback also shows earlier thread pairs: require the new answer
++  // after the new question, not a 42 left over from the first exchange.
++  const workingOk = await settled(() => {
++    const current = screen()
++    const questionAt = current.lastIndexOf('again?')
++    return questionAt >= 0 && current.slice(questionAt).includes('42')
++  })
++  channel.finish()
++  assert.ok(await settled(() => btwThreads.get(channel.agentId)?.turns.at(-1)?.phase === 'completed'), `working side question must complete: ${diagnostics()}`)
+   const notSteered = channel.steerCalls.length === 0
+-  assert.ok(closedOk && workingOk && notSteered, 'side question must work while the main turn is running')
+-  console.log('scenario2 Space dismisses; working-channel opens without steering:',
+-    closedOk, workingOk, notSteered)
++  assert.ok(workingOk && notSteered, `side question must work while the main turn is running: ${diagnostics()}`)
++  console.log('scenario2 Space dismisses; working-channel opens without steering:', closedOk, workingOk, notSteered)
+ 
+   // ── Scenario 3: Space closes the working-channel overlay too ─────────
+-  const closeMark = stdout.frames.length
+   stdin.write(' ')
+-  await delay(250)
+-  assert.ok(!plainText(stdout.frames.slice(closeMark)).includes('again?'), 'Space must dismiss the overlay')
+-  console.log('scenario3 Space dismisses overlay:', !plainText(stdout.frames.slice(closeMark)).includes('again?'))
++  const closedWorking = await settled(() => !has('again?'))
++  assert.ok(closedWorking, `Space must dismiss the overlay: ${diagnostics()}`)
++  console.log('scenario3 Space dismisses overlay:', closedWorking)
+ 
+   await instance.unmount()
++  stdout.term.dispose()
+ }
+ // ── Scenario 4: bare /btw notifies usage ───────────────────────────────
+ {
+@@ -186,15 +219,15 @@ function makeChannel() {
+     <Chat channel={channel as never} questionStore={new QuestionStore()} />,
+     { stdout, stdin, stderr: new FakeStderr(), exitOnCtrlC: false, patchConsole: false },
+   )
+-  await delay(400)
++  assert.ok(await settled(() => viewportLines(stdout.term).join('').trim().length > 0), 'initial screen must render')
+   stdin.write('/btw')
+-  await delay(100)
++  assert.ok(await settled(() => screenHas(stdout.term, '/btw')), 'bare command must reach composer')
+   stdin.write('\r')
+-  await delay(300)
+-  const usageNotified = channel.notifyCalls.some(text => text.includes('用法：/btw'))
+-  assert.ok(usageNotified, 'bare command must report usage')
++  const usageNotified = await settled(() => channel.notifyCalls.some(text => text.includes('用法：/btw')))
++  assert.ok(usageNotified, `bare command must report usage: ${JSON.stringify(channel.notifyCalls)}`)
+   console.log('scenario4 bare /btw notifies usage:', usageNotified)
+   await instance.unmount()
++  stdout.term.dispose()
+ }
+ 
+ // ── Scenario 5: wrapper + runner over a fake chunk stream ──────────────
+diff --git a/scripts/verify-input-bound-images.mjs b/scripts/verify-input-bound-images.mjs
+new file mode 100644
+index 00000000..ce02e057
+--- /dev/null
++++ b/scripts/verify-input-bound-images.mjs
+@@ -0,0 +1,81 @@
++/*
++ * Check PromptInput's actual bound-image span selector against the original
++ * scan+filter behavior. In-process TS transpilation only; no UI or p95 claim.
++ * Run: node scripts/verify-input-bound-images.mjs
++ */
++import assert from 'node:assert/strict'
++import { readFileSync } from 'node:fs'
++import ts from 'typescript'
++
++const prompt = readFileSync(new URL('../src/components/PromptInput.tsx', import.meta.url), 'utf8')
++const imageSource = readFileSync(new URL('../src/components/composerImageTokens.ts', import.meta.url), 'utf8')
++const ast = ts.createSourceFile('PromptInput.tsx', prompt, ts.ScriptTarget.ES2024, true, ts.ScriptKind.TSX)
++const selectors = []
++const wrappers = []
++function visit(node) {
++  if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === 'boundImageSpans') selectors.push(node)
++  if (ts.isFunctionDeclaration(node) && node.name?.text === 'wrapLineRows') wrappers.push(node)
++  ts.forEachChild(node, visit)
++}
++visit(ast)
++assert.equal(selectors.length, 1, 'bound image selector must be unique')
++assert.equal(wrappers.length, 1, 'wrapping helper must be unique')
++assert.match(wrappers[0].getText(ast), /imageTokenSpans\(line\)/u, 'raw image-looking text must remain unbreakable while wrapping')
++const imageJs = ts.transpileModule(imageSource, { compilerOptions: { target: ts.ScriptTarget.ES2024, module: ts.ModuleKind.ESNext } }).outputText
++const imageUrl = `data:text/javascript;base64,${Buffer.from(imageJs).toString('base64')}`
++const program = `
++import {imageTokenSpans as realImageTokenSpans} from ${JSON.stringify(imageUrl)}
++type ImageTokenSpan = {start:number; end:number; token:string}
++export function makeSelector(map: Map<string, string>) {
++  let scans = 0
++  const draftImagesRef = {current: map}
++  const imageTokenSpans = (text: string) => { scans++; return realImageTokenSpans(text) }
++  const ${selectors[0].getText(ast)}
++  return {select: boundImageSpans, getScans: () => scans}
++}
++export { realImageTokenSpans }
++`
++const result = ts.transpileModule(program, { compilerOptions: { target: ts.ScriptTarget.ES2024, module: ts.ModuleKind.ESNext }, reportDiagnostics: true })
++assert.equal(result.diagnostics?.length ?? 0, 0, 'bound selector must transpile')
++const { makeSelector, realImageTokenSpans } = await import(`data:text/javascript;base64,${Buffer.from(result.outputText).toString('base64')}`)
++const values = [
++  '', 'hello', '[Image #1]', 'x [Image #1] y [Image #2]', '[Image #01][Image #1]',
++  '[Image #0] [Image #999999999999999999999999]', '[Image #-1] [image #1]',
++  '中文🙂 [Image #2]\ne\u0301 [Image #1]', '\ud800[Image #1]\udc00',
++]
++let seed = 1234567
++const next = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed }
++const parts = ['x', '\n', '界', '🙂', '[Image #1]', '[Image #2]', '[Image #01]', '[bad]', '\ud800']
++for (let index = 0; index < 500; index++) {
++  let text = ''
++  const count = next() % 25
++  for (let part = 0; part < count; part++) text += parts[next() % parts.length]
++  values.push(text)
++}
++let checked = 0
++for (const live of [[], ['[Image #1]'], ['[Image #2]', '[Image #01]'], ['[Image #9]']]) {
++  const map = new Map(live.map((token, index) => [token, `stage-${index}`]))
++  const selector = makeSelector(map)
++  for (const text of values) {
++    assert.deepEqual(selector.select(text), realImageTokenSpans(text).filter(span => map.has(span.token)))
++    checked++
++  }
++}
++const map = new Map()
++const selector = makeSelector(map)
++const text = 'raw [Image #1] text'
++for (let row = 0; row < 7; row++) assert.deepEqual(selector.select(text), [])
++assert.equal(selector.getScans(), 0, 'no live capabilities must avoid whole-text token scanning')
++assert.equal(realImageTokenSpans(text).length, 1, 'raw token still exists for wrap geometry')
++map.set('[Image #1]', 'stage-1')
++assert.equal(selector.select(text).length, 1, 'a newly bound image must be detected immediately')
++assert.equal(selector.getScans(), 1)
++map.delete('[Image #1]')
++assert.deepEqual(selector.select(text), [], 'a released image must stop being bound immediately')
++assert.equal(selector.getScans(), 1)
++for (const value of [null, undefined, 5, {}, new String('[Image #1]')]) {
++  const outcome = fn => { try { return { value: fn(value) } } catch (error) { return { name: error?.name, message: error?.message } } }
++  assert.deepEqual(outcome(selector.select), outcome(input => realImageTokenSpans(input).filter(span => map.has(span.token))))
++  checked++
++}
++console.log(`input bound images: ${checked} synthetic cases passed`)
+diff --git a/scripts/verify-input-fold-threshold.mjs b/scripts/verify-input-fold-threshold.mjs
+new file mode 100644
+index 00000000..ff6424e4
+--- /dev/null
++++ b/scripts/verify-input-fold-threshold.mjs
+@@ -0,0 +1,87 @@
++/*
++ * Differential check of PromptInput's actual fold-threshold helper.
++ * TypeScript transpilation is in-process; no TTY, TSX loader, native child,
++ * network, clipboard, session, or user configuration is needed.
++ * Run: node scripts/verify-input-fold-threshold.mjs
++ */
++import assert from 'node:assert/strict'
++import { readFileSync } from 'node:fs'
++import ts from 'typescript'
++
++const source = readFileSync(new URL('../src/components/PromptInput.tsx', import.meta.url), 'utf8')
++const ast = ts.createSourceFile('PromptInput.tsx', source, ts.ScriptTarget.ES2024, true, ts.ScriptKind.TSX)
++const names = ['FOLD_MIN_LINES', 'FOLD_MIN_CHARS', 'isBigInput']
++const statements = new Map()
++for (const statement of ast.statements) {
++  if (!ts.isVariableStatement(statement)) continue
++  for (const declaration of statement.declarationList.declarations) {
++    if (ts.isIdentifier(declaration.name) && names.includes(declaration.name.text)) {
++      assert.equal(statement.declarationList.declarations.length, 1, 'threshold declarations must be independently located')
++      assert.equal(statements.has(declaration.name.text), false, 'threshold declaration must be unique')
++      statements.set(declaration.name.text, statement.getText(ast))
++    }
++  }
++}
++assert.deepEqual([...statements.keys()].sort(), [...names].sort(), 'all threshold source declarations must be present')
++const input = `${names.map(name => statements.get(name)).join('\n')}\nexport { isBigInput }`
++const result = ts.transpileModule(input, { compilerOptions: { target: ts.ScriptTarget.ES2024, module: ts.ModuleKind.ESNext }, reportDiagnostics: true })
++assert.equal(result.diagnostics?.length ?? 0, 0, 'threshold helper must transpile')
++const { isBigInput } = await import(`data:text/javascript;base64,${Buffer.from(result.outputText).toString('base64')}`)
++const old = text => text.split('\n').length >= 6 || text.length >= 600
++let checked = 0
++function compare(text) {
++  assert.equal(isBigInput(text), old(text), `threshold mismatch: length=${text.length}`)
++  checked++
++}
++for (const text of [
++  '', 'x'.repeat(599), 'x'.repeat(600), 'x'.repeat(601),
++  '\n'.repeat(4), '\n'.repeat(5), '\n'.repeat(6),
++  'one\ntwo\nthree\nfour\nfive\n', '😀'.repeat(299), '😀'.repeat(300),
++  '\ud800'.repeat(599), '\udc00'.repeat(600), '\r\n'.repeat(5),
++]) compare(text)
++let seed = 0x821a9d5
++const next = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed }
++const units = ['a', '\n', '\r', '界', '😀', '\ud800', '\udc00']
++for (let index = 0; index < 2000; index++) {
++  let text = ''
++  const length = next() % 700
++  for (let unit = 0; unit < length; unit++) text += units[next() % units.length]
++  compare(text)
++}
++// A long, ordinary string must short-circuit before allocating its line array.
++const originalSplit = String.prototype.split
++const sentinel = `unique-threshold-${'z'.repeat(1000)}`
++let calls = 0
++try {
++  String.prototype.split = function (...args) {
++    if (String(this) === sentinel) calls++
++    return originalSplit.apply(this, args)
++  }
++  assert.equal(isBigInput(sentinel), true)
++  assert.equal(calls, 0, 'a long primitive string must not be split just to decide its size')
++} finally {
++  String.prototype.split = originalSplit
++}
++// Preserve the historical failure/side-effect order for malformed host values.
++for (const value of [null, undefined, 1, {}, { length: 9999, split() { throw new Error('synthetic split failure') } }]) {
++  const outcome = fn => {
++    try { return { value: fn(value) } } catch (error) { return { name: error?.name, message: error?.message } }
++  }
++  assert.deepEqual(outcome(isBigInput), outcome(old))
++  checked++
++}
++const accesses = []
++const malformed = {
++  get split() {
++    accesses.push('split getter')
++    return () => { accesses.push('split call'); return { get length() { accesses.push('line count'); return 2 } } }
++  },
++  get length() { accesses.push('source length'); return 700 },
++}
++const expectedMalformed = old(malformed)
++const expectedAccesses = [...accesses]
++accesses.length = 0
++assert.equal(isBigInput(malformed), expectedMalformed)
++assert.deepEqual(accesses, expectedAccesses, 'malformed host values keep the old property-access order')
++checked++
++console.log(`input fold threshold: ${checked} differential checks passed`)
+diff --git a/scripts/verify-input-grapheme-lazy.mjs b/scripts/verify-input-grapheme-lazy.mjs
+new file mode 100644
+index 00000000..1b59b297
+--- /dev/null
++++ b/scripts/verify-input-grapheme-lazy.mjs
+@@ -0,0 +1,97 @@
++/*
++ * Narrow regression for PromptInput's original-value grapheme walk.
++ * Transpiles the actual source helper and the four actual key arms in-process.
++ * It does not mount React/Ink, exercise IME, or measure end-to-end latency.
++ * Run: node scripts/verify-input-grapheme-lazy.mjs
++ */
++import assert from 'node:assert/strict'
++import { readFileSync } from 'node:fs'
++import ts from 'typescript'
++
++const prompt = readFileSync(new URL('../src/components/PromptInput.tsx', import.meta.url), 'utf8')
++const intl = readFileSync(new URL('../src/utils/intl.ts', import.meta.url), 'utf8')
++const ast = ts.createSourceFile('PromptInput.tsx', prompt, ts.ScriptTarget.ES2024, true, ts.ScriptKind.TSX)
++const helpers = new Map()
++const handlers = []
++function visit(node) {
++  if (ts.isFunctionDeclaration(node) && node.name && ['graphemeBoundaries', 'previousGraphemeBoundary', 'nextGraphemeBoundary'].includes(node.name.text)) {
++    assert.equal(helpers.has(node.name.text), false)
++    helpers.set(node.name.text, node.getText(ast))
++  }
++  if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'useInput' && ts.isArrowFunction(node.arguments[0])) handlers.push(node.arguments[0])
++  ts.forEachChild(node, visit)
++}
++visit(ast)
++assert.equal(handlers.length, 1, 'the actual input handler must be unique')
++assert.ok(ts.isBlock(handlers[0].body))
++assert.equal(helpers.size, 3, 'the actual grapheme helpers must be located')
++const body = handlers[0].body.statements
++const selectIf = condition => {
++  const found = body.filter(node => ts.isIfStatement(node) && node.expression.getText(ast) === condition)
++  assert.equal(found.length, 1, `expected one ${condition} arm`)
++  return found[0].getText(ast)
++}
++const earlySelection = selectIf('(key.backspace || key.delete) && selection')
++const arms = ['key.leftArrow', 'key.rightArrow', 'key.backspace && !key.meta', 'key.delete'].map(selectIf)
++const eager = body.filter(node => ts.isVariableStatement(node) && node.declarationList.declarations.some(decl => ts.isIdentifier(decl.name) && decl.name.text === 'bounds'))
++assert.ok(eager.length <= 1, 'old-value boundary declaration must be unique')
++const eagerText = eager[0]?.getText(ast) ?? ''
++const baselineArms = arms.map(arm => arm.replaceAll('graphemeBoundaries(value)', 'bounds'))
++const intlJs = ts.transpileModule(intl, { compilerOptions: { target: ts.ScriptTarget.ES2024, module: ts.ModuleKind.ESNext } }).outputText
++const intlUrl = `data:text/javascript;base64,${Buffer.from(intlJs).toString('base64')}`
++const implementation = helpers.get('graphemeBoundaries').replace('function graphemeBoundaries(', 'function graphemeBoundariesImpl(')
++assert.notEqual(implementation, helpers.get('graphemeBoundaries'), 'must rename the extracted helper exactly once')
++function build(eagerDeclaration, keyArms) {
++  const program = `
++import {getGraphemeSegmenter} from ${JSON.stringify(intlUrl)}
++${implementation}
++${helpers.get('previousGraphemeBoundary')}
++${helpers.get('nextGraphemeBoundary')}
++export function simulate(value, cursor, selection, key) {
++  let scans = 0
++  const actions = []
++  const selectionRef = {current: selection}
++  const helpOpen = false
++  const graphemeBoundaries = text => { scans++; return graphemeBoundariesImpl(text) }
++  const setInput = (...args) => { actions.push(['setInput', ...args]) }
++  const deleteInputRange = (...args) => { actions.push(['deleteInputRange', ...args]) }
++  const setSelectedCommand = value => { actions.push(['setSelectedCommand', value]) }
++  const setFileSelected = value => { actions.push(['setFileSelected', value]) }
++  const onBackgroundRequest = () => { actions.push(['onBackgroundRequest']) }
++  ;(() => {
++    ${earlySelection}
++    ${eagerDeclaration}
++    ${keyArms.join('\n')}
++  })()
++  return {actions, scans}
++}`
++  const compiled = ts.transpileModule(program, { compilerOptions: { target: ts.ScriptTarget.ES2024, module: ts.ModuleKind.ESNext }, reportDiagnostics: true })
++  assert.equal(compiled.diagnostics?.length ?? 0, 0, 'extracted key arms must transpile')
++  return import(`data:text/javascript;base64,${Buffer.from(compiled.outputText).toString('base64')}`)
++}
++const actual = (await build(eagerText, arms)).simulate
++const baseline = (await build('const bounds = graphemeBoundaries(value)', baselineArms)).simulate
++const texts = [
++  '', 'a', 'hello world', '中文🙂e\u0301', '👨‍👩‍👧‍👦👍🏽🇨🇳',
++  'a\n\nb', '\ud800x\udc00', 'x'.repeat(602), '👩🏽‍💻 '.repeat(15),
++]
++const keys = [
++  {}, {leftArrow: true}, {rightArrow: true}, {backspace: true},
++  {delete: true}, {backspace: true, meta: true},
++]
++let checked = 0
++for (const text of texts) {
++  const cursors = [...new Set([-2, 0, 1, Math.floor(text.length / 2), text.length, text.length + 2])]
++  const selections = [null, {start: 0, end: text.length}]
++  for (const cursor of cursors) for (const selection of selections) for (const key of keys) {
++    const got = actual(text, cursor, selection, key)
++    const before = baseline(text, cursor, selection, key)
++    assert.deepEqual(got.actions, before.actions, `key behavior differs for ${JSON.stringify({text, cursor, selection, key})}`)
++    checked++
++  }
++}
++assert.equal(actual('ordinary input', 3, null, {}).scans, 0, 'ordinary typing must not segment the old value before its own path')
++assert.equal(actual('e\u0301🙂', 2, {start: 0, end: 2}, {leftArrow: true}).scans, 0, 'selection collapse must not segment the old value')
++assert.equal(actual('e\u0301🙂', 0, null, {backspace: true}).scans, 0, 'backspace at start must not segment the old value')
++assert.equal(actual('e\u0301🙂', 2, null, {leftArrow: true}).scans, 1, 'grapheme movement still segments the old value')
++console.log(`input grapheme lazy: ${checked} synthetic key cases passed`)
+diff --git a/scripts/verify-input-selection.tsx b/scripts/verify-input-selection.tsx
+index 00fc3c14..3194b786 100644
+--- a/scripts/verify-input-selection.tsx
++++ b/scripts/verify-input-selection.tsx
+@@ -58,6 +58,7 @@ const [
+ ])
+ const { getTheme, registerRuntimeThemeResolver } = await import('../src/theme.js')
+ const { NativeCursorContext } = await import('../src/ink/components/CursorDeclarationContext.js')
++const { activateModernEmojiWidths } = await import('./lib/modern-widths.mjs')
+ 
+ import type { PromptController } from '../src/components/PromptInput.js'
+ 
+@@ -90,6 +91,9 @@ type Harness = {
+ 
+ function makeHarness(cols: number, rows: number): Harness {
+   const term = new XTerm({ cols, rows, scrollback: 100, allowProposedApi: true })
++  // Match the renderer's modern emoji cell widths; xterm's default Unicode 6
++  // table treats 😀 as one cell and produces unrelated stale-cell artifacts.
++  activateModernEmojiWidths(term)
+   const frames: string[] = []
+   class FakeStdout extends Writable {
+     columns = cols
+@@ -648,6 +652,21 @@ function makePromptChannel(): Record<string, unknown> {
+         oscPayloads().at(-1) === word,
+       oscPayloads().at(-1) ?? 'no osc52',
+     )
++
++    // A13: Long wrapped draft followed by a wide-character tail. The caret
++    // must use the tail row's own offset rather than any prior wrapped row.
++    controllerBox.current?.clear()
++    await settled(() => !screenHas(word))
++    controllerBox.current?.append(`${'x'.repeat(1000)}\n尾😀z`)
++    check('A13 长草稿尾部可见', await settled(() => findText('尾😀z') !== null))
++    const tail = findText('尾😀z')
++    check('A13 跨多行后的宽字符尾部光标位置', tail !== null && await settled(() => caretAt(tail.col + 5, tail.row)))
++    stdin.write('\x1b[D')
++    check('A13 左移后光标位于尾字前', tail !== null && await settled(() => caretAt(tail.col + 4, tail.row)))
++    stdin.write('Q')
++    const inserted = await settled(() => controllerBox.current?.text().endsWith('尾😀Qz') === true)
++    check('A13 宽字符后插入不破坏内容', inserted, JSON.stringify(controllerBox.current?.text().slice(-12)))
++    check('A13 插入后屏幕同步', await settled(() => screenHas('尾😀Qz')), JSON.stringify(termTest.viewportLines(h.term).slice(-7)))
+   } finally {
+     app.unmount()
+   }
+diff --git a/scripts/verify-launchpad-onboarding-chat.tsx b/scripts/verify-launchpad-onboarding-chat.tsx
+index c2a41894..d2649c9e 100644
+--- a/scripts/verify-launchpad-onboarding-chat.tsx
++++ b/scripts/verify-launchpad-onboarding-chat.tsx
+@@ -45,6 +45,12 @@ import { settle, settled, viewportLines } from './lib/term-test.mjs'
+ import { stringWidth } from '../src/ink/stringWidth.js'
+ const { Terminal: XTerm } = xterm
+ 
++// 落地页条件位只有一个格子：后台更新探测发现新版本时「有新版本」顶掉「帮助」。
++// 本门禁点的就是「帮助」chip，挂载前把探测钉成离线（CI 的现实）——否则一次
++// 能联网的发布会中途把 chip 换掉，V3/V4 变成假红。
++const originalFetch = globalThis.fetch
++globalThis.fetch = async () => { throw new Error('launchpad update probe is offline in this gate') }
++
+ const [
+   { render, Box, ThemeProvider, AlternateScreen },
+   { Chat },
+@@ -2169,6 +2175,7 @@ else process.stdout.write(offer.kind === 'image' ? Buffer.from(offer.png, 'base6
+   }
+ }
+ 
++globalThis.fetch = originalFetch
+ if (failures === 0) console.log(`\nverify-launchpad-onboarding-chat: ${checks} checks, all passed`)
+ else console.error(`\nverify-launchpad-onboarding-chat: ${failures} of ${checks} checks FAILED`)
+ process.exit(failures === 0 ? 0 : 1)
+diff --git a/src/components/ModelPicker.tsx b/src/components/ModelPicker.tsx
+index bd36b025..9b618f48 100644
+--- a/src/components/ModelPicker.tsx
++++ b/src/components/ModelPicker.tsx
+@@ -86,7 +86,11 @@ export function ModelPicker({
+   const listRows = Math.max(1, availableRows - (showHeaderHints
+     ? frameRows + shortcutRows.length + (compact ? 0 : gaps) + (showDescription ? 1 : 0)
+     : frameRows - (showEfforts ? 0 : 1)))
+-  const showModelDescriptions = listRows >= 2
++  // Descriptions are decoration; never let them halve the visible choices.
++  // When the window cannot fit every row described, fall back to one row per
++  // model so short frames (folded history, narrow terminals) still show more
++  // than the focused entry.
++  const showModelDescriptions = listRows >= 6 || listRows >= models.length * 2
+   const modelHeights = models.map(model => showModelDescriptions && model.description ? 2 : 1)
+   const { start, end } = listWindow(modelHeights, focusIndex, listRows)
+   const providerFocus = groups.findIndex(group => group.provider === provider)
+diff --git a/src/components/PromptInput.tsx b/src/components/PromptInput.tsx
+index c1e9890e..20b0ab0c 100644
+--- a/src/components/PromptInput.tsx
++++ b/src/components/PromptInput.tsx
+@@ -224,8 +224,12 @@ interface DraftImageLease {
+  */
+ const FOLD_MIN_LINES = 6
+ const FOLD_MIN_CHARS = 600
+-const isBigInput = (text: string): boolean =>
+-  text.split('\n').length >= FOLD_MIN_LINES || text.length >= FOLD_MIN_CHARS
++const isBigInput = (text: string): boolean => {
++  // A long string already meets the threshold; avoid an extra line split on
++  // every render. Preserve the old failure order for malformed host values.
++  if (typeof text === 'string' && text.length >= FOLD_MIN_CHARS) return true
++  return text.split('\n').length >= FOLD_MIN_LINES || text.length >= FOLD_MIN_CHARS
++}
+ 
+ /** Format label for one image media type, matching the image preview card's
+  *  title (`JPEG`, `PNG`, `WEBP`, `GIF`). */
+@@ -1337,10 +1341,13 @@ export function PromptInput({
+    * whole token, Backspace at its end / Delete at its start remove it whole,
+    * a selection never cuts it, and it renders as a chip (the whole token is
+    * the caret cluster when the caret sits at its start). A raw token typed
+-   * or restored without a capability is ordinary text.
++   * or restored without a capability is ordinary text. An empty capability
++   * map needs no scan here; wrapLineRows still keeps raw tokens together.
+    */
+   const boundImageSpans = (text: string): ImageTokenSpan[] =>
+-    imageTokenSpans(text).filter(span => draftImagesRef.current.has(span.token))
++    typeof text === 'string' && draftImagesRef.current.size === 0
++      ? []
++      : imageTokenSpans(text).filter(span => draftImagesRef.current.has(span.token))
+ 
+   /** Move the caret to `offset`, snapped off any token interior. */
+   const placeCaret = (offset: number, prefer: 'start' | 'end' | 'nearest'): void => {
+@@ -2519,10 +2526,6 @@ export function PromptInput({
+       }
+     }
+ 
+-    // Grapheme boundaries of the current text: every caret move / delete
+-    // below snaps onto one of these offsets (never mid-cluster).
+-    const bounds = graphemeBoundaries(value)
+-
+     /** Insert text at the caret (typing, paste) and dismiss overlays. An
+      *  active selection is REPLACED by the insert (standard editor
+      *  semantics). Returns the insertion offset so callers can derive the
+@@ -3167,6 +3170,8 @@ export function PromptInput({
+       setInput(value, sel ? sel.end : wordBoundaryRight(value, cursor))
+       return
+     }
++    // Only caret/delete arms need old-value grapheme boundaries; typing and
++    // paste normalize the new value separately in setInput.
+     if (key.leftArrow) {
+       // ← on an EMPTY prompt opens the session manager; the caller decides
+       // whether the backend can background the session first.
+@@ -3180,22 +3185,22 @@ export function PromptInput({
+       // combining mark) so the caret never sits inside one. With a
+       // selection, collapse to its start edge instead.
+       const sel = selectionRef.current
+-      setInput(value, sel ? sel.start : previousGraphemeBoundary(bounds, cursor))
++      setInput(value, sel ? sel.start : previousGraphemeBoundary(graphemeBoundaries(value), cursor))
+       return
+     }
+     if (key.rightArrow) {
+       const sel = selectionRef.current
+-      setInput(value, sel ? sel.end : nextGraphemeBoundary(bounds, cursor))
++      setInput(value, sel ? sel.end : nextGraphemeBoundary(graphemeBoundaries(value), cursor))
+       return
+     }
+     if (key.backspace && !key.meta) {
+       if (cursor === 0) return
+-      const start = previousGraphemeBoundary(bounds, cursor)
++      const start = previousGraphemeBoundary(graphemeBoundaries(value), cursor)
+       deleteInputRange(start, cursor)
+       return
+     }
+     if (key.delete) {
+-      const end = nextGraphemeBoundary(bounds, cursor)
++      const end = nextGraphemeBoundary(graphemeBoundaries(value), cursor)
+       if (end === cursor) return
+       deleteInputRange(cursor, end)
+       return
+@@ -3287,8 +3292,8 @@ export function PromptInput({
+       // One stdin batch can merge several bare keys into a single event
+       // (fast typing), so re-read the synchronous mirrors and recompute
+       // the grapheme boundaries: every key in the batch operates on the
+-      // text/caret its predecessor produced (the outer `value`/`cursor`/
+-      // `bounds` reflect only the batch's first key).
++      // text/caret its predecessor produced (the outer `value`/`cursor`
++      // reflect only the batch's first key).
+       const value = valueRef.current
+       const cursor = cursorRef.current
+       const bounds = graphemeBoundaries(value)
+@@ -3739,8 +3744,9 @@ export function PromptInput({
+   const foldHint = t('input-fold-hover')
+   const foldPreviewWidth =
+     inputWidth - stringWidth(foldBadge) - stringWidth(`・${foldHint}`) - 6
++  // Only the collapsed chip uses this preview, not an ordinary editable draft.
+   const foldPreview =
+-    foldPreviewWidth >= 8
++    block !== null && foldPreviewWidth >= 8
+       ? truncateToWidth(foldText.split('\n')[0] ?? '', foldPreviewWidth)
+       : ''
+ 
+@@ -3946,12 +3952,15 @@ export function PromptInput({
+   // edit the real input). The footer reports the clipped remainder.
+   const PEEK_MAX_ROWS = 10
+   const peekVisualLines: string[] = []
+-  for (const line of foldText.split('\n')) {
+-    for (const row of wrapToWidth(line, cardContentWidth(columns))) {
++  // Hidden peek rows have no consumer; avoid rewrapping a large draft per key.
++  if (peekOpen) {
++    for (const line of foldText.split('\n')) {
++      for (const row of wrapToWidth(line, cardContentWidth(columns))) {
++        if (peekVisualLines.length >= PEEK_MAX_ROWS) break
++        peekVisualLines.push(row)
++      }
+       if (peekVisualLines.length >= PEEK_MAX_ROWS) break
+-      peekVisualLines.push(row)
+     }
+-    if (peekVisualLines.length >= PEEK_MAX_ROWS) break
+   }
+   const peekClipped = peekVisualLines.length >= PEEK_MAX_ROWS
+ 
+@@ -4762,7 +4771,11 @@ function wrapLineRows(
+ ): Array<{ start: number; end: number }> {
+   if (line === '') return [{ start: 0, end: 0 }]
+   const rows: Array<{ start: number; end: number }> = []
+-  const segmenter = getGraphemeSegmenter()
++  // Printable ASCII is one cell per grapheme, so long code or plain-English
++  // drafts do not need ICU segmentation on every key and caret click. Control
++  // characters and all non-ASCII text keep the grapheme-aware path below.
++  const ascii = /^[\x20-\x7e]+$/.test(line)
++  const segments = ascii ? line : getGraphemeSegmenter().segment(line)
+   // The space inside `[Image #N]` is not a break opportunity: the token is
+   // one unit on screen (its caret cluster and chip styling span it), so it
+   // wraps whole, like a word.
+@@ -4771,8 +4784,9 @@ function wrapLineRows(
+   let currentWidth = 0
+   let offset = 0
+   let lastBreak = -1
+-  for (const { segment } of segmenter.segment(line)) {
+-    const w = stringWidth(segment)
++  for (const item of segments) {
++    const segment = typeof item === 'string' ? item : item.segment
++    const w = ascii ? 1 : stringWidth(segment)
+     while (currentWidth + w > width && offset > rowStart) {
+       if (lastBreak > rowStart) {
+         rows.push({ start: rowStart, end: lastBreak })
+@@ -4813,22 +4827,31 @@ function caretInText(
+ ): { line: number; charCol: number; visualCol: number } {
+   let line = 0
+   let lineBase = 0
+-  let last = { line: 0, charCol: 0, visualCol: 0 }
++  let lastLogical = ''
++  let lastStart = 0
++  let lastCharCol = 0
+   for (const logical of text.split('\n')) {
+     for (const r of wrapLineRows(logical, width)) {
+       const start = lineBase + r.start
+       const charCol = Math.max(0, offset - start)
+-      last = {
+-        line,
+-        charCol,
+-        visualCol: stringWidth(logical.slice(r.start, r.start + charCol)),
++      if (offset <= lineBase + r.end) {
++        return { line, charCol, visualCol: stringWidth(logical.slice(r.start, r.start + charCol)) }
+       }
+-      if (offset <= lineBase + r.end) return last
++      // Only the matching row (or final row for an out-of-range offset)
++      // needs a width. Measuring the suffix at every earlier wrapped row is
++      // quadratic for long drafts and runs on every key and caret click.
++      lastLogical = logical
++      lastStart = r.start
++      lastCharCol = charCol
+       line++
+     }
+     lineBase += logical.length + 1
+   }
+-  return last
++  return {
++    line: Math.max(0, line - 1),
++    charCol: lastCharCol,
++    visualCol: stringWidth(lastLogical.slice(lastStart, lastStart + lastCharCol)),
++  }
+ }
+ 
+ /**

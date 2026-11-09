@@ -1,0 +1,45 @@
+From 593ebef3e8136539b2e1f2b78d80bb230f85f77c Mon Sep 17 00:00:00 2001
+From: mita5358 <kafitcohr@outlook.com>
+Date: Fri, 30 Oct 2026 16:15:59 +0800
+Subject: [PATCH 03/20] perf(dsh): mark the row container dirty once per
+ restore pass
+
+foldBack() called markChannelReadDirty(rows) inside the per-row loop. `rows`
+is a single object, so every one of those calls overwrote the same WeakMap
+entry and burned a revision number: 18,042 redundant writes for one press on
+a real titan session.
+
+Mark it once after the loop, and only when something was actually restored, so
+a press that finds nothing to revive does not bump the container revision at
+all. Same visible state, 1.10 ms -> 0.64 ms of marking on 18,042 rows.
+
+This is independent of the indexing change and can be dropped on its own.
+---
+ src/dsh-adapter/channel/transcript.ts | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/dsh-adapter/channel/transcript.ts b/src/dsh-adapter/channel/transcript.ts
+index a2a283a8..d3352513 100644
+--- a/src/dsh-adapter/channel/transcript.ts
++++ b/src/dsh-adapter/channel/transcript.ts
+@@ -160,7 +160,6 @@ export function foldBack(rows: ChatRow[], events: readonly SessionEvent[], views
+       row.folded = false
+       row.restored = true
+       markChannelReadDirty(row)
+-      markChannelReadDirty(rows)
+       restored += 1
+       continue
+     }
+@@ -172,9 +171,11 @@ export function foldBack(rows: ChatRow[], events: readonly SessionEvent[], views
+     row.folded = false
+     row.restored = true
+     markChannelReadDirty(row)
+-    markChannelReadDirty(rows)
+     restored += 1
+   }
++  // The container is marked once: it is one object, so N marks only burn
++  // revision numbers.
++  if (restored > 0) markChannelReadDirty(rows)
+   return restored
+ }
+ 

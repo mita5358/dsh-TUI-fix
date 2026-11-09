@@ -1,0 +1,80 @@
+From 6634834bc263b8e19863bf3793ac8e270b460dd1 Mon Sep 17 00:00:00 2001
+From: mita5358 <kafitcohr@outlook.com>
+Date: Mon, 9 Nov 2026 13:07:16 +0800
+Subject: [PATCH 20/20] docs: state the two-turn open window and the six-chunk
+ residence bound
+
+---
+ README.md                          |  2 +-
+ README_ZH.md                       |  2 +-
+ docs/dynamic-history-loading.en.md | 12 +++++++-----
+ docs/dynamic-history-loading.md    |  7 ++++---
+ 4 files changed, 13 insertions(+), 10 deletions(-)
+
+diff --git a/README.md b/README.md
+index cfa2c4f6..94659a52 100644
+--- a/README.md
++++ b/README.md
+@@ -752,7 +752,7 @@ The logical budget does not eliminate physical JSON/frame parsing or validation.
+ Resuming a DSH session still pays the host's full restore (frame decode, JSON
+ parse, v4 validation) — that cost is linear in record size and lives outside this
+ package. What this package controls is projection: the first screen projects only
+-the newest chunk (the last 10 turns, under 200k characters), older chunks are cut
++the newest chunk (the last 2 turns, under 200k characters), older chunks are cut
+ every 50 turns / 1M characters and projected when loaded, so first-screen work
+ stops growing with the record. On a 139 MB / 93k-event record the interactive
+ first screen went from 16.7–17.3 s to ~13.0 s: ~7.5 s host restore, ~4.1 s process
+diff --git a/README_ZH.md b/README_ZH.md
+index 365c9e61..727ab15f 100644
+--- a/README_ZH.md
++++ b/README_ZH.md
+@@ -634,7 +634,7 @@ WAL，不手工复制活动数据库与 WAL。缺少此 API 的构建会明确
+ 会话树读取先完整校验 packed 行，再按剩余扫描预算检查成员数量，最后才展开事件。
+ 超大行报告截断，损坏行报告失败；逻辑事件预算不消除物理 JSON/帧解析与校验成本。
+ 恢复 DSH 会话仍要付宿主的全量恢复（解帧、JSON 解析、v4 校验），这段开销与记录大小
+-线性、发生在本包之外。本包能控的是投影：首屏只投影最新一块（最后 10 轮、20 万字以内），
++线性、发生在本包之外。本包能控的是投影：首屏只投影最新一块（最后 2 轮、20 万字以内），
+ 更早的块按每块 50 轮 / 100 万字切分、加载时才投影，于是首屏成本不再随记录长度增长。
+ 在 139 MB / 9.3 万事件的记录上，可交互首屏从 16.7–17.3 秒降到约 13.0 秒：宿主恢复
+ 约 7.5 秒、进程启动与插件装载约 4.1 秒、投影约 1.0 秒。报告打开慢时可设
+diff --git a/docs/dynamic-history-loading.en.md b/docs/dynamic-history-loading.en.md
+index 50d9248f..8b4168dd 100644
+--- a/docs/dynamic-history-loading.en.md
++++ b/docs/dynamic-history-loading.en.md
+@@ -136,11 +136,13 @@ These are old measurements from different snapshots/builds, **not proof that thi
+ round's index and seek changes pass**. They do not establish a 2 s startup. Use
+ `DSH_TUI_BOOT_TRACE` to separate the phases.
+ 
+-**Loaded chunks currently have no LRU eviction.** Browsing more chunks accumulates
+-real projected rows. Render virtualization bounds mounting, not retention of body
+-rows, the source log, translated events or directory. Do not describe this as
+-“end-to-end constant memory”; adding cache or host architectures is outside this
+-round's scope.
++**At most six loaded chunks stay resident** (`MAX_LOADED_CHUNKS`, evicted least
++recently touched first): beyond that the oldest touched chunk folds back to its
++digest line and re-projects when its line is clicked; the newest chunk and the one
++just requested are never evicted. Until a chunk is folded back its projected rows,
++source-log slice, translated events and directory stay resident, and render
++virtualization bounds mounting rather than retention. Do not describe this as
++“end-to-end constant memory”.
+ 
+ ### 6.1 What an index click actually costs, and three fixes
+ 
+diff --git a/docs/dynamic-history-loading.md b/docs/dynamic-history-loading.md
+index f1b1ab19..eb234927 100644
+--- a/docs/dynamic-history-loading.md
++++ b/docs/dynamic-history-loading.md
+@@ -107,9 +107,10 @@ seed/clear，让自动加载前已绘出的 tick 仍能定位同一 `seq`。
+ 也出现过约 15 s。它们是不同快照/构建的旧证据，**不能作为本轮新索引/seek 已通过的证明**，
+ 更不能宣称已达到 2 s；阶段拆解应看 `DSH_TUI_BOOT_TRACE`。
+ 
+-**已加载块目前没有 LRU 卸载**：浏览更多块会累积真实正文行。渲染虚拟化只限制挂载，
+-不等于释放已投影正文、原日志、翻译记录或索引。不能写成“端到端常数内存”，也不在本轮
+-另加缓存/宿主方案以扩张范围。
++**已加载块最多常驻 6 个**（`MAX_LOADED_CHUNKS`，按最近触达淘汰）：超出时最早触达的块
++回折成摘要行，再点摘要行按需重新投影；最新块与刚请求的块不会被淘汰。未被回折的块仍
++保留其投影正文、原日志切片、翻译记录与目录，渲染虚拟化只限制挂载、不等于释放内存，
++因此不能写成“端到端常数内存”。
+ 
+ ### 6.1 点击索引的真实成本与三处优化
+ 

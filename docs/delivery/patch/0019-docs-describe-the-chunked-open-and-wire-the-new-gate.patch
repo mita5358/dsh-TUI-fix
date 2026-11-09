@@ -1,0 +1,527 @@
+From beef69dda322a8ddb4aac45625356d5c23a02ff9 Mon Sep 17 00:00:00 2001
+From: mita5358 <kafitcohr@outlook.com>
+Date: Mon, 9 Nov 2026 13:00:51 +0800
+Subject: [PATCH 19/20] docs: describe the chunked open and wire the new gates
+
+---
+ README.md                             |  4 ++-
+ README_ZH.md                          |  4 ++-
+ cli/test/cli.test.mjs                 |  2 +-
+ cli/test/edges.test.mjs               |  2 +-
+ cli/test/package.test.mjs             |  6 ++--
+ docs/README.md                        |  1 +
+ docs/user-guide.en.md                 |  7 ++++-
+ docs/user-guide.md                    |  7 ++++-
+ guide/dsh-tui-guide/interaction.en.md | 17 +++++++++--
+ guide/dsh-tui-guide/interaction.md    |  6 ++--
+ guide/dsh-tui-guide/user-guide.en.md  |  7 ++++-
+ guide/dsh-tui-guide/user-guide.md     |  7 ++++-
+ package.json                          | 30 ++++++++++++++++++
+ scripts/ci-group-timings.json         |  3 ++
+ scripts/run-ci-group.mjs              | 21 +++++++++++++
+ scripts/run-verify-build.mjs          | 44 ++++++++++++++++++++++++---
+ scripts/verify-package.mjs            | 14 ++++++++-
+ 17 files changed, 160 insertions(+), 22 deletions(-)
+
+diff --git a/README.md b/README.md
+index f223ae1f..cfa2c4f6 100644
+--- a/README.md
++++ b/README.md
+@@ -61,7 +61,7 @@ Resuming a DSH session preserves its recorded reasoning effort (or its live sele
+ - **Account sign-in** — the standard profile offers pi-ai OAuth for ChatGPT/Codex, Claude, and Grok (plus OpenAI direct and Meta Muse when available), and Host-owned DeepSeek browser sign-in as `deepseek-account` on DSH 0.2.0-rc.1+. Use `/provider` or `/auth` without another plugin.
+   A profile-only update from a global TUI patch that already mounts `dsh-tui-auth` can still start the official loopback callback listener on demand; fixed-port SSH forwarding still requires the global package to be aligned.
+ - **Extensions** — browser interaction, computer use and more.
+-- **Built for long sessions** — event-driven projection, virtualization, bounded caches. Opening a DSH session with tens of thousands of rows projects only its newest chunk; older history folds into one text-only report line per chunk plus one prompt line per turn, and clicking a folded turn on the timeline projects just that chunk.
++- **Built for long sessions** — event-driven projection, virtualization, bounded caches. Opening a DSH session with tens of thousands of rows projects only its newest chunk; older history folds into one text-only report line per chunk and expands on sight. The timeline retains every human turn and its preview from lightweight metadata; clicking an unloaded turn projects only its chunk and seeks that exact prompt. [Loading architecture](docs/dynamic-history-loading.en.md).
+ 
+ Keys and commands: [Interaction and commands](docs/interaction.en.md). Everything else: [documentation index](docs/README.md).
+ 
+@@ -414,6 +414,8 @@ the dashboard alone does not acknowledge every child. Task status stays failed.
+ ## Keybindings & Mouse
+ 
+ `Enter` send · `Tab` complete · `Ctrl+Enter` interrupt and send · `Alt+Up` recall the last message · `Esc` closes local layers before interrupting a running turn, double-`Esc` rewinds on empty idle input · `Ctrl+B` side panel · `Ctrl+O` details · `Ctrl+R` history (`↑`/`↓` and `Ctrl+R` are scoped to the current project) · `Ctrl+V` paste · `Ctrl+Shift+E` fullscreen draft editor · `?` shortcuts · `←` open the session manager (DSH backgrounds the current session first).
++Settled reasoning is shown as a short first-nonblank-line preview with an ellipsis; click its row to expand or collapse it, or use `Ctrl+O` for details. The preview is bounded and may omit unusually long or unsafe leading content. Older history that has not yet been restored may still contain only a partial body.
++
+ In both the launchpad and chat, `Ctrl+U` deletes from the caret to the current line start, preserving text to the right and whole image chips. It edits only the focused input.
+ 
+ In the launchpad input, `Shift+Enter` (or `Option+Enter`) opens chat and inserts a newline at the caret, keeping the draft and staged images unsent. Continue typing there, then press `Enter` to send.
+diff --git a/README_ZH.md b/README_ZH.md
+index 2b0d1d04..365c9e61 100644
+--- a/README_ZH.md
++++ b/README_ZH.md
+@@ -58,7 +58,7 @@
+ - **账号登录** — 标准 profile 提供 pi-ai 的 ChatGPT/Codex、Claude、Grok OAuth（可用时还有 OpenAI 直连与 Meta Muse）；DSH 0.2.0-rc.1+ 还通过宿主服务提供 DeepSeek 浏览器登录，路由为 `deepseek-account`。通过 `/provider` 或 `/auth` 使用，无需另装插件。
+   仅更新 profile 而留下已挂载 `dsh-tui-auth` 的旧全局 TUI 补丁时，本地登录也会按需启动官方 loopback 回调监听器；SSH 固定端口转发仍需对齐全局安装包。
+ - **扩展** — 浏览器交互、computer use 等。
+-- **为长会话设计** — 事件驱动投影、虚拟化、有界缓存。打开行数十万级的 DSH 会话时只投影最新一块；更早的历史折叠成每块一行纯文本摘要加每轮一行提示，点时间轴上折叠区的某一轮只现场投影那一块。
++- **为长会话设计** — 事件驱动投影、虚拟化、有界缓存。打开行数十万级的 DSH 会话时只投影最新一块；更早的历史每块只留一行纯文本摘要，滚到即自动展开。时间轴通过轻量元数据保留全部用户轮次与预览；点未加载的某轮只投影所属块，并准确跳到该条提问。[加载架构](docs/dynamic-history-loading.md)。
+ 
+ 键位与命令：[交互与命令](docs/interaction.md)。其余见[文档索引](docs/README.md)。
+ 
+@@ -329,6 +329,8 @@ delegation provider 的已结算运行失败至少 2 次、且不低于一半时
+ ## 快捷键与鼠标
+ 
+ `Enter` 发送 · `Tab` 补全 · `Ctrl+Enter` 打断并发送 · `Alt+Up` 取回上一条 · `Esc` 先关闭局部层，再中断运行回合；空闲空输入双击回溯 · `Ctrl+B` 侧栏 · `Ctrl+O` 详情 · `Ctrl+R` 搜历史（`↑`/`↓` 与 `Ctrl+R` 按当前项目隔离） · `Ctrl+V` 粘贴 · `Ctrl+Shift+E` 全屏草稿编辑器 · `?` 快捷键 · `←` 打开会话管理（DSH 会先将当前会话转后台）。
++已结算的思考内容显示为带省略号的首个非空行短预览；点击该行可展开或折叠，也可用 `Ctrl+O` 查看详情。预览长度有界，异常超长或不安全的开头可能被省略；尚未恢复的旧历史内容仍可能不完整。
++
+ 启动页与聊天页均支持 `Ctrl+U` 删除光标至当前行首的内容，保留右侧文字，图片 chip 整体处理；仅在输入框获得焦点时编辑草稿。
+ 
+ 在启动页输入框中按 `Shift+Enter`（或 `Option+Enter`）会进入聊天页，在光标处插入换行，并保留未发送的草稿和图片附件；可继续输入，再按 `Enter` 发送。
+diff --git a/cli/test/cli.test.mjs b/cli/test/cli.test.mjs
+index 95aa80c8..044cc555 100644
+--- a/cli/test/cli.test.mjs
++++ b/cli/test/cli.test.mjs
+@@ -22,7 +22,7 @@ after(() => rm(sandbox, { recursive: true, force: true, maxRetries: 3 }))
+ 
+ async function run(args, input = '', env = {}) {
+   const child = spawn(process.execPath, [launcher, ...args], {
+-    cwd: root, env: { ...process.env, DSH_TUI_CLI_DSH_BIN: fixture, DSH_HOME: join(sandbox, 'home'), HOME: sandbox, USERPROFILE: sandbox, ...env }, stdio: ['pipe', 'pipe', 'pipe'],
++    cwd: root, env: { ...process.env, NODE_NO_WARNINGS: '1', DSH_TUI_CLI_DSH_BIN: fixture, DSH_HOME: join(sandbox, 'home'), HOME: sandbox, USERPROFILE: sandbox, ...env }, stdio: ['pipe', 'pipe', 'pipe'],
+   })
+   child.stdin.on('error', () => {})
+   child.stdin.end(input)
+diff --git a/cli/test/edges.test.mjs b/cli/test/edges.test.mjs
+index 5aec04c3..1443c71b 100644
+--- a/cli/test/edges.test.mjs
++++ b/cli/test/edges.test.mjs
+@@ -123,7 +123,7 @@ test('direct CLI entry runs through a symlinked parent path', async () => {
+   const linkedRoot = join(temp, 'linked-root')
+   await symlink(root, linkedRoot, process.platform === 'win32' ? 'junction' : 'dir')
+   const result = spawnSync(process.execPath, [join(linkedRoot, 'cli/entry.mjs'), '--help'], {
+-    cwd: root, encoding: 'utf8', timeout: 10000,
++    cwd: root, encoding: 'utf8', timeout: 10000, env: { ...process.env, NODE_NO_WARNINGS: '1' },
+   })
+   assert.equal(result.status, 0, result.stdout + result.stderr)
+   assert.match(result.stdout, /dst run/u)
+diff --git a/cli/test/package.test.mjs b/cli/test/package.test.mjs
+index 0a5ebb51..8f1f897e 100644
+--- a/cli/test/package.test.mjs
++++ b/cli/test/package.test.mjs
+@@ -4,12 +4,10 @@ import { test, after } from 'node:test'
+ import { mkdtemp, mkdir, copyFile, cp, writeFile, readFile, rm } from 'node:fs/promises'
+ import { tmpdir } from 'node:os'
+ import { dirname, join } from 'node:path'
+-import { fileURLToPath, pathToFileURL } from 'node:url'
+-import { createRequire } from 'node:module'
++import { fileURLToPath } from 'node:url'
+ import { spawnSync } from 'node:child_process'
+ import { c as createTar, x as extractTar } from 'tar'
+ 
+-const require = createRequire(import.meta.url)
+ const root = fileURLToPath(new URL('../../', import.meta.url))
+ const temporary = await mkdtemp(join(tmpdir(), 'dst-package-'))
+ after(() => rm(temporary, { recursive: true, force: true, maxRetries: 3 }))
+@@ -28,7 +26,7 @@ test('standalone extracts and runs the same CLI without initializing its TUI pro
+   await mkdir(standalone)
+   await createTar({ gzip: true, cwd: source, file: join(standalone, 'runtime.tar.gz') }, ['node_modules'])
+   await copyFile(join(root, 'standalone/cacheGuard.cjs'), join(standalone, 'cacheGuard.cjs'))
+-  const entry = (await readFile(join(root, 'standalone/entry.mjs'), 'utf8')).replace("from 'tar'", `from '${pathToFileURL(require.resolve('tar')).href}'`)
++  const entry = (await readFile(join(root, 'standalone/entry.mjs'), 'utf8')).replace("from 'tar'", `from '${import.meta.resolve('tar')}'`)
+   await writeFile(join(standalone, 'entry.mjs'), entry)
+   const home = join(temporary, 'standalone-home')
+   const env = { ...process.env, DSH_HOME: home, DSH_TUI_STANDALONE_CACHE: join(temporary, 'cache'), DSH_TUI_CLI_NODE: process.execPath }
+diff --git a/docs/README.md b/docs/README.md
+index 61106e7c..b4d006f9 100644
+--- a/docs/README.md
++++ b/docs/README.md
+@@ -33,6 +33,7 @@ The root README lists what ships; the details live here. Chinese files have no s
+ | 文档 / Doc | 中文 | English | 讲什么 / What it covers |
+ | --- | --- | --- | --- |
+ | 架构与限制 / Architecture & limitations | [architecture.md](architecture.md) | [architecture.en.md](architecture.en.md) | 运行链路、性能、安全边界与已知限制。 |
++| 分块打开长会话 / Chunked history open | [dynamic-history-loading.md](dynamic-history-loading.md) | [dynamic-history-loading.en.md](dynamic-history-loading.en.md) | 长会话分块投影打开、首帧预算、seek 与最近块的卸载。 |
+ | 会话挂载运行时 / Session mount runtime | [session-mount-runtime.md](session-mount-runtime.md) | [session-mount-runtime.en.md](session-mount-runtime.en.md) | 多 TUI 占用规则与本机账本。 |
+ | 首次引导的账号与模型接入 / Onboarding provider setup | [onboarding-provider-setup.md](onboarding-provider-setup.md) | [onboarding-provider-setup.en.md](onboarding-provider-setup.en.md) | 引导第一步如何登录账号、写入凭据并选出默认模型。 |
+ | 独立宿主设计 / Standalone host design | [standalone-host-design.md](standalone-host-design.md) | — | 本包自持入口与组装根、DSH 进程内加载的方案与决策。 |
+diff --git a/docs/user-guide.en.md b/docs/user-guide.en.md
+index 6edab908..b2ac9b6d 100644
+--- a/docs/user-guide.en.md
++++ b/docs/user-guide.en.md
+@@ -584,6 +584,11 @@ An empty session shows the whale logo area at the top (scrolls away with the con
+ - Expand: **click the line** (tool card: click the card) to unfold, click again to fold; keyboard `Ctrl+O`.
+ - Thinking lines don't fold.
+ 
++**History digests and run grouping**
++
++- Restored-from-log tool cards read as a one-line digest by default: tool name + the start of its arguments + `…` + an expand hint; click the card or press `Ctrl+O` for the full arguments and result. A settled thinking block likewise keeps one line (duration + opening fragment + expand hint).
++- **A run of consecutive subagent cards** (≥3, all settled) folds into a single `子代理 ×N` header: click it to open the whole run, click again to fold; `Ctrl+O` opens and folds it too. While any member is still running the run stays open — in-flight work is never hidden behind a summary.
++
+ ### 5.2 Bottom status bar (three rows under the input)
+ 
+ **Row 1 — context segment bar** (`/settings → statusBar.contextBar`, default on)
+@@ -675,7 +680,7 @@ Common items below, full list on the /settings screen. Most topics (**Appearance
+ **effortDefault**: when the model lacks that level, choose the nearest lower offered tier or the model default and show a notice. On DSH, priority is settings user layer > the last `/effort`
+ (effort.json, the level the last session ran) > cordis `effort` (deployment default) > model default. Claude/Codex apply edits through their own controls and backend preferences; Auto at startup and resumed sessions preserve the selection, while explicitly choosing Auto resets the model default.
+ 
+-**scrollGutter**: the scrollbar track can be dragged directly; `Shift`/`Alt`/`Ctrl`+drag is still text selection.
++**scrollGutter**: the scrollbar track can be dragged directly; `Shift`/`Alt`/`Ctrl`+drag is still text selection. On the timeline, the ▲/▼ arrows and the wheel while the pointer is over the rail only step the index window — they never jump turns or scroll the transcript; the arrows dim at the top/bottom.
+ 
+ **pageMargin**: custom `NxM` = `N` columns left/right, `M` rows top/bottom (cap 8x4); only `N` means 1 row top/bottom.
+ 
+diff --git a/docs/user-guide.md b/docs/user-guide.md
+index e9db2b74..b9ab2403 100644
+--- a/docs/user-guide.md
++++ b/docs/user-guide.md
+@@ -532,6 +532,11 @@ dsh-TUI 不预装通用技能；`/skills` 浏览 DSH 发现的技能，可直调
+ - 展开：**鼠标点这一行**（工具卡点卡面）再点收起；键盘用 `Ctrl+O`。
+ - 思考（thinking）行不折叠。
+ 
++**历史摘要与成组折叠**
++
++- 历史（从会话记录恢复的）工具卡默认读作一行摘要：工具名 + 参数开头 + `…` + 展开提示；点卡面或 `Ctrl+O` 展开完整参数与结果。思考块落定后同样只剩一行（时长 + 开头片段 + 展开提示）。
++- **连续派出的子代理卡**（≥3 张且全部落定）自动折叠成一行组头 `子代理 ×N`：点组头展开整组，再点收回；`Ctrl+O` 同样展开/收回。组内只要还有成员在跑，这一组就保持展开——在跑的工作不会被收进摘要。
++
+ ### 5.2 底部状态栏（输入框下方三行）
+ 
+ **Row 1 — 上下文分段进度条**（`/settings → statusBar.contextBar`，默认开）
+@@ -613,7 +618,7 @@ dsh-tui 自身区块在 0.1.7 写入当前 profile 的 `cordis.patch.yml`，旧
+ **effortDefault**：模型没有该档时向下选择最近的可用档位，否则回到模型默认，并弹提示。DSH 的优先级为 settings 用户层 > 上次 `/effort`
+ （effort.json，即上次实际运行的档位）> cordis `effort`（部署默认值）> 模型默认。Claude/Codex 通过自身控制接口和后端偏好应用修改；启动采用自动模式或恢复会话时保留原有选择，在设置中主动选择自动会重置为模型默认。
+ 
+-**scrollGutter**：scrollbar 轨道可直接拖；`Shift`/`Alt`/`Ctrl`+拖动仍是文字选择。
++**scrollGutter**：scrollbar 轨道可直接拖；`Shift`/`Alt`/`Ctrl`+拖动仍是文字选择。timeline 两端的 ▲/▼ 与指针停在轨道上时的滚轮只翻动索引窗口，不跳回合、不滚动转录；到顶/到底三角变暗。
+ 
+ **pageMargin**：自定义 `NxM` = 左右 `N` 列、上下 `M` 行（上限 8x4）；只填 `N` 则上下 1 行。
+ 
+diff --git a/guide/dsh-tui-guide/interaction.en.md b/guide/dsh-tui-guide/interaction.en.md
+index f13c5d7a..ca0cb78f 100644
+--- a/guide/dsh-tui-guide/interaction.en.md
++++ b/guide/dsh-tui-guide/interaction.en.md
+@@ -657,7 +657,8 @@ In inline mode, the terminal emulator owns native scrollback and selection.
+   panel); elsewhere scrolls the message list (±3 lines per notch). Never scrolls the
+   transcript behind an open overlay. Moves the cursor in the trajectory scene (±3 rows per
+   notch on the timeline, ±1 in hotspot; scrolls the detail while expanded). Walks the
+-  focused row in /settings.
++  focused row in /settings. With the pointer over the right-edge timeline, the wheel only
++  steps its index window (±3 ticks per notch) and never scrolls the transcript.
+ - **Drag** — Select text and copy on release, keeping the selection; a "Copied N characters"
+   notice pops up. A new selection replaces the retained one. With
+   `dsh-tui.scrollGutter: scrollbar`, the right-edge scrollbar is a drag
+@@ -671,7 +672,10 @@ In inline mode, the terminal emulator owns native scrollback and selection.
+ - **Single-click a message row** — Plain text rows (user/assistant) do nothing — the
+   transcript is a reading surface, selection is the mouse's job there.
+ - **Single-click a tool card / thinking / compact summary** — Expand / collapse (header
+-  brightens on hover; trailing blank cells do not trigger).
++  brightens on hover; trailing blank cells do not trigger). Expanding rewraps a
++  tool header or arguments that were cut to the terminal width; while expanded the
++  header no longer opens the file menu (collapse restores it; the body's path row
++  still opens the file).
+ - **Single-click a subagent card** — Open that subagent's detail scene (status glyph
+   brightens on hover).
+ - **Single-click the input box** — Place the text caret at the click (multi-line, wrapped
+@@ -720,8 +724,15 @@ In inline mode, the terminal emulator owns native scrollback and selection.
+   cancelling stays on keyboard Esc.
+ - **Single-click a help-menu command row** — Fill `/name ` into the prompt and close the
+   help (the Tab completion's mouse equivalent).
++- **Click the timeline's ▲/▼ arrows** — Step the index window up / down one row; the
++  arrow dims and becomes inert at the top / bottom of the index.
+ - **Click a timeline-rail tick** — Jump to that turn — the rail covers every turn (folded
+-  ones included); a folded tick reveals its turn first, then scrolls it into place.
++  ones included); a folded tick reveals its turn first, then scrolls it into place. On a
++  long DSH session, where older history is collapsed into per-chunk report lines, a tick
++  inside a collapsed chunk projects only that chunk (not the whole history) before the jump.
++  Browsing the index never jumps turns or scrolls the transcript; once the window leaves the
++  active turn, ━━ can be absent from the visible ticks, and a real transcript scroll or a
++  tick click returns the window to following the active turn.
+ - **Keyboard selection extension** — With a selection, `Shift+←/→/↑/↓/Home/End` extends /
+   shrinks it (wraps across lines).
+ 
+diff --git a/guide/dsh-tui-guide/interaction.md b/guide/dsh-tui-guide/interaction.md
+index d12970ca..3a523fe1 100644
+--- a/guide/dsh-tui-guide/interaction.md
++++ b/guide/dsh-tui-guide/interaction.md
+@@ -657,6 +657,7 @@ dsh-tui 不修改 `~/.claude/settings.json`；会话启动时若其中的 `ANTHR
+   - 其余位置滚动会话消息列表。
+   - 浮层打开时不穿透滚动背后转录。
+   - 轨迹场景移动光标（时间线一格 ±3 行、热点 ±1 行、详情展开时滚详情）。
++  - 指针停在右缘时间轴上：只上下翻动索引窗口（一格 3 个刻度），不滚动转录。
+   - 设置屏移动焦点行。
+ - **拖拽**：选择文本，松开后立即复制并保留选区，弹出「已复制 N 字符」提示；重新拖选会替换现有选区。
+   - `dsh-tui.scrollGutter: scrollbar` 时，右缘滚动条是拖拽目标。
+@@ -667,7 +668,7 @@ dsh-tui 不修改 `~/.claude/settings.json`；会话启动时若其中的 `ANTHR
+ - **`Esc`**：取消正在进行的拖拽（或现有选区），不复制。
+ - **代码块**：从正文开始拖选时，light 与 full 代码框的软换行直接拼接，不额外复制边框内边距或换行。硬换行与硬行行首间距保留既有屏幕复制行为，不提供逐字节源码导出。
+ - **单击消息行**：纯文本行（用户/assistant）无操作——转录是阅读区，鼠标职责是选字。
+-- **单击工具卡 / thinking / compact 摘要**：展开 / 收起（hover 时标题提亮指示，行右侧空白不触发）。
++- **单击工具卡 / thinking / compact 摘要**：展开 / 收起（hover 时标题提亮指示，行右侧空白不触发）；展开会把被宽度截断的工具标题/参数换行画全，此时点标题不再开文件菜单（收起后恢复），文件仍可从正文的路径行打开。
+ - **单击子代理卡**：打开该子代理的详情场景（hover 时状态符号提亮）。
+ - **单击输入框**：定位文本光标到点击处（多行/换行/CJK 均按显示宽度对齐）。
+ - **单击输入框中的 `[Image #N]` / transcript 缩略图**：打开居中大图预览（Kitty/Sixel 不可用时显示图片元数据）。
+@@ -704,7 +705,8 @@ dsh-tui 不修改 `~/.claude/settings.json`；会话启动时若其中的 `ANTHR
+ - 悬停即移动焦点（lazygit 规则），编辑态整屏不响应防误触。
+ - **单击会话浏览器确认行**：删除/清理确认行点击 = 确认执行（同 `Enter`）；取消保留键盘 `Esc`。
+ - **单击帮助菜单命令行**：填入 `/name ` 并关闭帮助（`Tab` 补全的鼠标等价）。
+-- **点击时间轴刻度**：跳到该回合——轨道覆盖全部回合（含折叠的）；折叠刻度先展开该回合再滚到位。
++- **单击时间轴两端 ▲/▼**：索引窗口上/下翻一格；到顶/到底时变暗且点击无效。
++- **点击时间轴刻度**：跳到该回合——轨道覆盖全部回合（含折叠的）；折叠刻度先展开该回合再滚到位。长 DSH 会话把更早的历史折叠成每块一行摘要时，折叠区内的刻度只投影该回合所在的那一块（不是整段历史），再滚到位。翻动索引窗口不跳回合、不滚动转录；窗口离开当前回合后 ━━ 可以不在可见刻度里，真实滚动转录或点击刻度后恢复自动跟随当前回合。
+ - **键盘扩展选区**：有选区时 `Shift+←/→/↑/↓/Home/End` 扩展 / 收缩（跨行环绕）。
+ 
+ 以上鼠标行为只在 `fullscreen: true` 的 alternate screen 生效。
+diff --git a/guide/dsh-tui-guide/user-guide.en.md b/guide/dsh-tui-guide/user-guide.en.md
+index 6edab908..b2ac9b6d 100644
+--- a/guide/dsh-tui-guide/user-guide.en.md
++++ b/guide/dsh-tui-guide/user-guide.en.md
+@@ -584,6 +584,11 @@ An empty session shows the whale logo area at the top (scrolls away with the con
+ - Expand: **click the line** (tool card: click the card) to unfold, click again to fold; keyboard `Ctrl+O`.
+ - Thinking lines don't fold.
+ 
++**History digests and run grouping**
++
++- Restored-from-log tool cards read as a one-line digest by default: tool name + the start of its arguments + `…` + an expand hint; click the card or press `Ctrl+O` for the full arguments and result. A settled thinking block likewise keeps one line (duration + opening fragment + expand hint).
++- **A run of consecutive subagent cards** (≥3, all settled) folds into a single `子代理 ×N` header: click it to open the whole run, click again to fold; `Ctrl+O` opens and folds it too. While any member is still running the run stays open — in-flight work is never hidden behind a summary.
++
+ ### 5.2 Bottom status bar (three rows under the input)
+ 
+ **Row 1 — context segment bar** (`/settings → statusBar.contextBar`, default on)
+@@ -675,7 +680,7 @@ Common items below, full list on the /settings screen. Most topics (**Appearance
+ **effortDefault**: when the model lacks that level, choose the nearest lower offered tier or the model default and show a notice. On DSH, priority is settings user layer > the last `/effort`
+ (effort.json, the level the last session ran) > cordis `effort` (deployment default) > model default. Claude/Codex apply edits through their own controls and backend preferences; Auto at startup and resumed sessions preserve the selection, while explicitly choosing Auto resets the model default.
+ 
+-**scrollGutter**: the scrollbar track can be dragged directly; `Shift`/`Alt`/`Ctrl`+drag is still text selection.
++**scrollGutter**: the scrollbar track can be dragged directly; `Shift`/`Alt`/`Ctrl`+drag is still text selection. On the timeline, the ▲/▼ arrows and the wheel while the pointer is over the rail only step the index window — they never jump turns or scroll the transcript; the arrows dim at the top/bottom.
+ 
+ **pageMargin**: custom `NxM` = `N` columns left/right, `M` rows top/bottom (cap 8x4); only `N` means 1 row top/bottom.
+ 
+diff --git a/guide/dsh-tui-guide/user-guide.md b/guide/dsh-tui-guide/user-guide.md
+index e9db2b74..b9ab2403 100644
+--- a/guide/dsh-tui-guide/user-guide.md
++++ b/guide/dsh-tui-guide/user-guide.md
+@@ -532,6 +532,11 @@ dsh-TUI 不预装通用技能；`/skills` 浏览 DSH 发现的技能，可直调
+ - 展开：**鼠标点这一行**（工具卡点卡面）再点收起；键盘用 `Ctrl+O`。
+ - 思考（thinking）行不折叠。
+ 
++**历史摘要与成组折叠**
++
++- 历史（从会话记录恢复的）工具卡默认读作一行摘要：工具名 + 参数开头 + `…` + 展开提示；点卡面或 `Ctrl+O` 展开完整参数与结果。思考块落定后同样只剩一行（时长 + 开头片段 + 展开提示）。
++- **连续派出的子代理卡**（≥3 张且全部落定）自动折叠成一行组头 `子代理 ×N`：点组头展开整组，再点收回；`Ctrl+O` 同样展开/收回。组内只要还有成员在跑，这一组就保持展开——在跑的工作不会被收进摘要。
++
+ ### 5.2 底部状态栏（输入框下方三行）
+ 
+ **Row 1 — 上下文分段进度条**（`/settings → statusBar.contextBar`，默认开）
+@@ -613,7 +618,7 @@ dsh-tui 自身区块在 0.1.7 写入当前 profile 的 `cordis.patch.yml`，旧
+ **effortDefault**：模型没有该档时向下选择最近的可用档位，否则回到模型默认，并弹提示。DSH 的优先级为 settings 用户层 > 上次 `/effort`
+ （effort.json，即上次实际运行的档位）> cordis `effort`（部署默认值）> 模型默认。Claude/Codex 通过自身控制接口和后端偏好应用修改；启动采用自动模式或恢复会话时保留原有选择，在设置中主动选择自动会重置为模型默认。
+ 
+-**scrollGutter**：scrollbar 轨道可直接拖；`Shift`/`Alt`/`Ctrl`+拖动仍是文字选择。
++**scrollGutter**：scrollbar 轨道可直接拖；`Shift`/`Alt`/`Ctrl`+拖动仍是文字选择。timeline 两端的 ▲/▼ 与指针停在轨道上时的滚轮只翻动索引窗口，不跳回合、不滚动转录；到顶/到底三角变暗。
+ 
+ **pageMargin**：自定义 `NxM` = 左右 `N` 列、上下 `M` 行（上限 8x4）；只填 `N` 则上下 1 行。
+ 
+diff --git a/package.json b/package.json
+index bdeb075d..07f95f6b 100644
+--- a/package.json
++++ b/package.json
+@@ -281,6 +281,36 @@
+     "verify:channel-composition": "node --import tsx/esm scripts/verify-channel-composition.ts",
+     "verify:channel-trace-read": "node --import tsx/esm scripts/verify-channel-trace-read.ts",
+     "verify:history-chunks": "node --import tsx/esm scripts/verify-history-chunks.ts",
++    "verify:fold-back-user": "node --import tsx/esm scripts/verify-fold-back-user.ts",
++    "verify:markdown-lazy-highlight": "node --import tsx/esm scripts/verify-markdown-lazy-highlight.tsx",
++    "verify:syntax-lazy-highlight": "node --import tsx/esm scripts/verify-markdown-lazy-highlight.tsx --syntax",
++    "verify:chat-seek-paging": "node scripts/verify-chat-seek-paging.mjs",
++    "verify:chat-pending-wheel": "node scripts/verify-chat-pending-wheel.mjs seek && node scripts/verify-chat-pending-wheel.mjs down && node scripts/verify-chat-pending-wheel.mjs up && node scripts/verify-chat-pending-wheel.mjs overscroll && node scripts/verify-chat-pending-wheel.mjs panel",
++    "verify:scroll-anchor-overscroll": "node scripts/verify-scroll-anchor-overscroll.mjs",
++    "verify:top-page-load": "node --import tsx/esm scripts/verify-top-page-load.tsx",
++    "verify:file-target-no-separator": "node --import tsx/esm scripts/verify-file-target-no-separator.ts",
++    "verify:file-target-linear": "node --import tsx/esm scripts/verify-file-target-linear.ts",
++    "verify:file-target-slash-performance": "node --import tsx/esm scripts/verify-file-target-slash-performance.ts",
++    "verify:markdown-filelink-ansi": "node --import tsx/esm scripts/verify-markdown-filelink-ansi.ts",
++    "verify:settled-thinking-summary": "node --expose-gc --import tsx/esm scripts/verify-settled-thinking-summary.mjs",
++    "verify:leading-thinking-lines": "node --import tsx/esm scripts/verify-leading-thinking-lines.mjs",
++    "verify:thinking-ticker-tail": "node --import tsx/esm scripts/verify-thinking-ticker-tail.ts",
++    "verify:thinking-ticker-render": "node --import tsx/esm scripts/verify-thinking-ticker-render.tsx",
++    "verify:settled-thinking-cells": "node --import tsx/esm scripts/verify-settled-thinking-cells.mjs",
++    "verify:settled-thinking-component": "node --import tsx/esm scripts/verify-settled-thinking-component.tsx",
++    "verify:settled-thinking-chat": "node --import tsx/esm scripts/verify-settled-thinking-chat.mjs",
++    "verify:thinking-virtualization": "node scripts/verify-thinking-virtualization.mjs --run",
++    "verify:subagent-settled-no-scan": "node --import tsx/esm scripts/verify-subagent-settled-no-scan.mjs",
++    "verify:subagent-group-fold": "node --import tsx/esm scripts/verify-subagent-group-fold.tsx",
++    "verify:digest-click": "node --import tsx/esm scripts/verify-digest-click.tsx",
++    "verify:selection-attachment-bounded": "node --import tsx/esm scripts/verify-selection-attachment-bounded.ts",
++    "verify:history-prose-default": "node --import tsx/esm scripts/verify-history-prose-default.tsx",
++    "verify:folded-code-summary": "node --expose-gc --import tsx/esm scripts/verify-folded-code-summary.ts",
++    "verify:long-prose-ansi": "node --import tsx/esm scripts/verify-long-prose-ansi.tsx",
++    "verify:code-fence-chat": "node --import tsx/esm scripts/verify-code-fence-chat.tsx",
++    "verify:code-fence-lru": "node --import tsx/esm scripts/verify-code-fence-lru.tsx",
++    "verify:chunked-rail": "node --import tsx/esm scripts/verify-timeline-geometry.ts && node --import tsx/esm scripts/verify-chunked-rail.tsx",
++    "verify:rail-window-seek": "node --import tsx/esm scripts/verify-rail-window-seek.tsx",
+     "verify:activity-store": "node --import tsx/esm scripts/verify-activity-store.ts",
+     "verify:activity-store-render": "node --import tsx/esm scripts/verify-activity-store-render.tsx",
+     "verify:status-fields": "node --import tsx/esm scripts/verify-status-fields.tsx",
+diff --git a/scripts/ci-group-timings.json b/scripts/ci-group-timings.json
+index 3b8f6946..f65214b4 100644
+--- a/scripts/ci-group-timings.json
++++ b/scripts/ci-group-timings.json
+@@ -73,6 +73,7 @@
+     "verify-thinking-preview": 1.7,
+     "verify-timeline-rail": 24.2,
+     "verify-timeline-rail-settle": 5.4,
++    "verify-rail-index-scroll": 7.4,
+     "verify-tool-history-window": 4.7,
+     "verify-transcript-paging": 19.3,
+     "verify-unseen-report-once": 2.5,
+@@ -234,6 +235,7 @@
+     "verify-context-occupancy": 1.5,
+     "verify-context-warning": 1.5,
+     "verify-ctrl-t-scope": 3.8,
++    "verify-digest-click": 1.2,
+     "verify-divider-stability": 0.9,
+     "verify-divider-width": 0.8,
+     "verify-docked-queue": 7,
+@@ -243,6 +245,7 @@
+     "verify-effort-default": 0.3,
+     "verify-effort-ignition": 12.1,
+     "verify-effort-slider-ui": 3.5,
++    "verify-ellipsis-expand": 3.3,
+     "verify-empty-assistant": 4.5,
+     "verify-empty-assistant-row": 1.3,
+     "verify-external-editor": 1.1,
+diff --git a/scripts/run-ci-group.mjs b/scripts/run-ci-group.mjs
+index ef6ed247..fbe7bf5d 100644
+--- a/scripts/run-ci-group.mjs
++++ b/scripts/run-ci-group.mjs
+@@ -116,9 +116,12 @@ const GROUPS = {
+     ["verify-streaming-markdown-spacing", ['node', '--import', 'tsx/esm', 'scripts/verify-streaming-markdown-spacing.tsx']],
+     ['verify-text-measure-cache', ['node', '--import', 'tsx/esm', 'scripts/verify-text-measure-cache.ts']],
+     ['verify-text-wrap-geometry', ['node', '--import', 'tsx/esm', 'scripts/verify-text-wrap-geometry.tsx']],
++    ['verify-wrap-ansi-incremental', ['node', 'scripts/verify-wrap-ansi-incremental.mjs']],
+     ['verify-wrap-exact-fill', ['node', '--import', 'tsx/esm', 'scripts/verify-wrap-exact-fill.tsx']],
+     ['verify-component-wrap-exact-fill', ['node', '--import', 'tsx/esm', 'scripts/verify-component-wrap-exact-fill.tsx']],
+     ['verify-streaming-markdown-blocks', ['node', '--import', 'tsx/esm', 'scripts/verify-streaming-markdown-blocks.tsx']],
++    ['verify-streaming-suffix-identity', ['node', 'scripts/verify-streaming-suffix-identity.mjs']],
++    ['verify-streaming-tail-boundary', ['node', 'scripts/verify-streaming-tail-boundary.mjs']],
+ // Markdown token 覆盖：真实 lexer 产出的 token 类型必须与白名单完全一致
+ // （marked 升级带来新类型即失败）；任务列表 [x]/[ ] 在各种列表形态下的位置。
+     ['verify-markdown-token-coverage', ['node', '--import', 'tsx/esm', 'scripts/verify-markdown-token-coverage.ts']],
+@@ -237,6 +240,9 @@ const GROUPS = {
+ // 曾以 120ms/卡片持续驱动 React commit，N 张相位错开合成 ~30ms
+ // 均匀帧 cadence。
+     ["verify-subagent-settle", ['node', '--import', 'tsx/esm', 'scripts/verify-subagent-settle.tsx']],
++// 连续子代理卡成组：已落定的 fan-out 默认折叠成一行摘要，点击/Ctrl+O 展开
++// 整组并可再收回；组内有 running 成员时保持展开（在跑的工作不许被收起）。
++    ["verify-subagent-group-fold", ['node', '--import', 'tsx/esm', 'scripts/verify-subagent-group-fold.tsx']],
+ // 子代理流投影批处理：chunk 风暴的 snapshot+行投影必须按 16ms 帧
+ // 对齐合并（token 率 100-300/s 下的全量深拷贝热路径），且生命周期
+ // 事件（tool/call、subagent/end）保持同步立即可见。
+@@ -312,6 +318,11 @@ const GROUPS = {
+ // 时间线 rail 回归：rail 覆盖全部轮次（含折叠轮），高亮锚定视口顶、
+ // ▲/▼ 目标不越过 maxScroll。
+     ["verify-timeline-rail", ['node', '--import', 'tsx/esm', 'scripts/verify-timeline-rail.tsx']],
++// 时间线 rail 索引窗口独立滚动回归：▲/▼ 与「指针在 rail 上」的滚轮只翻
++// tick 索引窗口，不跳轮次、不滚动转录；到顶/到底三角变暗 no-op；窗口翻走
++// 后 ━━ 可不在窗口内，真实转录滚动/点 tick 才回自动跟随。
++    ["verify-rail-index-scroll", ['node', '--import', 'tsx/esm', 'scripts/verify-rail-index-scroll.tsx']],
++    ['verify-rail-probe-guards', ['node', 'scripts/verify-rail-probe-guards.mjs']],
+ // 时间线 rail 视口高度落定回归：底部 chrome 悬停展开/收回与终端行 resize
+ // 改变转录视口高度时（无滚动通知、不翻转 sticky），rail 几何必须跟随；
+ // 通知语义（仅高度变化触发）经渲染器→React 回调计数探针断言。
+@@ -498,6 +509,9 @@ const GROUPS = {
+ // 悬停窥视（窗口钉头部）/移开重折叠、点击 chip 固定展开、点击 ▾ 前缀
+ // 再折叠、Esc 展开不清空、Enter/输入全文提交——鼠标走真实 SGR 事件。
+     ["repro-paste-fold", ['node', '--import', 'tsx/esm', 'scripts/repro-paste-fold.tsx']],
++    ['verify-input-fold-threshold', ['node', 'scripts/verify-input-fold-threshold.mjs']],
++    ['verify-input-grapheme-lazy', ['node', 'scripts/verify-input-grapheme-lazy.mjs']],
++    ['verify-input-bound-images', ['node', 'scripts/verify-input-bound-images.mjs']],
+ // 图片附件回归：剪贴板位图占位符与图片文件 @ 引用进附件库（#152）。
+     ["verify-clipboard-image", ['node', '--import', 'tsx/esm', 'scripts/verify-clipboard-image.ts']],
+ // 拖选复制端到端回归（用户报告：全屏下拖选"只能复制一个字符，只有
+@@ -1572,6 +1586,13 @@ const GROUPS = {
+ // 与正文都出折叠标记且裁掉的尾巴不在屏上；Ctrl+O 逃生门恢复原文；
+ // reasoning 行不折叠（自带三行预览）。
+     ["verify-long-line-fold", ['node', '--import', 'tsx/esm', 'scripts/verify-long-line-fold.tsx']],
++// 静默省略号可展开回归（用户反馈：只有 hover tooltip 的截断点不出去）：工具卡
++// 头部被宽度截断的标题/无标题卡的 480 字符参数，在窄终端点一下换行画全、再点
++// 收起；详情页转录的落定思考摘要同样可点开；冷 verbose 与点击展开逐字节一致。
++    ["verify-ellipsis-expand", ['node', '--import', 'tsx/esm', 'scripts/verify-ellipsis-expand.tsx']],
++// 历史分块摘要行即加载控件：点摘要行把该块投影到原位（工具 digest 行），
++// 普通 notice 分隔行（compact 摘要，无 collapsed 标志）必须保持惰性。
++    ["verify-digest-click", ['node', '--import', 'tsx/esm', 'scripts/verify-digest-click.tsx']],
+ // btw 面板：侧栏（空态、Markdown、Enter 提交/Esc 保草稿/Tab 切焦点/n 新话题/s 发到聊天）、
+ // 未读 badge、28/40 列；真实 Chat 的 /btw 在面板启用时进侧栏，未启用时用浮层（Esc 中止）。
+     ["verify-btw-panel", ['node', '--import', 'tsx/esm', 'scripts/verify-btw-panel.tsx']],
+diff --git a/scripts/run-verify-build.mjs b/scripts/run-verify-build.mjs
+index e1803d1b..d0b947b7 100644
+--- a/scripts/run-verify-build.mjs
++++ b/scripts/run-verify-build.mjs
+@@ -115,6 +115,34 @@ const GATES = [
+   'verify:session-reset',
+   'verify:channel-ui',
+   'verify:history-chunks',
++  'verify:fold-back-user',
++  'verify:markdown-lazy-highlight',
++  'verify:syntax-lazy-highlight',
++  'verify:chat-seek-paging',
++  'verify:chat-pending-wheel',
++  'verify:scroll-anchor-overscroll',
++  'verify:file-target-no-separator',
++  'verify:file-target-linear',
++  'verify:file-target-slash-performance',
++  'verify:markdown-filelink-ansi',
++  'verify:settled-thinking-summary',
++  'verify:leading-thinking-lines',
++  'verify:thinking-ticker-tail',
++  'verify:thinking-ticker-render',
++  'verify:settled-thinking-cells',
++  'verify:settled-thinking-component',
++  'verify:settled-thinking-chat',
++  'verify:thinking-virtualization',
++  'verify:subagent-settled-no-scan',
++  'verify:subagent-group-fold',
++  'verify:selection-attachment-bounded',
++  'verify:history-prose-default',
++  'verify:folded-code-summary',
++  'verify:long-prose-ansi',
++  'verify:code-fence-chat',
++  'verify:code-fence-lru',
++  'verify:chunked-rail',
++  'verify:rail-window-seek',
+   'verify:adapter-detection',
+   'verify:adapter-replay-harness',
+   'verify:adapter-channel-conformance',
+@@ -159,10 +187,18 @@ const FRONT = [
+   'verify:approval-visibility',
+ ]
+ 
+-// Gates that must not share the machine with other gates. Empty today: every
+-// gate passes under full parallel load. Add a gate here, with the reason,
+-// rather than raising a timeout inside it.
+-const SERIAL = []
++// Keep timing/allocation probes and the frame-sensitive Chat test isolated
++// from sibling gates; do not hide contention by increasing their thresholds.
++const SERIAL = [
++  'verify:chat-pending-wheel',
++  'verify:file-target-no-separator',
++  'verify:file-target-slash-performance',
++  'verify:settled-thinking-summary',
++  'verify:thinking-ticker-render',
++  'verify:settled-thinking-chat',
++  'verify:thinking-virtualization',
++  'verify:subagent-settled-no-scan',
++]
+ 
+ const root = new URL('..', import.meta.url)
+ const scripts = JSON.parse(readFileSync(new URL('package.json', root), 'utf8')).scripts ?? {}
+diff --git a/scripts/verify-package.mjs b/scripts/verify-package.mjs
+index f22fba9e..153a59e0 100644
+--- a/scripts/verify-package.mjs
++++ b/scripts/verify-package.mjs
+@@ -12,7 +12,19 @@ const input = await new Promise((resolve, reject) => {
+   process.stdin.on('error', reject)
+ })
+ 
+-const reports = JSON.parse(input)
++let reports
++const lines = input.split(/\r?\n/u)
++for (let index = 0; index < lines.length; index++) {
++  const candidate = lines[index]?.trim()
++  if (candidate !== '[' && candidate !== '{') continue
++  try {
++    reports = JSON.parse(lines.slice(index).join('\n'))
++    break
++  } catch {
++    // npm's prepare lifecycle may print arbitrary lines before the JSON report.
++  }
++}
++if (reports === undefined) throw new Error('npm pack did not return a JSON file list')
+ // npm 10 emits an array while npm 11 emits an object keyed by package name.
+ const report = Array.isArray(reports) ? reports[0] : Object.values(reports)[0]
+ if (report === undefined || !Array.isArray(report.files)) {

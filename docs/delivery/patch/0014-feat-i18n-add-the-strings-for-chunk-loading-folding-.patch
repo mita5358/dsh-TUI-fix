@@ -1,0 +1,52 @@
+From 62cc7dbc3af0abc08c6876bca5699e46fc28124c Mon Sep 17 00:00:00 2001
+From: mita5358 <kafitcohr@outlook.com>
+Date: Mon, 9 Nov 2026 13:00:50 +0800
+Subject: [PATCH 14/20] feat(i18n): add the strings for chunk loading, folding
+ and digests
+
+---
+ src/i18n.ts | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/src/i18n.ts b/src/i18n.ts
+index 12fa5cab..8ece6b41 100644
+--- a/src/i18n.ts
++++ b/src/i18n.ts
+@@ -1177,10 +1177,18 @@ const dict = {
+   // （foldTerminalCommand）、分屏 diff 隐藏行（SplitDiffView）。按字符折叠
+   // 的行内标记见 long-line-folded。
+   'lines-folded-expand': { zh: '… +{{n}} 行（{{key}} 展开）', en: '… +{{n}} lines ({{key}} to expand)' },
++  // 历史摘要行：整行就是展开开关（点击摘要 = expandedRows 切换），提示里
++  // 同时给出点击与键盘两条路径。
++  'lines-folded-expand-click': { zh: '… +{{n}} 行（点击或 {{key}} 展开）', en: '… +{{n}} lines (click or {{key}} to expand)' },
++  // 折叠的历史代码块（Markdown 的 foldedCode 路径）：一行摘要代替整段围栏，
++  // 只保留语言、行数与首行片段；点击这一行展开（沿用 expandedRows 手势）。
++  'code-fence-folded': { zh: '{{lang}} · {{n}} 行', en: '{{lang}} · {{n}} lines' },
++  'code-fence-folded-expand': { zh: '（点击展开）', en: '(click to expand)' },
+   // 工具卡折叠量（行/字符）与展开态的「只是预览」说明。
+   'tool-card-lines-unit': { zh: '{{n}} 行', en: '{{n}} lines' },
+   'tool-card-chars-unit': { zh: '{{n}} 字符', en: '{{n}} chars' },
+   'tool-card-lines-hidden': { zh: '… 已折叠 {{parts}}（{{key}} 展开）', en: '… folded {{parts}} ({{key}} to expand)' },
++  'tool-card-lines-hidden-click': { zh: '… 已折叠 {{parts}}（点击或 {{key}} 展开）', en: '… folded {{parts}} (click or {{key}} to expand)' },
+   'tool-card-source-truncated': { zh: '原始数据已折叠：以上是预览，全文保留在会话日志里', en: 'Source folded: the above is a preview; the session log keeps the full text' },
+   'tool-card-full-unavailable': { zh: '以上是整理后的视图，没有保留可展开的原始全文', en: 'Formatted view above; no raw full text was kept to expand' },
+   'tool-card-window-shown': { zh: '… 只显示前 {{shown}}/{{total}} 行（全文仍保留）', en: '… showing the first {{shown}}/{{total}} lines (the full text is kept)' },
+@@ -2201,6 +2209,18 @@ const dict = {
+   'jobs-group-hint-expand': { zh: '点击展开', en: 'click to expand' },
+   'jobs-group-hint-fold': { zh: '点击折叠', en: 'click to fold' },
+ 
++  // 连续子代理卡成组（SubagentGroupHeader）：一次 fan-out 落下 N 张 `⑂` 卡，
++  // 组头一行汇总整组；全部落定后整组折叠成这一行（运行中的不折叠）。
++  'subagents-group-title': { zh: '子代理 ×{{count}}', en: 'subagents ×{{count}}' },
++  'subagents-group-folded': { zh: '已折叠 {{count}} 个子代理', en: '{{count}} subagents folded' },
++  'subagents-group-live': { zh: '{{count}} 运行中', en: '{{count}} running' },
++  'subagents-group-completed': { zh: '{{count}} 已完成', en: '{{count}} completed' },
++  'subagents-group-failed': { zh: '{{count}} 失败', en: '{{count}} failed' },
++  'subagents-group-all-completed': { zh: '全部完成', en: 'all completed' },
++  'subagents-group-elapsed': { zh: '合计 {{duration}}', en: '{{duration}} total' },
++  'subagents-group-hint-expand': { zh: '点击展开', en: 'click to expand' },
++  'subagents-group-hint-fold': { zh: '点击折叠', en: 'click to fold' },
++
+   // ── components/questions/PlanReviewPanel.tsx ────────────────────────
+   'plan-review-fallback-header': { zh: '计划评审', en: 'Plan review' },
+   'plan-review-feedback-placeholder': { zh: '输入反馈，告诉模型要改什么…', en: 'Tell the model what to change…' },

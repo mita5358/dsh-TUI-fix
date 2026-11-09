@@ -1,0 +1,96 @@
+From ef5554dcbb9d145f987a14c33f14dc02753b60cd Mon Sep 17 00:00:00 2001
+From: mita5358 <kafitcohr@outlook.com>
+Date: Fri, 30 Oct 2026 23:52:36 +0800
+Subject: [PATCH 10/20] docs(dsh): describe the chunked open and how to trace
+ its phases
+
+---
+ README.md              | 11 ++++++++++-
+ README_ZH.md           |  8 +++++++-
+ docs/interaction.en.md |  4 +++-
+ docs/interaction.md    |  2 +-
+ 4 files changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/README.md b/README.md
+index 9b538650..f223ae1f 100644
+--- a/README.md
++++ b/README.md
+@@ -61,7 +61,7 @@ Resuming a DSH session preserves its recorded reasoning effort (or its live sele
+ - **Account sign-in** — the standard profile offers pi-ai OAuth for ChatGPT/Codex, Claude, and Grok (plus OpenAI direct and Meta Muse when available), and Host-owned DeepSeek browser sign-in as `deepseek-account` on DSH 0.2.0-rc.1+. Use `/provider` or `/auth` without another plugin.
+   A profile-only update from a global TUI patch that already mounts `dsh-tui-auth` can still start the official loopback callback listener on demand; fixed-port SSH forwarding still requires the global package to be aligned.
+ - **Extensions** — browser interaction, computer use and more.
+-- **Built for long sessions** — event-driven projection, virtualization, bounded caches.
++- **Built for long sessions** — event-driven projection, virtualization, bounded caches. Opening a DSH session with tens of thousands of rows projects only its newest chunk; older history folds into one text-only report line per chunk plus one prompt line per turn, and clicking a folded turn on the timeline projects just that chunk.
+ 
+ Keys and commands: [Interaction and commands](docs/interaction.en.md). Everything else: [documentation index](docs/README.md).
+ 
+@@ -747,6 +747,15 @@ API reports a migration-specific prerequisite. Session-tree reads validate packe
+ rows and check their entire member count against the remaining scan budget before
+ expanding events. Oversized rows report truncation; malformed rows report failure.
+ The logical budget does not eliminate physical JSON/frame parsing or validation.
++Resuming a DSH session still pays the host's full restore (frame decode, JSON
++parse, v4 validation) — that cost is linear in record size and lives outside this
++package. What this package controls is projection: the first screen projects only
++the newest chunk (the last 10 turns, under 200k characters), older chunks are cut
++every 50 turns / 1M characters and projected when loaded, so first-screen work
++stops growing with the record. On a 139 MB / 93k-event record the interactive
++first screen went from 16.7–17.3 s to ~13.0 s: ~7.5 s host restore, ~4.1 s process
++start and plugin load, ~1.0 s projection. Set `DSH_TUI_BOOT_TRACE=<file>` to log
++those phase marks as JSON lines when reporting a slow open.
+ Development `@deepseek-ai/*` release-age exceptions list only exact package versions in the current
+ lockfile (including the legacy SQLite island); all other versions retain the
+ 24-hour delay. Regenerate with `node scripts/verify-release-age-cohort.mjs --write`
+diff --git a/README_ZH.md b/README_ZH.md
+index 9c62dc14..2b0d1d04 100644
+--- a/README_ZH.md
++++ b/README_ZH.md
+@@ -58,7 +58,7 @@
+ - **账号登录** — 标准 profile 提供 pi-ai 的 ChatGPT/Codex、Claude、Grok OAuth（可用时还有 OpenAI 直连与 Meta Muse）；DSH 0.2.0-rc.1+ 还通过宿主服务提供 DeepSeek 浏览器登录，路由为 `deepseek-account`。通过 `/provider` 或 `/auth` 使用，无需另装插件。
+   仅更新 profile 而留下已挂载 `dsh-tui-auth` 的旧全局 TUI 补丁时，本地登录也会按需启动官方 loopback 回调监听器；SSH 固定端口转发仍需对齐全局安装包。
+ - **扩展** — 浏览器交互、computer use 等。
+-- **为长会话设计** — 事件驱动投影、虚拟化、有界缓存。
++- **为长会话设计** — 事件驱动投影、虚拟化、有界缓存。打开行数十万级的 DSH 会话时只投影最新一块；更早的历史折叠成每块一行纯文本摘要加每轮一行提示，点时间轴上折叠区的某一轮只现场投影那一块。
+ 
+ 键位与命令：[交互与命令](docs/interaction.md)。其余见[文档索引](docs/README.md)。
+ 
+@@ -631,6 +631,12 @@ SQLite 迁移脚本在受支持的 Node 22.19+ 与 Node 24+ 构建上使用官
+ WAL，不手工复制活动数据库与 WAL。缺少此 API 的构建会明确报告迁移专属前置要求。
+ 会话树读取先完整校验 packed 行，再按剩余扫描预算检查成员数量，最后才展开事件。
+ 超大行报告截断，损坏行报告失败；逻辑事件预算不消除物理 JSON/帧解析与校验成本。
++恢复 DSH 会话仍要付宿主的全量恢复（解帧、JSON 解析、v4 校验），这段开销与记录大小
++线性、发生在本包之外。本包能控的是投影：首屏只投影最新一块（最后 10 轮、20 万字以内），
++更早的块按每块 50 轮 / 100 万字切分、加载时才投影，于是首屏成本不再随记录长度增长。
++在 139 MB / 9.3 万事件的记录上，可交互首屏从 16.7–17.3 秒降到约 13.0 秒：宿主恢复
++约 7.5 秒、进程启动与插件装载约 4.1 秒、投影约 1.0 秒。报告打开慢时可设
++`DSH_TUI_BOOT_TRACE=<文件>` 把这些阶段标记按 JSON 行记录下来。
+ 开发环境的 `@deepseek-ai/*` release-age 豁免仅列出当前锁文件的精确包版本（包含旧 SQLite 岛），
+ 其他版本仍保留 24 小时延迟。有意更新锁文件后运行
+ `node scripts/verify-release-age-cohort.mjs --write` 重新生成并审查差异。
+diff --git a/docs/interaction.en.md b/docs/interaction.en.md
+index f13c5d7a..86e41c28 100644
+--- a/docs/interaction.en.md
++++ b/docs/interaction.en.md
+@@ -721,7 +721,9 @@ In inline mode, the terminal emulator owns native scrollback and selection.
+ - **Single-click a help-menu command row** — Fill `/name ` into the prompt and close the
+   help (the Tab completion's mouse equivalent).
+ - **Click a timeline-rail tick** — Jump to that turn — the rail covers every turn (folded
+-  ones included); a folded tick reveals its turn first, then scrolls it into place.
++  ones included); a folded tick reveals its turn first, then scrolls it into place. On a
++  long DSH session, where older history is collapsed into per-chunk report lines, a tick
++  inside a collapsed chunk projects only that chunk (not the whole history) before the jump.
+ - **Keyboard selection extension** — With a selection, `Shift+←/→/↑/↓/Home/End` extends /
+   shrinks it (wraps across lines).
+ 
+diff --git a/docs/interaction.md b/docs/interaction.md
+index d12970ca..c37b90f4 100644
+--- a/docs/interaction.md
++++ b/docs/interaction.md
+@@ -704,7 +704,7 @@ dsh-tui 不修改 `~/.claude/settings.json`；会话启动时若其中的 `ANTHR
+ - 悬停即移动焦点（lazygit 规则），编辑态整屏不响应防误触。
+ - **单击会话浏览器确认行**：删除/清理确认行点击 = 确认执行（同 `Enter`）；取消保留键盘 `Esc`。
+ - **单击帮助菜单命令行**：填入 `/name ` 并关闭帮助（`Tab` 补全的鼠标等价）。
+-- **点击时间轴刻度**：跳到该回合——轨道覆盖全部回合（含折叠的）；折叠刻度先展开该回合再滚到位。
++- **点击时间轴刻度**：跳到该回合——轨道覆盖全部回合（含折叠的）；折叠刻度先展开该回合再滚到位。长 DSH 会话把更早的历史折叠成每块一行摘要时，折叠区内的刻度只投影该回合所在的那一块（不是整段历史），再滚到位。
+ - **键盘扩展选区**：有选区时 `Shift+←/→/↑/↓/Home/End` 扩展 / 收缩（跨行环绕）。
+ 
+ 以上鼠标行为只在 `fullscreen: true` 的 alternate screen 生效。

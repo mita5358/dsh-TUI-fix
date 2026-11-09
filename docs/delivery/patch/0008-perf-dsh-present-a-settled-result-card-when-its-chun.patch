@@ -1,0 +1,206 @@
+From 2fd36b48264ee7f15ed644207799ca93f4d1b1c9 Mon Sep 17 00:00:00 2001
+From: mita5358 <kafitcohr@outlook.com>
+Date: Fri, 30 Oct 2026 23:33:42 +0800
+Subject: [PATCH 08/20] perf(dsh): present a settled result card when its chunk
+ loads
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A resume seed translated 93k events of the titan record in 1,838 ms, and
+`presentResultView` was 730 ms of it: every settled result ran its card's
+presenter over the result text, including the ~15.6k results that back
+chunks the transcript only keeps as a digest row. Nothing renders those
+cards until a chunk materializes, so the work is moved to that moment.
+
+`translateReplay` takes `{ present: false }` for the seed; each chunk then
+derives its payload from the result's own durable event through the same
+`presentResultView`. The derivation is the translator's rule restated
+(name and arguments from `tool/call`, skipped for `ask_user_question` and
+subagent calls, errors left alone), so the rows are identical to an eager
+translate — verified over all 93,121 translated entries of the titan log
+(`/tmp/verify-defer.mjs`: 434 card payloads, no differences).
+
+Measured on the mirror's titan session: `translate-done` 1,838 ms ->
+1,083 ms of the boot trace, first paint 14,102 ms -> 13,718 ms.
+---
+ src/dsh-adapter/backend/session.ts    |  4 +--
+ src/dsh-adapter/backend/translate.ts  | 29 ++++++++++++++----
+ src/dsh-adapter/channel/extensions.ts | 44 +++++++++++++++++++++++++--
+ 3 files changed, 66 insertions(+), 11 deletions(-)
+
+diff --git a/src/dsh-adapter/backend/session.ts b/src/dsh-adapter/backend/session.ts
+index 1bdd610f..5ae1885a 100644
+--- a/src/dsh-adapter/backend/session.ts
++++ b/src/dsh-adapter/backend/session.ts
+@@ -41,7 +41,7 @@ declare module '../../agent/capabilities.js' {
+      * translator. The channel's adoption transactions replay inside a
+      * synchronous tail, which the async `history()` cannot serve.
+      */
+-    translateReplay(events: readonly SessionEvent[]): readonly AgentEvent[]
++    translateReplay(events: readonly SessionEvent[], options?: { present?: boolean }): readonly AgentEvent[]
+     /** Forget the translator's per-session state (paired with a projector reset). */
+     resetTranslation(): void
+     /** The dsh-tools presenters, scoped to this session's agent. */
+@@ -173,7 +173,7 @@ export function createDshSession(ctx: Context, target: DshSessionTarget, options
+       }
+     },
+     rawHistory: (): readonly SessionEvent[] => snapshotLiveSessionEvents(agent.session),
+-    translateReplay: (events: readonly SessionEvent[]): readonly AgentEvent[] => translator.translateReplay(events),
++    translateReplay: (events: readonly SessionEvent[], options?: { present?: boolean }): readonly AgentEvent[] => translator.translateReplay(events, options),
+     resetTranslation: (): void => translator.reset(),
+     presentCallView: translator.presentCallView,
+     presentResultView: translator.presentResultView,
+diff --git a/src/dsh-adapter/backend/translate.ts b/src/dsh-adapter/backend/translate.ts
+index 7bd07b0b..9363f95c 100644
+--- a/src/dsh-adapter/backend/translate.ts
++++ b/src/dsh-adapter/backend/translate.ts
+@@ -240,6 +240,14 @@ export function createDshTranslator(deps: DshTranslatorDeps) {
+    * projector's own card index: deleted on result, cleared on reset.
+    */
+   const openCalls = new Map<string, { readonly name: string; readonly args: string; readonly card: boolean }>()
++  /**
++   * Whether a settled result's card payload is presented while it translates.
++   * A replay seed whose older chunks the transcript will not project turns
++   * this off: `presentResultView` runs a card's presenter over the result text
++   * (~730 ms of a 1.8 s titan translate), and the deferred payload is derived
++   * from the raw event when that chunk finally materializes.
++   */
++  let presentResults = true
+   /**
+    * `spawn_teammate` calls that have not written their member yet. The team
+    * refuses a teammate (name taken or invalid, member limit, not the Lead,
+@@ -381,7 +389,7 @@ export function createDshTranslator(deps: DshTranslatorDeps) {
+       ...(isError && (call !== undefined || spawn !== undefined) ? { errorText: toolErrorText(event) } : {}),
+       ...(card === undefined ? {} : { images: transcriptImagesOf(data.message.content, deps.attachments) }),
+       ...(data.meta === undefined ? {} : { meta: data.meta }),
+-      ...(card === undefined || isError ? {} : { presentation: presentResultView(card.name, card.args, data) as ToolResultPresentation | undefined }),
++      ...(card === undefined || isError || !presentResults ? {} : { presentation: presentResultView(card.name, card.args, data) as ToolResultPresentation | undefined }),
+     }
+     if (spawn !== undefined && isError) return [{ ...spawn, presentation: presentCallView(spawn.name, spawn.argsJson) as ToolCallPresentation | undefined }, result]
+     if (card === undefined || isError) return [result]
+@@ -584,15 +592,24 @@ export function createDshTranslator(deps: DshTranslatorDeps) {
+    * Translate a durable replay seed (resume / rewind / model-switch fork).
+    * Settled `assistant/chunk` runs are dropped first (`prepareReplayEvents`);
+    * the frame fence restarts with the replacement session.
++   *
++   * `present: false` leaves every settled result's card payload unbuilt; the
++   * caller derives it from the raw `tool/result` event with
++   * `presentResultView` when it actually projects that part of the seed.
+    */
+-  const translateReplay = (events: readonly SessionEvent[]): readonly AgentEvent[] => {
++  const translateReplay = (events: readonly SessionEvent[], options: { present?: boolean } = {}): readonly AgentEvent[] => {
+     lastStreamRevision = -1
+     promptSeen = false
+-    const out: AgentEvent[] = []
+-    for (const event of prepareReplayEvents(events)) {
+-      for (const translated of translateEvent(event)) out.push(translated)
++    presentResults = options.present !== false
++    try {
++      const out: AgentEvent[] = []
++      for (const event of prepareReplayEvents(events)) {
++        for (const translated of translateEvent(event)) out.push(translated)
++      }
++      return out
++    } finally {
++      presentResults = true
+     }
+-    return out
+   }
+ 
+   /** Forget the frame fence and every open call (paired with a projector reset). */
+diff --git a/src/dsh-adapter/channel/extensions.ts b/src/dsh-adapter/channel/extensions.ts
+index cd7beb53..24d8c19c 100644
+--- a/src/dsh-adapter/channel/extensions.ts
++++ b/src/dsh-adapter/channel/extensions.ts
+@@ -30,6 +30,7 @@ import type { CommandRuntime } from '@deepseek-ai/dsh-commands'
+ import type { SessionEvent } from '@deepseek-ai/dsh-session'
+ import type { DshNative } from '../../agent/capabilities.js'
+ import type { AgentEvent } from '../../agent/events.js'
++import type { ToolResultPresentation } from '../../agent/presentation.js'
+ import type { AgentSession } from '../../agent/session.js'
+ import { channelCapabilities } from '../../channel/capabilities.js'
+ import { isCommandCompletionToken, LOCAL_COMMANDS, type LocalCommand } from '../../commands.js'
+@@ -39,6 +40,7 @@ import { DEFAULT_SESSION_MODES, resolveSessionModes } from '../../sessionModes.j
+ import { installedMeetsVersion } from '../contract.js'
+ import { markBoot } from '../../utils/bootTrace.js'
+ import { chunkForRow, placeholderEvent, planChunks, placeholderRows, type HistoryChunk } from '../backend/history-chunks.js'
++import { isSubagentToolName } from './projection-helpers.js'
+ import { createDshSession } from '../backend/session.js'
+ import { createDshTranslator, dshPricingWindow } from '../backend/translate.js'
+ import { concreteService } from '../host-access.js'
+@@ -383,6 +385,15 @@ export function attachDshExtensions(
+   let seedEntries: readonly AgentEvent[] = []
+   const loadedChunks = new Set<number>()
+   const placeholderCounts = new Map<number, number>()
++  /**
++   * Presenting a settled result's card costs real time on a long record
++   * (`presentResultView` over 16k results is ~730 ms of a 1.8 s titan
++   * translate), and an older chunk renders none of those cards until someone
++   * loads it. The seed then translates with `present: false` and each chunk
++   * derives the payload it shows from the result's raw durable event, once,
++   * when the chunk materializes.
++   */
++  let presentDeferredResults: (entries: readonly AgentEvent[]) => readonly AgentEvent[] = entries => entries
+ 
+   /** Compact text weight for the report line: `890k`, `1.0M`. */
+   const compactChars = (chars: number): string =>
+@@ -402,7 +413,7 @@ export function attachDshExtensions(
+ 
+   /** One planned chunk as fresh rows: its digest line, then its real rows. */
+   const chunkRows = (chunk: HistoryChunk): ChatRow[] => {
+-    const rows = projectHistorySlice(seedEntries.slice(chunk.start, chunk.end), state.thinkingFold)
++    const rows = projectHistorySlice(presentDeferredResults(seedEntries.slice(chunk.start, chunk.end)), state.thinkingFold)
+     return [
+       { id: chunk.idBase, kind: 'notice', text: chunkDigest(chunk, true), restored: true },
+       ...rows.map((row, index) => ({ ...row, id: chunk.idBase + 1 + index, restored: true })),
+@@ -653,12 +664,39 @@ export function attachDshExtensions(
+     // aligned chunks (history-chunks.ts); every older chunk keeps a digest row
+     // and its prompt rows, and "load earlier" projects it in place.
+     markBoot('seed-enter')
+-    const entries = dshNative().translateReplay(events)
++    const entries = dshNative().translateReplay(events, { present: false })
+     markBoot('translate-done')
+     seedEntries = entries
+     seedChunks = planChunks(entries)
+     loadedChunks.clear()
+     placeholderCounts.clear()
++    // What a deferred card payload needs: the call's name and arguments (its
++    // presenter input) and the raw result event. Raw events outlive the seed
++    // in the caller anyway; these two indexes only hold references to them.
++    const cards = new Map<string, { readonly name: string; readonly args: string }>()
++    const rawResults = new Map<number, SessionEvent<'tool/result'>>()
++    for (const event of events) {
++      if (event.type === 'tool/call') {
++        const name = event.data.name
++        if (name !== 'ask_user_question' && !isSubagentToolName(name)) cards.set(event.data.callId, { name, args: event.data.arguments })
++      } else if (event.type === 'tool/result') rawResults.set(event.seq, event)
++    }
++    presentDeferredResults = (slice: readonly AgentEvent[]): readonly AgentEvent[] => {
++      let copy: AgentEvent[] | undefined
++      for (let index = 0; index < slice.length; index += 1) {
++        const entry = slice[index]!
++        if (entry.type !== 'tool.result' || entry.presentation !== undefined || entry.isError) continue
++        const call = cards.get(entry.callId)
++        if (call === undefined) continue
++        const raw = rawResults.get(entry.seq)
++        if (raw === undefined) continue
++        const presentation = dshNative().presentResultView(call.name, call.args, raw.data) as ToolResultPresentation | undefined
++        if (presentation === undefined) continue
++        copy ??= [...slice]
++        copy[index] = { ...entry, presentation }
++      }
++      return copy ?? slice
++    }
+     const newest = seedChunks[seedChunks.length - 1]
+     if (newest === undefined) {
+       subagentProjection.bootstrapFromLog(events)
+@@ -684,7 +722,7 @@ export function attachDshExtensions(
+       state.rows.push(...rows)
+     }
+     markBoot('fold-done')
+-    projector.apply(entries.slice(newest.start, newest.end), { replay: true })
++    projector.apply(presentDeferredResults(entries.slice(newest.start, newest.end)), { replay: true })
+     markBoot('newest-done')
+     loadedChunks.add(newest.index)
+     subagentProjection.bootstrapFromLog(events)

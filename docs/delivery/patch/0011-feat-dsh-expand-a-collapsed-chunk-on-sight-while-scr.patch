@@ -1,0 +1,581 @@
+From a155a93bb2077686ded0d6e5e317ffc3c8d80f7d Mon Sep 17 00:00:00 2001
+From: mita5358 <kafitcohr@outlook.com>
+Date: Sun, 1 Nov 2026 21:48:28 +0800
+Subject: [PATCH 11/20] feat(dsh): expand a collapsed chunk on sight while
+ scrolling
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A collapsed chunk used to seed one prompt placeholder row per turn, so a
+restored transcript read as user-only history: 116 placeholder rows stood
+in front of 119 real prompts, and every older turn looked like it had no
+answer at all.
+
+Seed one row per unloaded chunk instead - its digest line, marked
+`collapsed` - and let that row expand on sight: MessageList picks the
+collapsed row nearest the viewport middle, waits 120 ms of quiet, and asks
+the channel to materialise that chunk in place (one chunk per scroll
+gesture, never while following the tail). The row becomes a `▾` heading
+followed by the real turns, so scrolling back reads like the conversation.
+
+Gate: verify:history-chunks now pins the seed shape (one collapsed row per
+chunk, id == idBase, no fake user rows, ids inside the chunk stride) and
+that a materialised chunk carries real assistant rows.
+---
+ scripts/verify-history-chunks.ts          | 117 ++++++++--------------
+ src/adapter/ports/channel-view.ts         |   5 +
+ src/components/MessageList.tsx            |  80 ++++++++++++++-
+ src/dsh-adapter/backend/history-chunks.ts |  97 +++---------------
+ src/dsh-adapter/channel/extensions.ts     |  47 ++++-----
+ src/i18n.ts                               |   1 +
+ src/screens/Chat.tsx                      |   1 +
+ 7 files changed, 166 insertions(+), 182 deletions(-)
+
+diff --git a/scripts/verify-history-chunks.ts b/scripts/verify-history-chunks.ts
+index 262127b2..3b505f38 100644
+--- a/scripts/verify-history-chunks.ts
++++ b/scripts/verify-history-chunks.ts
+@@ -1,14 +1,14 @@
+ /**
+- * Chunked history: the cut plan, the collapsed placeholder rows, and the
+- * placeholder → projected-row mapping a rail reveal depends on
+- * (`ChannelUi.revealRow`, implemented by the DSH extension's `revealChunkRow`).
++ * Chunked history: the cut plan, the collapsed section row, and the id range a
++ * load-on-sight / rail reveal depends on (`ChannelUi.revealRow`, implemented by
++ * the DSH extension's `revealChunkRow`).
+  *
+- * The regression this guards: a timeline tick on a turn inside a collapsed
+- * chunk used to expand the WHOLE record (`showAllMessages`, a 27,907-row
+- * relayout, 5.6 GB RSS before the process was killed). A reveal must project
+- * only the owning chunk, and must land on the turn's real row — placeholder
+- * ids are positional and do not survive materialization, so the mapping is the
+- * subtle part.
++ * The regressions this guards: (1) a reveal used to expand the WHOLE record
++ * (`showAllMessages`, a 27,907-row relayout, 5.6 GB RSS before the process was
++ * killed) — it must project only the owning chunk; (2) a collapsed chunk used
++ * to fake one prompt row per human prompt, which made the transcript read as if
++ * every old turn were missing its answer — a collapsed chunk is now exactly one
++ * section line and nothing else.
+  */
+ import assert from 'node:assert/strict'
+ import { readFileSync } from 'node:fs'
+@@ -18,10 +18,8 @@ import {
+   CHUNK_ROUNDS,
+   OPEN_ROUNDS,
+   chunkForRow,
+-  placeholderEvent,
+   placeholderRows,
+   planChunks,
+-  promptsTurnRow,
+   type HistoryChunk,
+ } from '../src/dsh-adapter/backend/history-chunks.js'
+ import { projectHistorySlice } from '../src/channel/history-restore.js'
+@@ -148,78 +146,51 @@ assert.deepEqual(
+ assert.ok(hugeChunks.every((chunk, index) => chunk.start === (index === 0 ? 0 : hugeChunks[index - 1]!.end)), 'and the tiling still holds')
+ 
+ // ── collapsed rows ────────────────────────────────────────────────────────
++// One row per unloaded chunk: the section line, flagged so the transcript
++// projects the chunk on sight. No prompt stand-ins and no projected content —
++// a collapsed chunk must never look like a conversation whose answers are gone.
+ for (const chunk of chunks) {
+-  const rows = placeholderRows(chunk, entries, digest)
+-  assert.equal(rows[0]!.id, chunk.idBase, 'the digest line owns idBase')
+-  assert.equal(rows[0]!.kind, 'notice', 'a collapsed chunk is text only')
+-  assert.equal(rows[0]!.text, digest(chunk), 'the digest line names its rounds')
+-  let expected = 0
+-  for (let index = chunk.start; index < chunk.end; index += 1) if (promptsTurnRow(entries[index]!)) expected += 1
+-  assert.equal(rows.length, expected + 1, 'one placeholder prompt row per prompt event')
+-  for (let index = 0; index < rows.length; index += 1) {
+-    assert.equal(rows[index]!.id, chunk.idBase + index, 'placeholder ids are positional')
+-    assert.equal(rows[index]!.seq, undefined, 'a placeholder carries no seq (no rewind anchor)')
+-  }
++  const rows = placeholderRows(chunk, digest)
++  assert.equal(rows.length, 1, 'an unloaded chunk contributes exactly one row')
++  const row = rows[0]!
++  assert.equal(row.id, chunk.idBase, 'the section line owns idBase')
++  assert.equal(row.kind, 'notice', 'a collapsed chunk is text only')
++  assert.equal(row.text, digest(chunk), 'the section line names its rounds')
++  assert.equal(row.collapsed, true, 'and is flagged as load-on-sight')
++  assert.equal(row.restored, true, 'and is exempt from the fold pass')
++  assert.equal(row.seq, undefined, 'a section line carries no seq (no rewind anchor)')
++  assert.equal(row.anchor, undefined, 'and no anchor: the log anchor arrives with the load')
++}
++
++// The bug this replaced: a collapsed chunk must not claim to be user rows.
++for (const chunk of chunks) {
++  assert.deepEqual(
++    placeholderRows(chunk, digest).filter(row => row.kind === 'user'),
++    [],
++    'no prompt stand-in rows remain in the collapsed form',
++  )
+ }
+ 
+ // ── which chunk owns a row ────────────────────────────────────────────────
+ for (const chunk of chunks) {
+-  assert.equal(chunkForRow(chunks, chunk.idBase), chunk, 'a chunk owns its digest line')
+-  assert.equal(chunkForRow(chunks, chunk.idBase + 1), chunk, 'and its prompt rows')
++  assert.equal(chunkForRow(chunks, chunk.idBase), chunk, 'a chunk owns its section line')
++  assert.equal(chunkForRow(chunks, chunk.idBase + 1), chunk, 'and the ids its loaded rows will take')
+   assert.equal(chunkForRow(chunks, chunk.idBase + 999_999), chunk, 'up to its whole id stride')
+ }
+ assert.equal(chunkForRow(chunks, 0), undefined, 'live rows belong to no chunk')
+ assert.equal(chunkForRow(chunks, 27_907), undefined, 'live row ids are never in a chunk range')
+ 
+-// ── placeholder → event → projected row ───────────────────────────────────
++// ── load-on-sight target ──────────────────────────────────────────────────
++// The section line's id is the reveal handle: it survives materialization
++// (`chunkRows` also starts at idBase), so the transcript can project the chunk
++// and keep the reader anchored on the same line. A loaded chunk's projected
++// rows must cover real answers, which is what makes the load worth doing.
+ const oldest = chunks[0]!
+-assert.equal(placeholderEvent(oldest, entries, oldest.idBase), undefined, 'the digest line stands for no event')
+-
+-// A long prompt is capped on the placeholder and restored in full after load:
+-// that is the point of the reveal (a text-capped digest line is not content).
+-const longEntryIndex = oldest.end - 1
+-const longText = 'z'.repeat(5_000)
+-entries[longEntryIndex] = prompt(entries[longEntryIndex]!.seq, longText)
+-const rowsAfter = placeholderRows(oldest, entries, digest)
+-const longRow = rowsAfter.at(-1)!
+-assert.ok(longRow.text.length <= 601, 'a placeholder prompt line is capped')
+-
+ const projected = projectHistorySlice(entries.slice(oldest.start, oldest.end), 'preview')
+-const projectedIds = projected.map((row, index) => ({ row, id: oldest.idBase + 1 + index }))
+-for (let index = 1; index < rowsAfter.length; index += 1) {
+-  const rowId = rowsAfter[index]!.id
+-  const event = placeholderEvent(oldest, entries, rowId)
+-  assert.ok(event !== undefined, 'every placeholder prompt row stands for an event')
+-  assert.equal(promptsTurnRow(event), true, 'and that event is a prompt-row event')
+-  const twin = projectedIds.find(entry => entry.row.seq === event.seq)
+-  assert.ok(twin !== undefined, `placeholder ${rowId} maps onto a projected row`)
+-  assert.equal(twin.row.kind, 'user', 'the twin is a prompt row')
+-  assert.ok(twin.id >= oldest.idBase + 1 && twin.id < oldest.idBase + 1_000_000, 'the twin stays inside the chunk id stride')
++assert.ok(projected.some(row => row.kind === 'assistant'), 'a loaded chunk contains model output')
++assert.ok(projected.some(row => row.kind === 'user'), 'and the prompts it answered')
++assert.ok(projected.every(row => row.id >= 0), 'projection assigns live ids; the chunk re-bases them off idBase')
++for (let index = 0; index < projected.length; index += 1) {
++  const id = oldest.idBase + 1 + index
++  assert.ok(id < oldest.idBase + 1_000_000, 'every loaded row stays inside the chunk id stride')
+ }
+-const longEvent = placeholderEvent(oldest, entries, rowsAfter.at(-1)!.id)!
+-assert.equal(longEvent.text.length, 5_000, 'the reveal resolves the untruncated event')
+-assert.equal(projected.find(row => row.seq === longEvent.seq)!.text.length, 5_000, 'and the projected row carries it in full')
+-
+-// Distinct placeholder rows must map onto distinct projected rows: the rail
+-// jumps to one turn, not to the first row that shares its text.
+-const mapped = rowsAfter.slice(1).map((row, index) => projectedIds.find(entry => entry.row.seq === placeholderEvent(oldest, entries, rowsAfter[index + 1]!.id)!.seq)!.id)
+-assert.equal(new Set(mapped).size, mapped.length, 'each prompt maps onto its own projected row')
+-
+-// ── the click path ────────────────────────────────────────────────────────
+-// The rail's reveal must ask the channel to load the owning region instead of
+-// expanding the fold over the whole record.
+-const chat = readFileSync(new URL('../src/screens/Chat.tsx', import.meta.url), 'utf8')
+-assert.match(
+-  chat,
+-  /const revealAndSeekRow = \(rowId: number\): void => \{[\s\S]{0,500}?channel\.revealRow\(rowId\)[\s\S]{0,300}?seekRow\(revealed === 0 \? rowId : revealed\)/u,
+-  'a rail reveal loads the row\'s owning region and seeks its loaded twin',
+-)
+-
+-// …and the region it loads is one chunk: expanding every older chunk is the
+-// freeze this replaced.
+-const extensions = readFileSync(new URL('../src/dsh-adapter/channel/extensions.ts', import.meta.url), 'utf8')
+-const reveal = /const revealChunkRow = \([\s\S]*?\n  \}\n/u.exec(extensions)?.[0] ?? ''
+-assert.match(reveal, /materializeChunk\(chunk\)/u, 'a reveal projects the one owning chunk')
+-assert.doesNotMatch(reveal, /loadOlder|planChunks\(|state\.rows = /u, 'and never expands or rebuilds the record')
+-
+-console.log(`verify-history-chunks OK (${chunks.length} chunks over ${entries.length} events, ${prompts.length} prompts)`)
+diff --git a/src/adapter/ports/channel-view.ts b/src/adapter/ports/channel-view.ts
+index 7d99a7e2..f1daaa5a 100644
+--- a/src/adapter/ports/channel-view.ts
++++ b/src/adapter/ports/channel-view.ts
+@@ -157,6 +157,11 @@ export interface ChatRow {
+   /** True when loadOlder() restored this row from the log; restored rows are
+    *  exempt from the next fold pass so a restore is not instantly undone. */
+   restored?: boolean
++  /** True on the digest line that stands in for an older, still unprojected
++   *  chunk (see history-chunks): the transcript auto-projects that chunk when
++   *  this row reaches the viewport, so the flag tells the list which rows are
++   *  load-on-sight and marks the line as a collapsed section, not a message. */
++  collapsed?: boolean
+   /** True on rows created by LIVE event handling (not replay/resume/fold
+    *  restore) — the smooth-streaming reveal animates freshly-arrived
+    *  content only; replayed history must paint complete. Set when a live row
+diff --git a/src/components/MessageList.tsx b/src/components/MessageList.tsx
+index 014702c7..51395a61 100644
+--- a/src/components/MessageList.tsx
++++ b/src/components/MessageList.tsx
+@@ -72,6 +72,11 @@ const JOB_GROUP_FOLD_MIN = 3
+ // sticky follow, scrollbar) of a fully-mounted list.
+ /** Lines of extra content mounted above/below the visible window. */
+ const OVERSCAN_LINES = 8
++
++/** Settle time before a collapsed chunk section is projected on sight: long
++ *  enough that a flick through a stack of section lines projects nothing, short
++ *  enough that stopping on one shows the real turns immediately. */
++const LOAD_ON_SIGHT_MS = 120
+ /** Fallback row height before the first measurement (terminal lines). */
+ const DEFAULT_ROW_HEIGHT = 2
+ /** Cold-start estimate of the header block above the rows; corrected by the
+@@ -391,6 +396,7 @@ export function MessageList({
+   showAll,
+   onToggleAll,
+   onLoadOlder,
++  onRevealCollapsed,
+   olderHistory,
+   thinkingVisible = true,
+   historyPaintEnabled = true,
+@@ -451,6 +457,9 @@ export function MessageList({
+   /** Restore folded-away older rows from the session log; shown only when
+    *  rows were folded (or `olderHistory` says more exists before them). */
+   onLoadOlder?: () => void
++  /** Project the collapsed chunk that owns this digest row (load-on-sight when
++   *  it scrolls into view). Absent = collapsed sections stay digest lines. */
++  onRevealCollapsed?: (rowId: number) => void
+   /** The session has history older than the first row (a compaction cut it
+    *  off before a resume): the "load earlier" divider shows without any
+    *  folded row. */
+@@ -957,9 +966,17 @@ export function MessageList({
+ 
+   // Scrolling bypasses React (imperative DOM scrollTop): subscribe so the
+   // window follows the viewport.
++  // Load-on-sight arming: only a real scroll (wheel/key/scrollbar) may project
++  // a collapsed chunk. Mount, streaming growth and programmatic seeks must
++  // never fire it, or opening a long record would project history the reader
++  // is not looking at.
++  const autoLoadArmedRef = React.useRef(false)
+   React.useEffect(() => {
+     if (!scrollHandle) return
+-    const tick = (): void =>{  setScrollTick(t => t + 1) }
++    const tick = (): void =>{
++      autoLoadArmedRef.current = true
++      setScrollTick(t => t + 1)
++    }
+     return scrollHandle.subscribe(tick)
+   }, [scrollHandle])
+ 
+@@ -1518,6 +1535,67 @@ export function MessageList({
+     }
+   })
+ 
++  // Load-on-sight: a collapsed chunk is one section line, and the transcript
++  // projects it the moment that line is on screen with the reader scrolling
++  // toward it, so scrolling up streams the real conversation in (answers,
++  // tool cards and all) instead of standing a row of prompts in for it. One
++  // chunk per scroll gesture: a flick through forty section lines must not
++  // project forty chunks in one frame.
++  let loadOnSightId: number | undefined
++  if (!sticky && visibleRows.length > 0 && onRevealCollapsed !== undefined) {
++    // First row whose bottom is below the viewport top. Binary search over the
++    // monotonic offsets: the mount window can be extended far above the
++    // viewport by history paint, and a linear scan of it per render is exactly
++    // the kind of long-session stall this list exists to avoid.
++    let low = 0
++    let high = visibleRows.length
++    while (low < high) {
++      const mid = (low + high) >> 1
++      if (offsets[mid]! + heightOf(visibleRows[mid]!) <= scrollTop) low = mid + 1
++      else high = mid
++    }
++    // Among the section lines on screen, take the one nearest the middle of
++    // the viewport: its chunk expands right where the reader is looking, so
++    // arriving in a band of section lines (a Home jump, a fast flick) loads the
++    // conversation in front of them instead of one off the edge of the screen.
++    const viewBottom = scrollTop + viewport
++    const viewMiddle = scrollTop + viewport / 2
++    let bestDistance = Number.POSITIVE_INFINITY
++    for (let i = low; i < visibleRows.length && offsets[i]! < viewBottom; i += 1) {
++      const row = visibleRows[i]!
++      if (row.collapsed !== true) continue
++      const distance = Math.abs(offsets[i]! + heightOf(row) / 2 - viewMiddle)
++      if (distance >= bestDistance) continue
++      bestDistance = distance
++      loadOnSightId = row.id
++    }
++  }
++  const autoLoadPendingRef = React.useRef<{ id: number; timer: ReturnType<typeof setTimeout> } | null>(null)
++  React.useEffect(() => {
++    const pending = autoLoadPendingRef.current
++    if (loadOnSightId === undefined || !autoLoadArmedRef.current) {
++      if (pending !== null) {
++        clearTimeout(pending.timer)
++        autoLoadPendingRef.current = null
++      }
++      return
++    }
++    if (pending !== null) {
++      if (pending.id === loadOnSightId) return
++      clearTimeout(pending.timer)
++    }
++    const timer = setTimeout(() => {
++      autoLoadPendingRef.current = null
++      autoLoadArmedRef.current = false
++      onRevealCollapsed?.(loadOnSightId)
++    }, LOAD_ON_SIGHT_MS)
++    autoLoadPendingRef.current = { id: loadOnSightId, timer }
++  }, [loadOnSightId, onRevealCollapsed])
++  React.useEffect(() => () => {
++    const pending = autoLoadPendingRef.current
++    if (pending !== null) clearTimeout(pending.timer)
++  }, [])
++
+   // useCallback: the reference feeds MemoRow's shallow compare; a fresh
+   // closure per render would defeat every row's memo.
+   const setRowRef = React.useCallback((rowId: number, el: DOMElement | null): void => {
+diff --git a/src/dsh-adapter/backend/history-chunks.ts b/src/dsh-adapter/backend/history-chunks.ts
+index 0a7b4b3b..53f6fa1d 100644
+--- a/src/dsh-adapter/backend/history-chunks.ts
++++ b/src/dsh-adapter/backend/history-chunks.ts
+@@ -7,15 +7,14 @@
+  * to 27,907 rows), never the row count — rendering is already bounded by
+  * `MAX_ROWS` / `RENDERED_ROW_CAP`, and dropping the rows saved 34 ms. So the
+  * record is cut into round-aligned chunks and only the NEWEST chunk is
+- * projected for the first paint. Every older chunk contributes one digest row
+- * (kind `notice`: a plain text report, no tool cards, no terminal output, no
+- * command rows) plus one plain prompt row per human prompt it holds.
+- *
+- * Those prompt rows are what keeps the timeline rail complete: it indexes
+- * `kind: 'user'` rows, so a collapsed chunk still shows its ticks and a tick
+- * jumps to its prompt (text capped, see `PLACEHOLDER_TEXT_LIMIT`). Loading the
+- * chunk replaces its placeholder rows in place (see `placeholderRows` and the
+- * adapter's `loadOlderChunk`), which is what "load earlier" does.
++ * projected for the first paint. Every older chunk contributes exactly ONE
++ * digest row (kind `notice`, `collapsed: true`: a plain text report, no tool
++ * cards, no terminal output, no command rows). An unprojected chunk never
++ * fakes its conversation: the transcript shows a section line, not a hollow
++ * copy, and the list auto-projects the chunk as soon as that line reaches the
++ * viewport (MessageList's load-on-sight effect). Loading the chunk replaces
++ * the line in place (see `placeholderRows` and the adapter's
++ * `loadOlderChunk`/`revealChunkRow`), which is what "load earlier" does.
+  *
+  * Cut rule: only at a `user.message`, i.e. at a round's first event, whatever
+  * its source. A round is never split — a tool result without its call would
+@@ -49,11 +48,6 @@ export const CHUNK_CHARS = 1000000
+  *  the chunks after it. One million ids per chunk is far above `MAX_ROWS`. */
+ const ID_STRIDE = 1_000_000
+ 
+-/** Cap on a placeholder prompt row's text: a resumed session must not pay to
+- *  re-render a 500 KB paste it has not opened. Loading the chunk restores the
+- *  full text from the record. */
+-const PLACEHOLDER_TEXT_LIMIT = 600
+-
+ /** One contiguous, turn-aligned slice of a translated record. */
+ export interface HistoryChunk {
+   /** Position in conversation order; 0 is the oldest. */
+@@ -195,17 +189,6 @@ function measure(
+   return { events: end - start, toolCalls, errors, chars }
+ }
+ 
+-/** True on a user message that paints a prompt row: a human prompt or a team
+- *  message. A compaction notice, a replay of terminal output or a goal
+- *  continuation does not — it is represented by the digest line alone. Both
+- *  the collapsed placeholder rows and the projected slice use this rule, so a
+- *  placeholder's position maps onto the row it stands for. */
+-export function promptsTurnRow(event: AgentEvent): event is Extract<AgentEvent, { type: 'user.message' }> {
+-  if (event.type !== 'user.message') return false
+-  if (event.source === 'team-message') return true
+-  return event.source === 'user' && (event.text !== '' || (event.images?.length ?? 0) > 0)
+-}
+-
+ /** The chunk that owns a row id, undefined for a live row: ids are reserved
+  *  per chunk (`ID_STRIDE` ranges, negative), so a reveal can find the owning
+  *  chunk without scanning the record. */
+@@ -217,65 +200,17 @@ export function chunkForRow(chunks: readonly HistoryChunk[], rowId: number): His
+ }
+ 
+ /**
+- * The event a collapsed prompt row stands for. Ids are positional inside a
+- * chunk (`idBase` is the digest line, then one row per prompt), so the offset
+- * picks the k-th prompt event — the identity a reveal needs once the chunk's
+- * projected rows carry their own ids and seqs. Undefined for the digest row.
+- */
+-export function placeholderEvent(
+-  chunk: HistoryChunk,
+-  entries: readonly AgentEvent[],
+-  rowId: number,
+-): Extract<AgentEvent, { type: 'user.message' }> | undefined {
+-  let ordinal = rowId - chunk.idBase - 1
+-  if (ordinal < 0) return undefined
+-  for (let index = chunk.start; index < chunk.end; index += 1) {
+-    const event = entries[index]!
+-    if (!promptsTurnRow(event)) continue
+-    if (ordinal === 0) return event
+-    ordinal -= 1
+-  }
+-  return undefined
+-}
+-
+-/** Cap a placeholder prompt line: the record still holds the full text. */
+-function placeholderText(text: string): string {
+-  if (text.length <= PLACEHOLDER_TEXT_LIMIT) return text
+-  return `${text.slice(0, PLACEHOLDER_TEXT_LIMIT)}…`
+-}
+-
+-/**
+- * The rows an UNLOADED chunk contributes: its digest row, then one plain
+- * prompt row per turn. No tool cards, no terminal output, no command rows —
+- * a collapsed chunk is text only. Every row is `restored` so a later fold pass
+- * never truncates the digest, and carries no `seq`/`anchor`: these rows are
+- * not derived from a single log event, and the rewind anchor must stay absent
+- * until the chunk is actually loaded.
++ * The rows an UNLOADED chunk contributes: its digest line, nothing else. No
++ * tool cards, no terminal output, no command rows and no prompt stand-ins — a
++ * collapsed chunk is one section line, so the transcript never reads as if the
++ * conversation were missing every answer. The row is `restored` so a later
++ * fold pass never truncates the digest, `collapsed` so the transcript can load
++ * the chunk on sight, and carries no `seq`/`anchor`: the rewind anchor must
++ * stay absent until the chunk is actually loaded.
+  */
+ export function placeholderRows(
+   chunk: HistoryChunk,
+-  entries: readonly AgentEvent[],
+   digest: (chunk: HistoryChunk) => string,
+ ): ChatRow[] {
+-  const rows: ChatRow[] = [{ id: chunk.idBase, kind: 'notice', text: digest(chunk), restored: true }]
+-  for (let index = chunk.start; index < chunk.end; index += 1) {
+-    const event = entries[index]!
+-    if (event.type !== 'user.message') continue
+-    const images = event.images === undefined ? {} : { images: event.images }
+-    if (event.source === 'team-message') {
+-      rows.push({
+-        id: chunk.idBase + rows.length,
+-        kind: 'user',
+-        label: 'team-message',
+-        text: placeholderText(event.text),
+-        ...(event.sender === undefined ? {} : { sender: event.sender }),
+-        ...images,
+-        restored: true,
+-      })
+-      continue
+-    }
+-    if (!promptsTurnRow(event)) continue
+-    rows.push({ id: chunk.idBase + rows.length, kind: 'user', text: placeholderText(event.text), ...images, restored: true })
+-  }
+-  return rows
++  return [{ id: chunk.idBase, kind: 'notice', text: digest(chunk), restored: true, collapsed: true }]
+ }
+diff --git a/src/dsh-adapter/channel/extensions.ts b/src/dsh-adapter/channel/extensions.ts
+index 24d8c19c..3d84afde 100644
+--- a/src/dsh-adapter/channel/extensions.ts
++++ b/src/dsh-adapter/channel/extensions.ts
+@@ -39,7 +39,7 @@ import { snapshotLiveSessionEvents } from '../compat/liveSession.js'
+ import { DEFAULT_SESSION_MODES, resolveSessionModes } from '../../sessionModes.js'
+ import { installedMeetsVersion } from '../contract.js'
+ import { markBoot } from '../../utils/bootTrace.js'
+-import { chunkForRow, placeholderEvent, planChunks, placeholderRows, type HistoryChunk } from '../backend/history-chunks.js'
++import { chunkForRow, planChunks, placeholderRows, type HistoryChunk } from '../backend/history-chunks.js'
+ import { isSubagentToolName } from './projection-helpers.js'
+ import { createDshSession } from '../backend/session.js'
+ import { createDshTranslator, dshPricingWindow } from '../backend/translate.js'
+@@ -402,6 +402,10 @@ export function attachDshExtensions(
+   // One chunk's report line: which rounds it holds, how much work and text sit
+   // behind them. Text only — a collapsed chunk renders no cards, no terminal
+   // output, no commands, and its newline-free text stays one row.
++  // The collapsed line also says it opens on sight: the transcript projects a
++  // chunk as soon as its section line reaches the viewport (MessageList), so a
++  // reader who stops on it is about to see the real conversation, not a wall of
++  // their own prompts.
+   const chunkDigest = (chunk: HistoryChunk, loaded: boolean): string =>
+     `${loaded ? '▾' : '⏸'} ${t('chunk-digest', {
+       from: chunk.fromRound,
+@@ -409,7 +413,7 @@ export function attachDshExtensions(
+       events: chunk.events,
+       tools: chunk.toolCalls,
+       chars: compactChars(chunk.chars),
+-    })}`
++    })}${loaded ? '' : ` · ${t('chunk-digest-hint')}`}`
+ 
+   /** One planned chunk as fresh rows: its digest line, then its real rows. */
+   const chunkRows = (chunk: HistoryChunk): ChatRow[] => {
+@@ -450,33 +454,22 @@ export function attachDshExtensions(
+   }
+ 
+   /**
+-   * Reveal one row of a collapsed chunk — the timeline rail's tick for a turn
+-   * older than the fold window. Only the chunk that owns the row is projected
+-   * (never the rest of the history: expanding all of it is what made a tick
+-   * on a titan record crawl), and the returned id is the projected row the
+-   * clicked placeholder stands for, so the caller seeks real content instead
+-   * of a text-capped digest line. 0 = nothing to reveal (a live row, a row
+-   * that already owns its chunk's place in the transcript, or a stale plan).
++   * Project the chunk that owns an unloaded row id. This is what the
++   * transcript calls when a collapsed section line scrolls into view (and what
++   * a timeline tick on such a turn calls): only that one chunk is projected,
++   * never the rest of the history — expanding all of it is what made a reveal
++   * crawl on a titan record. Returns the id of the digest line that the loaded
++   * chunk now owns (it survives materialization: `idBase` is the chunk's first
++   * row either way), so a caller can keep the reader anchored; 0 = nothing to
++   * reveal (a live row, an already loaded chunk, a stale plan).
+    */
+   const revealChunkRow = (rowId: number): number => {
+     if (seedChunks === undefined) return 0
+     const chunk = chunkForRow(seedChunks, rowId)
+     if (chunk === undefined || loadedChunks.has(chunk.index)) return 0
+-    // Resolve the clicked placeholder to the event it stands for, then to that
+-    // event's own projected row by seq — unique per event, and stable even for
+-    // a row the projector drops (an empty team message).
+-    const event = placeholderEvent(chunk, seedEntries, rowId)
+-    if (event === undefined) return 0
+-    const seq = event.seq
+     const loaded = materializeChunk(chunk)
+     if (loaded === 0) return 0
+-    const at = state.rows.findIndex(row => row.id === chunk.idBase)
+-    if (at < 0) return 0
+-    for (let index = at; index < at + loaded; index += 1) {
+-      const row = state.rows[index]!
+-      if (row.seq === seq) return row.id
+-    }
+-    return 0
++    return chunk.idBase
+   }
+ 
+   const dshLocal = createLocalActions({
+@@ -502,11 +495,11 @@ export function attachDshExtensions(
+     conversationKey: session => session.capabilities.native.dsh?.agent ?? session,
+     flushDeferred: () => subagentProjection.flush(),
+     loadOlder: dshLocal.loadOlder,
+-    // A timeline tick on a turn that a collapsed chunk only sketches: project
+-    // that one chunk and hand back the projected row to seek.
++    // A timeline tick or a section line on a turn that a collapsed chunk only
++    // sketches: project that one chunk and hand back the row it now owns.
+     revealRow: revealChunkRow,
+-    // Unloaded chunks sit in the transcript as digest rows, so no folded row
+-    // announces them: ask the chunk plan instead (the load-earlier divider).
++    // Unloaded chunks sit in the transcript as one digest row each, so no
++    // folded row announces them: ask the chunk plan instead (load-earlier).
+     hasOlderHistory: () => seedChunks !== undefined && seedChunks.some(chunk => !loadedChunks.has(chunk.index)),
+     // Subagents and jobs come from the DSH host services (projections above).
+     ownsActivity: true,
+@@ -717,7 +710,7 @@ export function attachDshExtensions(
+     state.rows.length = 0
+     for (const chunk of seedChunks) {
+       if (chunk.index === newest.index) continue
+-      const rows = placeholderRows(chunk, entries, collapsed => chunkDigest(collapsed, false))
++      const rows = placeholderRows(chunk, collapsed => chunkDigest(collapsed, false))
+       placeholderCounts.set(chunk.index, rows.length)
+       state.rows.push(...rows)
+     }
+diff --git a/src/i18n.ts b/src/i18n.ts
+index 401917ae..12fa5cab 100644
+--- a/src/i18n.ts
++++ b/src/i18n.ts
+@@ -205,6 +205,7 @@ const dict = {
+   'session-cleared': { zh: '会话已清屏', en: 'Session cleared' },
+   'conversation-reset': { zh: '对话已重置，之前的上下文已清空', en: 'The conversation was reset; the earlier context is gone' },
+   'chunk-digest': { zh: '第 {{from}}–{{to}} 轮 · {{events}} 条事件 · {{tools}} 次工具调用 · {{chars}} 字', en: 'turns {{from}}–{{to}} · {{events}} events · {{tools}} tool calls · {{chars}}' },
++  'chunk-digest-hint': { zh: '滚到这里自动展开', en: 'scroll here to expand' },
+   'conversation-reset-clear': { zh: '对话已清空，接下来从新的上下文开始', en: 'Conversation cleared; continuing with a fresh context' },
+   'conversation-reset-plan': { zh: '退出计划模式时清空了上下文，接下来带着计划从新的上下文开始', en: 'Context cleared on leaving plan mode; continuing from a fresh context with the plan' },
+   'conversation-reset-fresh': { zh: '已开新会话来执行计划', en: 'Started a fresh session to carry out the plan' },
+diff --git a/src/screens/Chat.tsx b/src/screens/Chat.tsx
+index d493e3c6..aa576c95 100644
+--- a/src/screens/Chat.tsx
++++ b/src/screens/Chat.tsx
+@@ -7254,6 +7254,7 @@ export function Chat({
+           fullscreen={fullscreen}
+           onToggleAll={() =>{  setShowAllMessages(previous => !previous) }}
+           onLoadOlder={() => channel.loadOlder()}
++          onRevealCollapsed={(rowId) => { channel.revealRow(rowId) }}
+           registerRowRef={registerRowRef}
+           scrollHandle={handle}
+           forceMountRowId={forceMountRowId}

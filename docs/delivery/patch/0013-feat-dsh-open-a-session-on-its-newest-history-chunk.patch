@@ -1,0 +1,3124 @@
+From e1b8b367d8cac166a86344d400797ed143be2e05 Mon Sep 17 00:00:00 2001
+From: mita5358 <kafitcohr@outlook.com>
+Date: Mon, 9 Nov 2026 13:00:50 +0800
+Subject: [PATCH 13/20] feat(dsh): open a session on its newest history chunk
+
+---
+ docs/dynamic-history-loading.en.md        | 252 ++++++++++
+ docs/dynamic-history-loading.md           | 200 ++++++++
+ scripts/verify-dsh-fold-back.ts           |  30 +-
+ scripts/verify-fold-back-user.ts          | 275 +++++++++++
+ scripts/verify-history-chunks.ts          |  39 +-
+ scripts/verify-tool-history-window.tsx    |  27 +-
+ src/adapter/ports/channel-view.ts         |  48 ++
+ src/agent/events.ts                       |   7 +
+ src/channel/history-restore.ts            |   3 +-
+ src/channel/projection.ts                 |  29 +-
+ src/channel/selection-record.ts           |  27 +-
+ src/channel/transcript.ts                 |  21 +-
+ src/components/MessageList.tsx            | 577 ++++++++++++++++++----
+ src/dsh-adapter/backend/history-chunks.ts |  33 +-
+ src/dsh-adapter/channel.ts                |   2 +-
+ src/dsh-adapter/channel/extensions.ts     | 115 ++++-
+ src/dsh-adapter/channel/transcript.ts     |  50 +-
+ src/dsh-adapter/channel/types.ts          |   4 +-
+ src/dsh-adapter/plugin.ts                 |   6 +
+ src/screens/Chat.tsx                      | 174 +++++--
+ 20 files changed, 1711 insertions(+), 208 deletions(-)
+ create mode 100644 docs/dynamic-history-loading.en.md
+ create mode 100644 docs/dynamic-history-loading.md
+ create mode 100644 scripts/verify-fold-back-user.ts
+
+diff --git a/docs/dynamic-history-loading.en.md b/docs/dynamic-history-loading.en.md
+new file mode 100644
+index 00000000..50d9248f
+--- /dev/null
++++ b/docs/dynamic-history-loading.en.md
+@@ -0,0 +1,252 @@
++# Dynamic history loading: chunked bodies, complete index
++
++[简体中文](dynamic-history-loading.md) · [Architecture](architecture.en.md)
++
++> **Goal confirmed by the user on 2026-11-02:** the original problem was slow loading
++> of long conversations. The selected direction is a complete TUI loading architecture
++> with **dynamic chunks and a chunk-aware index**, not merely a right-rail fix.
++> Future work must not restore whole-history body projection to make navigation work.
++> **Implementation and acceptance for this round are complete:** all 102 build gates,
++> types/package checks, the 36-case real-channel + Chat integration, seed shape on a
++> real 124-chunk session, and isolated-profile installation passed. Evidence and boot
++> phases are in delivery `EVIDENCE.md`; historical first-paint numbers are not a new
++> performance comparison for this patch.
++
++## 1. Why two layers
++
++A render-row cap is insufficient if startup first projects the entire log and only
++then folds/virtualizes it: text processing and tool-result presentation have already
++been paid for. Conversely, an unloaded body does not mean that its turns do not exist.
++
++| Previous mistake | Constraint |
++| --- | --- |
++| Fake `user` placeholder rows made history look like prompts without model replies | One digest row per unloaded chunk; the prompt directory is non-rendered metadata |
++| Replacing old user rows with digests left only the newest turns on the rail | Index every real human turn independently of body materialization |
++| One rail click triggered whole-history body reprojection | A reveal projects only the owning chunk, never the entire record |
++| Estimated heights picked the wrong chunk; seek anchors were released early; a new coordinate beyond the old `maxScroll` was mistaken for tail-follow | Select visible chunks using measured geometry; distinguish explicit seek from follow-bottom and finish only after measurement converges |
++
++```text
++Durable session log (unchanged)
++  └─ translation and chunk plan
++       ├─ lightweight directory: every human turn's identity, prompt reference/preview, image count
++       │    └─ rail: complete order, hover previews, reveal handles for unloaded turns
++       └─ body chunks: materialize only the newest chunk for first paint
++            ├─ older chunk: one notice digest plus non-rendered collapsedTurns metadata
++            └─ on demand: replace that digest in place with its heading and real user/model/tool rows
++```
++
++A logically complete directory does not draw thousands of ticks simultaneously in a
++finite-height terminal; the rail retains its existing viewport window. Once loaded,
++real user rows replace their directory entries without duplicate turns. Clear, new
++session and session adoption must clear or rebuild the plan, handle mappings and
++preview caches rather than resurrect the preceding session's index.
++
++## 2. Boundaries and budgets
++
++The durable backend log remains the source of truth. Projection changes **when**
++facts are shown, not the facts: no deletion, lossy log rewriting, invented messages
++or re-execution of historical tools. Chunk bodies use the shared projector.
++
++| Item | Current rule |
++| --- | --- |
++| Newest chunk | `OPEN_ROUNDS = 2`, `OPEN_CHARS = 200_000` |
++| Older chunks | `CHUNK_ROUNDS = 50`, `CHUNK_CHARS = 1_000_000` |
++| Cuts | Group backward from the newest end; cut only at `user.message` round boundaries, never inside a round |
++| Oversized round | Occupies a chunk alone without truncation; these budgets are not hard memory limits |
++| Weight | Character lengths of prompt/model text, tool arguments/results, etc., not on-disk byte size |
++
++Chunk rounds include injected/goal and compaction `user.message` events, preventing
++long unattended runs from becoming one giant chunk. The **human-turn index** instead
++matches the visible user-row predicate: `source === 'user'` and nonempty text or at
++least one image. Image-only prompts count; team messages, injected context,
++compaction checkpoints and command output must not impersonate human turns.
++
++The default open window is deliberately tiny — the newest two rounds — so first paint
++projects only the last exchange and the reader lands on it. Every older turn is still a
++tick on the rail / a digest row, and one click projects the chunk that owns it (see §5):
++opening less loses nothing; it defers the projection cost to the frame the reader actually
++asks for it.
++
++## 3. Identity and exact reveal
++
++A digest's `collapsedTurns` holds `{ id, seq, text, imageCount }`; these entries are
++not transcript `ChatRow`s. Their virtual `id` is a navigation handle, not a guessed
++projected row offset. Its current namespace lies below every chunk row id:
++
++```text
++oldestIdBase = chunk.idBase - chunk.index * ID_STRIDE
++handle = oldestIdBase - globalEntryIndex - 1
++handle → { chunk, durable seq } → materialize that chunk → real user row id for seq
++```
++
++Event and row offsets differ because hidden inputs and tool cards change the row
++count. Clicking the second prompt in a chunk must reach that exact prompt, not its
++heading or first prompt. Keep old handle aliases until the next seed/clear so a tick
++painted before an on-sight load can still resolve the same durable `seq` afterward.
++
++## 4. On-demand loading and navigation geometry
++
++- **Load on sight:** after scrolling, select the digest actually inside the viewport
++  nearest its center using post-commit Yoga measurements. An overscan-mounted but
++  invisible digest must not trigger loading. The current dwell delay is `120 ms`,
++  with at most one automatic expansion per scroll gesture and none while following
++  the tail. This delay is not an end-to-end completion deadline.
++- **Rail reveal:** an unloaded turn resolves through the mapping above, projects
++  only its owning chunk, then force-mounts and seeks the real prompt. Publish the
++  materialization immediately; repaint must not depend on another input event.
++- **Navigation proxy:** an unloaded turn may borrow its digest's top for relative
++  position, never as a substitute for reveal via `scrollTo(proxyTop)`. After a jump
++  into old history, another unloaded chunk can be **below** the viewport; `folded`
++  cannot always mean “above.” Turns sharing a digest share its proxy top: the last
++  one above is ▲ and the first below is ▼. A proxy must not invent a pinned prompt.
++  Unreachable real tail prompts remain subject to `maxScroll`.
++
++## 5. Measurement-converged seek handshake (verified)
++
++1. Resolve the real target id and retain `forceMountRowId` to keep it mounted.
++2. After row/prefix measurements settle, with no pending measurement correction,
++   `MessageList` calls `onSeekReady(rowId, textOffset)`. Derive the offset from that
++   prompt's own margin rather than retaining stale geometry.
++3. `Chat` aligns against fresh Yoga top plus offset and checks the reachable target,
++   `min(targetTop, maxScroll)`. A tail tick that cannot reach the top must not loop
++   forever trying to achieve an impossible coordinate.
++4. Defer releasing force-mount until the renderer has consumed the seek and the
++   scroll position is actually aligned. A ref appearing is not completion, and a
++   longer fixed timeout is not a replacement for geometric confirmation.
++5. Guard the handshake by request identity and explicit scroll-intent version: a
++   new wheel, End or rail jump cancels the old request. Binding generation also
++   cancels seeks on same-session rebind. Geometry corrections are not user intent,
++   and unrelated streaming below the target must not starve a historical seek.
++6. In the explicit element-seek frame, do not restore tail-follow by comparing the
++   new coordinate with the **old** `maxScroll`. Expanding a summary is not a user
++   returning to the bottom. Further measurement corrections must preserve the
++   identity of the requested prompt.
++
++## 6. Cost boundary: no end-to-end constant-time or constant-memory claim
++
++This architecture defers old body projection, tool-result presentation and mounting.
++The **host still decompresses, parses and validates the complete log**. Translation,
++chunk planning, the directory and session-wide usage accounting still have work
++that grows with history, and retain records/references. This is not a host-side
++random-access log reader.
++
++Historical measurements on a roughly 93k-event sample recorded first paint dropping
++from 16.7–17.3 s to about 12–13 s; larger sandbox snapshots also recorded about 15 s.
++These are old measurements from different snapshots/builds, **not proof that this
++round's index and seek changes pass**. They do not establish a 2 s startup. Use
++`DSH_TUI_BOOT_TRACE` to separate the phases.
++
++**Loaded chunks currently have no LRU eviction.** Browsing more chunks accumulates
++real projected rows. Render virtualization bounds mounting, not retention of body
++rows, the source log, translated events or directory. Do not describe this as
++“end-to-end constant memory”; adding cache or host architectures is outside this
++round's scope.
++
++### 6.1 What an index click actually costs, and three fixes
++
++`scripts/perf-rail-click.tsx` replays “click an unloaded turn → its prompt owns the top of
++the viewport → still there 200 ms later” against the real DSH channel, the production
++fullscreen `Chat` and a headless xterm. The fixture is 372 chunks / 368 human turns (the
++heavy shape has ~22 rows and 20 tool calls per chunk) and each sample proves the click really
++called `revealRow`, using its return value for identity instead of inferring it from a digest
++count that a folding-window repaint can also move.
++
++The click is followed by one synchronous block. It breaks down into three real costs, all
++addressed here:
++
++1. **Accounting inside synchronous materialization.** The chunk-scoped projection behind
++   `revealRow` estimates tokens for every tool result, which only feeds accounting yet walks
++   the whole text. `AgentEventMeta.scratch` lets chunk replay skip those estimates (the
++   `countTokens` closure in `projection.ts`); the synchronous part of `revealRow` fell from
++   28–61 ms to **2–4 ms**.
++2. **Preview slicing.** `preview` used to flatten the whole string before truncating; it now
++   scans a bounded doubling window (`transcript.ts`), so digests over large tool results no
++   longer pay for their full length.
++3. **Layout cache slots.** A reveal mounts a whole chunk of cards in one frame (~1.2k Yoga
++   nodes). The cross-generation layout cache in `src/native-ts/yoga-layout` kept only 4 input
++   slots per node, but a freshly mounted card probes more than 4 width/mode combinations in a
++   single pass, so the LRU wrapped before probes repeated and a 1.6k-node tree was visited
++   100k times. At 8 slots `layoutNode` visits fell 102,524 → 29,746 and text measures
++   30,847 → 6,254; 16 slots measured no better, so the memory trade stops at 8.
++
++Measured on the equal-bytes fixture (5 clicks × 2 runs, median; click → stable landing):
++
++| Shape | Metric | Before | After |
++| --- | --- | --- | --- |
++| 1 row / 1 tool call per chunk | landed p50 / p95 | 363 / 592 ms | 329 / 540 ms |
++| 22 rows / 20 tool calls per chunk | materialize p50 / p95 | 319 / 612 ms | 245 / 502 ms |
++| same | landed p50 / p95 | 367 / 1138 ms | 308 / 845 ms |
++
++Wall-clock includes the headless xterm parsing each frame's output in the same process; a real
++terminal paints more cheaply, so these numbers are conservative. The remaining cost is the
++first mount of a whole chunk's cards in one frame; progressive mounting would move the landing
++geometry, so it is left as follow-up rather than expanded into this round.
++
++### 6.2 By default only "what the user said" and "what the model said" stay expanded
++
++**Problem**: once a chunk is revealed, the whole chunk paints as body text. The rows are carried
++by large low-density fields - code fences (a 120-line fence is 120 rows), thinking blocks, tool
++cards, multi-line command scripts, long tables. What a reader actually wants is the user prompts
++plus the model's prose; everything else in a revealed chunk should default to a one-row digest.
++
++**Change** (`MessageList.tsx`, `Markdown.tsx`, `TranscriptLeaves.tsx`):
++
++- A top-level fenced block inside settled assistant text paints as one digest row:
++  `⌁ ts · 26 lines · const marker = … … (click to expand)`. The digest never enters
++  `CodeBlockFrame` and is not highlighted or wrap-measured. Clicking the digest expands it and
++  clicking the expanded block folds it back (a click is release-without-drag, so drag-selecting
++  code still copies); `Ctrl+O` still expands everything.
++- Restored rows (`row.restored`: revealed chunks and rows re-prepended by the render cap) fold a
++  terminal card header to its first line plus `… +N lines`, the same semantics as the existing
++  3-row tool-result cap and 1-row thinking digest.
++- Streaming rows (`row.streaming`) never fold: folding only applies to settled content, otherwise
++  text would visibly breathe.
++
++**Measurement** (`ASSISTANT_KB=6 RESULT_KB=300 CALLS=3 CMD_LINES=8`, 187 chunks, same-byte fixture,
++folding toggled at runtime inside one build, experiment removed afterwards):
++
++| Metric | Unfolded | Folded |
++| --- | --- | --- |
++| Yoga-measured nodes per frame (3 clicks) | 5854 / 7477 / 7513 | 3830 / 3758 / 3710 |
++| Materialize p50 / p95 | 190 / 245 ms | 193 / 372 ms |
++| Landed p50 / p95 | 328 / 534 ms | 342 / 604 ms |
++
++Halving the Yoga-measured node count proves the paint cost dropped. Wall-clock click latency in
++this fixture is dominated by two things unrelated to folding - chunk projection and the headless
++xterm parsing the whole frame - so p50/p95 sits inside ±100 ms noise and must not be quoted as an
++end-to-end speedup. The real gain is how many rows a screen actually paints: a 120-line fence
++becomes one row.
++
++**Isolation check**: the `dsh-sandbox` manual profile carries this round's tgz; in a `--new`
++session the model returned a 38-line python fence and the screen showed only
++`● ⌁ python · 38 lines · import random … (click to expand)`; clicking painted the full fence and
++clicking the block folded it back. Integration side: `scripts/verify-chunked-rail.tsx` gained six
++assertions (digest on screen, body not painted, Ctrl+O round trip, digest click expands, block
++click folds back), 36 → 42 all passing.
++
++## 7. Acceptance checklist
++
++As of 2026-11-02, the functional acceptance items below passed. The final long-session
++boot trace is recorded in delivery `EVIDENCE.md`. It is not an uncontrolled comparison
++against an older build; historical ~12–13 s timings are not proof of this patch's
++performance delta.
++
++| Area | This round's evidence |
++| --- | --- |
++| First paint/performance | Installed-package seed shape: 124 chunks, newest body plus one digest per older chunk; tmux trace records raw-history, seed and render phases without claiming a new comparative speedup; `verify:build` passes 98/102, and `verify-backdrop-dim`, `verify-math-inline-image`, `verify-terminal-images-sixel` fail the same way on a clean HEAD in this environment |
++| Index-click latency | `scripts/perf-rail-click.tsx` on the 372-chunk fixture: heavy-shape landed p50/p95 367/1138 ms → 308/845 ms, synchronous reveal 28–61 ms → 2–4 ms (see 6.1) |
++| Default folding | Revealed chunks paint a fenced code block as a one-row digest and a terminal card as its first line + `+N lines`; clicking the digest or the block toggles it, `Ctrl+O` still expands all; Yoga-measured nodes roughly halve (see 6.2) |
++| Complete index | Real 124-chunk log: 116 older + 3 newest human turns = 119; image/source predicates are covered by chunk tests and materialized turns do not duplicate |
++| Exact jump | 36 real-channel + Chat/xterm integration checks cover non-first prompts, owning-chunk-only reveal, stale handles and same-batch End; the sandbox tmux hit a historical tick preview and navigated into old body content |
++| Dynamic loading/navigation | 49 rail geometry cases plus all 102 build gates pass, covering proxies, ▲/▼ direction, overscan and digest navigation |
++| Seek convergence | Non-first prompt alignment in the real transcript viewport; same-batch End cancellation and dense live-tail stability pass integration assertions |
++| Lifecycle | Real append, clear, new, same-shape resume/rebind and preview invalidation are covered by the 36 integration assertions |
++| Delivery | compile and typecheck pass; `verify:build` 98/102 (four failures: three pre-existing environment ones plus the existing `verify:btw` flake, all reproduced on clean HEAD; `verify:plugin-feed` was fixed this round and no longer fails); package surface 3376 files / 35 entry targets; the patch (50 files, +3676/−172) passes `git apply --check`, `apply` and `compile:src` on clean baseline `83fcf892`; the rebuilt tarball (`84e4b4b6…`) was reinstalled in the isolated manual profile and exercised with real rail clicks |
++| Isolation | Only `/home/Administrator/Coding/dsh-sandbox` HOME/DSH_HOME and `rail-final-20261102` tmux were used; the real profile and `tmux dsh` were not modified |
++
++Implementation: [history-chunks.ts](../src/dsh-adapter/backend/history-chunks.ts),
++[extensions.ts](../src/dsh-adapter/channel/extensions.ts),
++[MessageList.tsx](../src/components/MessageList.tsx), [Chat.tsx](../src/screens/Chat.tsx),
++[timeline-rail.ts](../src/ink/timeline-rail.ts). Historical timings and raw output are
++in the delivery directory's `LATENCY-REPORT.md` and `EVIDENCE.md`; old behavior
++statements and tarball hashes do not override this round's acceptance contract.
+diff --git a/docs/dynamic-history-loading.md b/docs/dynamic-history-loading.md
+new file mode 100644
+index 00000000..f1b1ab19
+--- /dev/null
++++ b/docs/dynamic-history-loading.md
+@@ -0,0 +1,200 @@
++# 动态历史加载：分块正文与完整索引
++
++[English](dynamic-history-loading.en.md) · [架构](architecture.md)
++
++> **2026-11-02 用户确认目标**：最初的问题是长对话加载卡顿；最终方向是彻底优化
++> TUI 对话加载架构——**动态分块加载、分块索引**，不只是修右侧栏。
++> 后续不能以恢复全量正文投影来换取索引完整或跳转正确。
++> **本轮实现与验收已完成**：102 项 build gates、类型/包检查、36 项真实 channel + Chat
++> 集成、124 块真实会话 seed-shape 和隔离 profile 安装均通过。证据与启动相位见交付目录
++> `EVIDENCE.md`；历史首帧数字不是本轮性能对照。
++
++## 1. 为什么需要两层
++
++仅限制渲染行数不够：如果首屏前仍把全部日志投影为正文行，再折叠/虚拟化，
++昂贵的文本处理、工具结果呈现已经发生。另一方面，正文尚未加载不代表那段会话不存在。
++
++| 之前的错误 | 约束 |
++| --- | --- |
++| 旧块里伪造一排 `user` 占位行，屏幕看起来只有提问、没有模型输出 | 未加载正文每块只显示一行摘要；提问目录是非渲染元数据 |
++| 摘要取代旧用户行后，rail 只剩最新几轮 | 索引覆盖全部真实用户轮次，与正文是否物化无关 |
++| 点一次索引触发全量正文重投影 | 一次 reveal 只投影目标所属块，不展开全记录 |
++| 用估算行高挑块、提前丢掉 seek 锚点；新位置越过旧 `maxScroll` 后被误当贴底 | 用实测几何选可见块；显式 seek 与跟随底部区分，测量收敛后再完成跳转 |
++
++```text
++真实会话日志（不修改）
++  └─ 翻译、分块计划
++       ├─ 轻量目录：全部用户 turn 的身份、提问文本引用/预览、图片数量
++       │    └─ rail：完整顺序、悬停预览、未加载 turn 的 reveal handle
++       └─ 正文块：首屏只物化最新块
++            ├─ 旧块：一行 notice 摘要 + 非渲染 collapsedTurns 元数据
++            └─ 按需物化：摘要原位替换为块标题及真实用户/模型/工具行
++```
++
++目录逻辑上完整，不意味着在有限高终端同时画出数千个 tick；rail 仍按原有视口窗口展示。
++加载后真实用户行替代对应目录项，不能重复计数。`/clear`、新会话或会话切换必须清理或
++重建块计划、handle 映射及预览缓存，不能复活前一个会话的索引。
++
++## 2. 边界与预算
++
++真源始终是后端持久化日志；投影只改变**何时呈现**，不删除、压缩改写或伪造会话事实，
++也不重新执行历史工具。块正文继续经过共享投影器。
++
++| 项目 | 当前规则 |
++| --- | --- |
++| 最新块 | `OPEN_ROUNDS = 2`，`OPEN_CHARS = 200_000` |
++| 更早块 | `CHUNK_ROUNDS = 50`，`CHUNK_CHARS = 1_000_000` |
++| 切分 | 从最新往旧分组，只在 `user.message` 的轮边界切；整轮不能拆开 |
++| 超重轮 | 单轮超过预算时独占一块，不截断内容；预算不是硬内存上限 |
++| 权重 | 提问、模型文本、工具参数/结果等字符串的字符长度，不是磁盘字节数 |
++
++切块计数包含 injected/goal、compaction 等 `user.message`，防止长无人值守过程成为单一巨块；
++**用户轮次索引**则匹配真实用户行的可见谓词：`source === 'user'`，且文本非空或含图片。
++纯图片提问算一轮；team-message、注入上下文、压缩检查点与命令输出不冒充用户轮次。
++
++默认开窗刻意小到「最近两轮」：首屏只需要投影末尾交换，阅读者一落地就在最新轮次。
++更早的每一轮仍是 rail 上的一格刻度 / 一行摘要块，点击即投影它所属的那一块（见 §5），
++所以少开不是丢内容，而是把「投影成本」推迟到读者真的要看它的那一帧。
++
++## 3. 索引身份与精确 reveal
++
++摘要行的 `collapsedTurns` 保存 `{ id, seq, text, imageCount }`；它不是正文 `ChatRow`。
++虚拟 `id` 是导航 handle，不是猜测出来的投影行偏移。当前命名空间位于所有块行 id 以下：
++
++```text
++oldestIdBase = chunk.idBase - chunk.index * ID_STRIDE
++handle = oldestIdBase - globalEntryIndex - 1
++handle → { chunk, durable seq } → 物化这一块 → seq 对应的真实用户 row id
++```
++
++事件下标不等于正文行下标：隐藏输入、工具卡等都会改变行数。点块中第二条提问必须落到
++第二条真实提问，不能只返回块标题或首条提问。块物化后保留旧 handle 别名直到下一次
++seed/clear，让自动加载前已绘出的 tick 仍能定位同一 `seq`。
++
++## 4. 按需加载与导航几何
++
++- **Load on sight**：滚动后，在提交后的 Yoga 实测位置中，挑实际视口内最靠近中心的摘要。
++  仅 overscan 挂载但不可见的摘要不能触发加载。当前停留延迟为 `120 ms`；一次滚动手势
++  至多自动展开一块，跟随底部时不触发。延迟不是端到端完成时限。
++- **Rail reveal**：点击未加载 turn，通过上述映射只物化所属块，再 force-mount 与 seek；
++  物化后必须发布状态，不能等下一次键盘/滚轮才重画。
++- **Navigation proxy**：未加载 turn 可暂借所属摘要的 top 判断相对位置，但不能直接
++  `scrollTo(proxyTop)` 代替 reveal。先跳到旧块后，另一个未加载块可能在视口**下方**，
++  所以 `folded` 不能一律解释为“在上方”。同摘要的多轮共用代理 top：上方取末轮作 ▲，
++  下方取首轮作 ▼；代理不伪造 sticky prompt。真实尾部不可达的 prompt 仍受 `maxScroll` 约束。
++
++## 5. 测量收敛后的 seek 握手（已验证）
++
++1. 解析真实目标 id，保留 `forceMountRowId`，使目标进入虚拟化挂载窗口。
++2. `MessageList` 完成行高/前缀测量，且无待处理的测量修正后，调用
++   `onSeekReady(rowId, textOffset)`；offset 取目标自身的 prompt margin，不缓存旧几何。
++3. `Chat` 用新鲜 Yoga top 加 offset 对齐；以 `min(targetTop, maxScroll)` 确认可达落点。
++   不可达的尾部 tick 不能因“永远无法到顶”陷入重复 seek。
++4. 只有渲染器已消费 seek、滚动位置确实对齐后，才延后释放 force-mount。
++   不能在 ref 刚出现时就宣告完成，也不能用更长的固定等待替代几何确认。
++5. 用请求身份与显式滚动 intent 版本保护握手：新的滚轮、End 或索引跳转取消旧请求；
++   同会话 rebind 也按 binding generation 清理。纯布局修正不是用户导航，无关流式尾部不阻塞旧块 seek。
++6. 显式元素 seek 那一帧不按**旧** `maxScroll` 重新判为贴底；摘要变为真实正文后的
++   高度增长不是用户主动返回底部。测量继续调整时，仍须保持同一提问锚点。
++
++## 6. 开销边界：没有端到端常数时间/内存承诺
++
++本架构推迟旧块正文投影、工具结果呈现和挂载；**宿主仍全量解压、解析、校验日志**，
++当前翻译、分块规划、目录与全会话用量统计也仍有随历史增长的工作，并持有记录/引用。
++这不是从磁盘随机读取一个块的宿主架构改造。
++
++历史测量在约 93k 事件样本上记录过首帧从 16.7–17.3 s 降到约 12–13 s；更大沙箱快照
++也出现过约 15 s。它们是不同快照/构建的旧证据，**不能作为本轮新索引/seek 已通过的证明**，
++更不能宣称已达到 2 s；阶段拆解应看 `DSH_TUI_BOOT_TRACE`。
++
++**已加载块目前没有 LRU 卸载**：浏览更多块会累积真实正文行。渲染虚拟化只限制挂载，
++不等于释放已投影正文、原日志、翻译记录或索引。不能写成“端到端常数内存”，也不在本轮
++另加缓存/宿主方案以扩张范围。
++
++### 6.1 点击索引的真实成本与三处优化
++
++`scripts/perf-rail-click.tsx` 在真实 DSH channel、生产 fullscreen `Chat` 和无头 xterm 上重复
++「点击未加载 turn → 被点提示行出现在顶部 → 200 ms 后仍在原位」的闭环。夹具为 372 块 / 368 个
++人类轮次（重形状每块约 22 行、20 次工具调用），并断言该次点击真的触发了 `revealRow`
++（用返回值判身份，不再靠摘要行数差推断，避免折叠窗口重绘造成的假样本）。
++
++点击后的主线程被一段同步工作占满；拆开看是三处成本，本轮全部修掉：
++
++1. **同步物化里的记账**。`revealRow` 内部的块级 projection 对每条工具结果做 token 估算，
++   纯为记账却把整段文本从头扫一遍。`AgentEventMeta.scratch` 让块级 replay 跳过这些估算
++   （`projection.ts` 的 `countTokens`），`revealRow` 的同步段从 28–61 ms 降到 **2–4 ms**。
++2. **摘要预览切片**。`preview` 原先要摊平整串再截断；改为有界倍增窗口扫描（`transcript.ts`），
++   大工具结果上的摘要不再按全长收费。
++3. **布局缓存槽位**。一次 reveal 会在同一帧挂载整块卡片（约 1.2k 个 Yoga 节点）。
++   `src/native-ts/yoga-layout` 的跨代布局缓存每节点只保留 4 组输入，而新挂载的卡片在一次
++   pass 里会用超过 4 组宽度/模式探测，LRU 在探测重复前就绕回，1.6k 节点的树被访问 10 万次。
++   提高到 8 组后 `layoutNode` 访问 102,524 → 29,746、文字测量 30,847 → 6,254；16 组无额外收益，故停在 8。
++
++实测（同字节夹具，5 次点击 × 2 轮取中位；点击 → 稳定落地）：
++
++| 形状 | 指标 | 修前 | 修后 |
++| --- | --- | --- | --- |
++| 每块 1 行 / 1 次工具调用 | 落地 p50 / p95 | 363 / 592 ms | 329 / 540 ms |
++| 每块 22 行 / 20 次工具调用 | 物化 p50 / p95 | 319 / 612 ms | 245 / 502 ms |
++| 同上 | 落地 p50 / p95 | 367 / 1138 ms | 308 / 845 ms |
++
++口径：墙钟时间，包含无头 xterm 在同一进程里解析这一帧输出；真实终端写屏更便宜，因此上表偏保守。
++剩余成本集中在「整块卡片在同一帧里首次挂载」，渐进挂载会改变落点几何，本轮不扩大范围，留作后续。
++
++### 6.2 默认只摊开「用户说了什么」和「模型说了什么」
++
++**问题**：块一展开，整块历史就按正文全画。真正撑起行数的是低内容密度的大字段——代码块
++（一个 120 行围栏就是 120 行）、思考段、工具卡、多行命令脚本、长表格。用户实际阅读的是
++「用户输入句 + 模型文字回答句」，其余都应在展开块里默认收成一行摘要。
++
++**做法**（`MessageList.tsx` + `Markdown.tsx` + `TranscriptLeaves.tsx`）：
++
++- 已结算的助手文本里，顶层代码围栏改画一行摘要：
++  `⌁ ts · 26 行 · const marker = … … （点击展开）`。摘要不进 `CodeBlockFrame`，
++  也不做高亮/换行测量；点摘要行或者点展开后的代码块都能来回切换（点击是
++  「按下未拖动」的 release，拖选复制代码不受影响）。`Ctrl+O` 仍然整体展开。
++- 还原行（`row.restored`，即 revaled 块与窗口上限回补的行）默认把终端卡标题折成首行 +
++  `… +N 行`，与既有的工具结果 3 行上限、思考 1 行摘要同一套语义。
++- 流式行（`row.streaming`）永远不折：折叠只作用于已结算内容，否则会看到文字反复伸缩。
++
++**实测**（`ASSISTANT_KB=6 RESULT_KB=300 CALLS=3 CMD_LINES=8`，187 块，同字节夹具对照）：
++
++| 指标 | 折叠前 | 折叠后 |
++| --- | --- | --- |
++| 单帧 Yoga 测量节点数（3 次点击） | 5854 / 7477 / 7513 | 3830 / 3758 / 3710 |
++| 物化 p50 / p95 | 190 / 245 ms | 193 / 372 ms |
++| 落地 p50 / p95 | 328 / 534 ms | 342 / 604 ms |
++
++口径：把「折叠」开关做成同一构建内的运行时开关（已在实验后移除），夹具相同、轮次相同。
++Yoga 测量节点数减半说明上屏成本确实降了；但在这个夹具里点击墙钟被两件与折叠无关的事主导
++——块级 projection 与无头 xterm 解析整帧输出——所以 p50/p95 落在 ±100 ms 噪声内，不能据此
++宣称端到端变快。真实收益体现在「一屏里现在真的要画的行数」：120 行围栏 → 1 行。
++
++**隔离验证**：`dsh-sandbox` 的 manual profile 装本轮 tgz，`--new` 会话让模型回一个 38 行
++python 围栏，屏上只有 `● ⌁ python · 38 行 · import random … （点击展开）`；点击后出现完整
++围栏，再点代码块收回摘要。集成侧 `scripts/verify-chunked-rail.tsx` 增加 6 项断言（摘要上屏、
++默认不画正文、Ctrl+O 来回、点摘要展开、点代码块收回），36 项 → 42 项全过。
++
++## 7. 验收表
++
++截至 2026-11-02，下表所列功能验收均已通过；本轮长会话启动 trace 记录在 `EVIDENCE.md`。
++该 trace 不与旧构建做未经控制的首帧性能比较，历史约 12–13 s 数据也不作为本轮新索引/seek 的证明。
++
++| 验收面 | 本轮证据 |
++| --- | --- |
++| 首屏/性能 | 安装包种子形状为 124 块：最新块 + 每旧块一行摘要；本轮 tmux trace 记录 raw-history、seed、render 各阶段，未宣称新的对照性能提升；`verify:build` 98/102 通过，`verify-backdrop-dim`、`verify-math-inline-image`、`verify-terminal-images-sixel` 在干净 HEAD 上同样失败（本机环境，与本改动无关） |
++| 索引点击时延 | `scripts/perf-rail-click.tsx` 在 372 块夹具上对照测量：重形状点击落地 p50/p95 367/1138 ms → 308/845 ms，同步 reveal 28–61 ms → 2–4 ms（见 6.1） |
++| 默认折叠 | 展开块里的代码围栏只画一行摘要、终端卡只留首行 + `+N 行`；点摘要/代码块来回切换，`Ctrl+O` 仍可整体展开；Yoga 测量节点约减半（见 6.2） |
++| 全量索引 | 124 块真实日志中旧块元数据 116 轮 + 最新块 3 轮 = 119 个用户轮次；图片/来源谓词由 chunk tests 验证，物化后无重复 |
++| 精确跳转 | 42 项真实 channel + Chat/xterm 集成覆盖非首轮、只加载所属块、旧 handle 和同批次 End；sandbox tmux 在完整 124 块会话中命中 rail 预览并跳入旧正文 |
++| 动态加载/导航 | 49 项 rail 几何用例 + 102 项 build gates 通过；包含代理 ▲/▼、overscan 与摘要导航 |
++| Seek 收敛 | 真实 transcript viewport 的非首轮定位；End 抢占和密集真实流式尾部期间的稳定性均通过集成断言 |
++| 生命周期 | 真实 append、clear、new、同长度 resume/rebind 与预览清理由 42 项集成断言覆盖 |
++| 交付 | compile、typecheck 通过；`verify:build` 98/102（4 项失败：3 项本机环境既有 + `verify:btw` 既有抖动，干净 HEAD 同样失败；`verify:plugin-feed` 本轮已修、不再失败）；3376 文件 / 35 入口 package 检查通过；补丁（50 文件 / +3676/−172）在干净基线 `83fcf892` 上 `git apply --check` + `apply` + `compile:src` 全通过；tgz（`84e4b4b6…`）在隔离 manual profile 重装并跑过真机 rail 点击 |
++| 隔离 | 仅用 `/home/Administrator/Coding/dsh-sandbox` 的 HOME/DSH_HOME 与 `rail-final-20261102` tmux；真实 profile 和 `tmux dsh` 未改动 |
++
++实现入口：[history-chunks.ts](../src/dsh-adapter/backend/history-chunks.ts)、
++[extensions.ts](../src/dsh-adapter/channel/extensions.ts)、
++[MessageList.tsx](../src/components/MessageList.tsx)、[Chat.tsx](../src/screens/Chat.tsx)、
++[timeline-rail.ts](../src/ink/timeline-rail.ts)。历史延迟与原始记录见交付目录的
++`LATENCY-REPORT.md`、`EVIDENCE.md`；其中旧行为描述与旧包 hash 不能覆盖本文的本轮验收约束。
+diff --git a/scripts/verify-dsh-fold-back.ts b/scripts/verify-dsh-fold-back.ts
+index 4973d07c..d07fb194 100644
+--- a/scripts/verify-dsh-fold-back.ts
++++ b/scripts/verify-dsh-fold-back.ts
+@@ -7,8 +7,8 @@
+  *
+  * This pins the fix — one bounded pass builds `seq → tool/call` and the
+  * assistant/message cursor, every lookup is a map hit or a binary search —
+- * and proves it restores EXACTLY what the per-row scan did, including the
+- * cases that scan got wrong on purpose:
++ * and proves it preserves the per-row scan's assistant/tool behavior, with
++ * exact-seq, preview-verified user restoration added separately:
+  *
+  *  - a tool row whose call event is absent stays folded, and a non-call event
+  *    sharing its seq does NOT shadow a real call elsewhere in the window (the
+@@ -25,6 +25,8 @@
+  * Run: node --import tsx/esm scripts/verify-dsh-fold-back.ts
+  */
+ import assert from 'node:assert/strict'
++import { withoutTeammateReminder } from '../src/dsh-adapter/compat/agent-team-0.2.0.js'
++import { preview } from '../src/channel/transcript.js'
+ 
+ const { foldBack } = await import('../src/dsh-adapter/channel/transcript.js')
+ type SessionEvent = import('@deepseek-ai/dsh-session').SessionEvent
+@@ -41,7 +43,7 @@ function check(label: string, ok: boolean, detail?: unknown): void {
+   console.log(`  ✓ ${label}`)
+ }
+ 
+-/** The previous implementation, kept verbatim as the oracle. */
++/** Linear oracle for the original assistant/tool behavior and the new user contract. */
+ function foldBackOracle(rows: ChatRow[], events: readonly SessionEvent[], views?: ToolViewPresenter): number {
+   const folded = rows.filter(row => row.folded)
+   if (folded.length === 0) return 0
+@@ -57,6 +59,18 @@ function foldBackOracle(rows: ChatRow[], events: readonly SessionEvent[], views?
+   for (const row of folded) {
+     const rowSeq = row.seq
+     if (rowSeq === undefined) continue
++    if (row.kind === 'user') {
++      const event = events.find(event => event.seq === rowSeq && event.type === 'user/message')
++      if (event === undefined || event.type !== 'user/message' || event.data.source?.kind !== 'user' || row.label === 'team-message') continue
++      const firstText = (content: typeof event.data.content): string => content.find(block => block.type === 'text')?.text.trim() ?? ''
++      const candidates = new Set([firstText(event.data.content), firstText(withoutTeammateReminder(event.data).content)]
++        .filter(text => preview(text, 200) === row.text))
++      if (candidates.size !== 1) continue
++      row.text = candidates.values().next().value!
++      row.folded = false
++      restored += 1
++      continue
++    }
+     if (row.kind === 'tool' && row.tool !== undefined) {
+       const call = restoreEvents.find(event => event.seq === rowSeq && event.type === 'tool/call')
+       if (call === undefined || call.type !== 'tool/call') continue
+@@ -123,7 +137,7 @@ const ev = {
+       },
+     }) as unknown as SessionEvent,
+   user: (seq: number, text: string) =>
+-    ({ seq, type: 'user/message', data: { content: [{ type: 'text', text }] } }) as unknown as SessionEvent,
++    ({ seq, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text }] } }) as unknown as SessionEvent,
+ }
+ 
+ /** Run both implementations on identical inputs and diff the outcome. */
+@@ -156,6 +170,14 @@ function same(label: string, makeRows: () => ChatRow[], makeEvents: () => Sessio
+ 
+ // ── behaviour the oracle's linear scan defines ────────────────────────────────
+ 
++same('a user row restores only its matching prompt', () => [
++  { id: nextId++, kind: 'user', seq: 1, text: preview('prompt '.repeat(50), 200), folded: true },
++], () => [ev.user(1, 'prompt '.repeat(50)), ev.message(2, 'answer')])
++
++same('a user row with a mismatched preview stays folded', () => [
++  { id: nextId++, kind: 'user', seq: 1, text: 'wrong preview', folded: true },
++], () => [ev.user(1, 'prompt'), ev.message(2, 'answer')])
++
+ same('a tool row takes the call event at its own seq, and its result by callId', () => [
+   toolRow(4, 'c1'),
+ ], () => [ev.call(4), ev.result(7, 'c1')], true)
+diff --git a/scripts/verify-fold-back-user.ts b/scripts/verify-fold-back-user.ts
+new file mode 100644
+index 00000000..d4abdd01
+--- /dev/null
++++ b/scripts/verify-fold-back-user.ts
+@@ -0,0 +1,275 @@
++/** Focused regression for DSH user-row folding/restoration; no live session or credentials.
++ * Run: node --import tsx/esm scripts/verify-fold-back-user.ts
++ */
++import assert from 'node:assert/strict'
++import { tmpdir } from 'node:os'
++import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs'
++import { dirname, join } from 'node:path'
++import type { ChatRow } from '../src/dsh-adapter/channel/types.js'
++import type { SessionEvent } from '@deepseek-ai/dsh-session'
++
++// Isolate even when this script is run directly, before production imports.
++const parent = realpathSync(tmpdir())
++const scratch = mkdtempSync(join(parent, 'dsh-fold-user-'))
++try {
++  for (const key of Object.keys(process.env)) {
++    if (key === 'HOME' || key === 'USERPROFILE' || key.startsWith('XDG_') || key.startsWith('DSH_') ||
++      /TOKEN|SECRET|CREDENTIAL|API_KEY|PASSWORD|ACCESS_KEY|^(HTTP|HTTPS|ALL|NO)_PROXY$/i.test(key)) delete process.env[key]
++  }
++  for (const dir of ['home', 'config', 'cache', 'data', 'state', 'dsh', 'tmp']) mkdirSync(join(scratch, dir))
++  Object.assign(process.env, {
++    HOME: join(scratch, 'home'), USERPROFILE: join(scratch, 'home'),
++    XDG_CONFIG_HOME: join(scratch, 'config'), XDG_CACHE_HOME: join(scratch, 'cache'),
++    XDG_DATA_HOME: join(scratch, 'data'), XDG_STATE_HOME: join(scratch, 'state'),
++    DSH_HOME: join(scratch, 'dsh'), DSH_TUI_HOME: join(scratch, 'dsh'),
++    TMPDIR: join(scratch, 'tmp'), TMP: join(scratch, 'tmp'), TEMP: join(scratch, 'tmp'), TSX_DISABLE_CACHE: '1',
++  })
++  const { foldBack, foldRows, restoreRowFromEvent } = await import('../src/dsh-adapter/channel/transcript.js')
++  const { createDshTranslator } = await import('../src/dsh-adapter/backend/translate.js')
++  const { createChannel } = await import('../src/dsh-adapter/channel.js')
++  const { mountChannelUi } = await import('../src/dsh-adapter/channel-ui.js')
++
++const user = (seq: number, content: unknown[], source: unknown = { kind: 'user' }): SessionEvent =>
++  ({ seq, time: seq, type: 'user/message', data: { id: `u${seq}`, source, content } }) as unknown as SessionEvent
++const text = (value: string) => ({ type: 'text', text: value })
++const assistant = (seq: number): SessionEvent =>
++  ({ seq, type: 'assistant/message', data: { message: { content: [text('assistant answer')] } } }) as unknown as SessionEvent
++const row = (id: number, seq: number | undefined, value: string): ChatRow =>
++  ({ id, kind: 'user', text: value, ...(seq === undefined ? {} : { seq }) })
++
++// This test is intentionally first: on the original implementation a later
++// assistant message clears folded/restored while the long text is only preview.
++{
++  const full = `first question ${'长'.repeat(260)} last sentence`
++  const rows = [row(101, 10, full)]
++  assert.equal(foldRows(rows, 0), 1)
++  const preview = rows[0]!.text
++  assert.notEqual(preview, full)
++  assert.equal(foldBack(rows, [user(10, [text(full)]), assistant(11)]), 1)
++  assert.equal(rows[0]!.id, 101)
++  assert.equal(rows[0]!.seq, 10)
++  assert.equal(rows[0]!.text, full, 'restored must mean full user text, not the preview')
++  assert.equal(rows[0]!.folded, false)
++  assert.equal(rows[0]!.restored, true)
++}
++
++// The unverified helper cannot bypass user source/preview checks or expose
++// later attachment blocks; only foldBack may restore a user row.
++{
++  const target = row(102, 10, 'folded preview')
++  restoreRowFromEvent(target, user(10, [text('prompt'), text('PRIVATE ATTACHMENT')]))
++  assert.equal(target.text, 'folded preview')
++}
++
++// Multiple users, short and long, first duplicate seq wins. Only the first
++// text block belongs in the bubble: later text can be @attachment contents.
++{
++  const long = 'AB'.repeat(180)
++  const rows = [row(1, 5, 'short'), row(2, 9, long), row(3, 12, 'alpha')]
++  foldRows(rows, 0)
++  const events = [
++    user(5, [text(' short ')]), assistant(6),
++    user(9, [text(`  ${long}  `), { type: 'image', data: 'attachment' }, text('private attachment body')]),
++    user(9, [text('duplicate must not win')]), assistant(10),
++    user(12, [{ type: 'image', data: 'attachment' }, text(' alpha '), text('attachment body')]), assistant(13),
++  ]
++  assert.equal(foldBack(rows, events), 3)
++  assert.deepEqual(rows.map(r => [r.id, r.seq, r.text, r.folded, r.restored]), [
++    [1, 5, 'short', false, true], [2, 9, long, false, true], [3, 12, 'alpha', false, true],
++  ])
++}
++
++// User indexing does not assume folded rows are sorted by seq.
++{
++  const rows = [row(50, 20, 'later'), row(51, 2, 'earlier')]
++  foldRows(rows, 0)
++  assert.equal(foldBack(rows, [user(2, [text('earlier')]), user(20, [text('later')])]), 2)
++  assert.deepEqual(rows.map(r => r.text), ['later', 'earlier'])
++}
++
++// No event, a user at the wrong seq, or only an assistant at the same seq
++// must never claim the truncated content has been restored.
++for (const events of [[], [user(8, [text('wrong')]), assistant(9)], [assistant(7)]]) {
++  const rows = [row(20, 7, 'Z'.repeat(300))]
++  foldRows(rows, 0)
++  const preview = rows[0]!.text
++  assert.equal(foldBack(rows, events), 0)
++  assert.equal(rows[0]!.text, preview)
++  assert.equal(rows[0]!.folded, true)
++  assert.notEqual(rows[0]!.restored, true)
++}
++{
++  const rows = [row(21, undefined, 'x'.repeat(300))]
++  foldRows(rows, 0)
++  assert.equal(foldBack(rows, [user(1, [text('wrong')]), assistant(2)]), 0)
++  assert.equal(rows[0]!.folded, true)
++}
++
++// Malformed historical payloads cannot prove a restoration and must not crash.
++for (const data of [null, {}, { source: { kind: 'user' }, content: null },
++  { source: { kind: 'user' }, content: [null] },
++  { source: { kind: 'user' }, content: [{ type: 'text', text: 42 }] },
++]) {
++  const rows = [row(22, 7, 'x'.repeat(300))]
++  foldRows(rows, 0)
++  const event = { seq: 7, type: 'user/message', data } as unknown as SessionEvent
++  assert.equal(foldBack(rows, [event, assistant(8)]), 0)
++  assert.equal(rows[0]!.folded, true)
++  assert.notEqual(rows[0]!.restored, true)
++}
++
++// A real image-only message has an empty projected body; folding never drops
++// the attachment. Empty textual blocks use the same first-text/trim semantics.
++{
++  const rows = [row(30, 4, '')]
++  const images = [{ id: 'image-1' }] as unknown as NonNullable<ChatRow['images']>
++  rows[0]!.images = images
++  foldRows(rows, 0)
++  assert.equal(foldBack(rows, [user(4, [{ type: 'image', data: 'attachment' }, text('  ')])]), 1)
++  assert.equal(rows[0]!.text, '')
++  assert.equal(rows[0]!.images, images)
++  assert.equal(rows[0]!.folded, false)
++  assert.equal(rows[0]!.restored, true)
++}
++
++// Compare against the real stateful translator: the first 0.2.0 teammate
++// prompt sheds its identity block, but a later ordinary prompt does not.
++{
++  const reminder = `<system-reminder>\nYou are teammate "alice".\nYour Team Lead is named "lead".\nUse list_agents({}) to find your teammates and their names.\nTo message your Team Lead, use send_message({ target: "lead", message: "..." }).\nTo message another teammate, use send_message({ target: "<teammate name>", message: "..." }).\n</system-reminder>\n\n`
++  const first = 'first human prompt ' + 'P'.repeat(260)
++  const second = 'second human prompt ' + 'Q'.repeat(260)
++  const events = [
++    user(1, [text(reminder), text(first), text('ATTACHMENT-CONTENT')]),
++    user(3, [text(second), text('SECRET-ATTACHMENT')]),
++    user(5, [text(reminder), text('later text is an attachment')]),
++  ]
++  const translator = createDshTranslator({ tools: () => undefined, scope: () => undefined, attachments: () => undefined })
++  const translated = events.flatMap(event => translator.translateEvent(event)).filter(event => event.type === 'user.message' && event.source === 'user')
++  assert.deepEqual(translated.map(event => event.text), [first, second, reminder.trim()])
++  const rows = translated.map((event, index) => row(100 + index, event.seq, event.text))
++  foldRows(rows, 0)
++  assert.equal(foldBack(rows, events), 3)
++  assert.deepEqual(rows.map(r => r.text), translated.map(event => event.text))
++  assert.ok(rows.every(r => r.restored === true && r.folded === false))
++
++  // Both the raw and legacy-stripped candidate have the same 200-character
++  // preview but different full content: guessing either would be unsafe.
++  const ambiguousRows = [row(200, 9, reminder.trim())]
++  foldRows(ambiguousRows, 0)
++  const before = ambiguousRows[0]!.text
++  assert.equal(foldBack(ambiguousRows, [user(9, [text(reminder), text(reminder + 'different tail')])]), 0)
++  assert.equal(ambiguousRows[0]!.text, before)
++  assert.equal(ambiguousRows[0]!.folded, true)
++  assert.notEqual(ambiguousRows[0]!.restored, true)
++}
++
++// Same-seq non-human sources and content which does not match the existing
++// preview are not evidence that a human bubble was reconstructed.
++for (const event of [
++  user(7, [text('X'.repeat(300))], { kind: 'plugin' }),
++  user(7, [text('X'.repeat(300))], { kind: 'agent-message', form: 'relay', senderSessionId: 'peer' }),
++  user(7, [text('different'.repeat(50))]),
++]) {
++  const rows = [row(40, 7, 'X'.repeat(300))]
++  foldRows(rows, 0)
++  const before = rows[0]!.text
++  assert.equal(foldBack(rows, [event, assistant(8)]), 0)
++  assert.equal(rows[0]!.text, before)
++  assert.equal(rows[0]!.folded, true)
++  assert.notEqual(rows[0]!.restored, true)
++}
++
++// Synthetic durable log through the real channel seed, emitter and UI mount.
++// One user round with 610 distinct assistant steps keeps the prompt in the
++// open chunk while exceeding the 600-row folding window.
++{
++  const full = 'mounted prompt ' + 'M'.repeat(300)
++  const events: SessionEvent[] = [user(1, [text(full), text('PRIVATE ATTACHMENT BODY')])]
++  for (let step = 1; step <= 610; step += 1) {
++    events.push({ seq: step + 1, time: step + 1, type: 'assistant/message', data: {
++      turn: 1, step, message: { content: [text(`answer ${step}`)] },
++    } } as unknown as SessionEvent)
++  }
++  const cleanups: Array<() => void> = []
++  const ctx = {
++    on: () => () => undefined,
++    effect: (setup: () => () => void) => { cleanups.push(setup()) },
++    get: () => undefined,
++    logger: { warn() {} },
++  }
++  const agent = {
++    id: 'synthetic-user-fold-agent', status: 'idle',
++    session: { id: 'synthetic-user-fold-session', seq: events.length, events },
++    ctx: { on: () => () => undefined },
++    followup() {}, steer() {}, cancel() {}, inbox: { remove: () => true },
++  }
++  const raw = createChannel(ctx as never, agent as never, { model: 'fixture', provider: 'fixture', cwd: scratch, activity: false })
++  const mounted = mountChannelUi(ctx, raw, undefined, 'new')
++  try {
++    await new Promise<void>((resolve, reject) => {
++      const timeout = setTimeout(() => { unsubscribe(); reject(new Error('channel did not publish folded user row')) }, 2000)
++      const unsubscribe = mounted.channel.subscribe(() => {
++        if (!mounted.channel.rows.some(r => r.kind === 'user' && r.seq === 1 && r.folded)) return
++        clearTimeout(timeout)
++        unsubscribe()
++        resolve()
++      })
++      raw.emitStream()
++    })
++    const before = mounted.channel.rows.find(r => r.kind === 'user' && r.seq === 1)
++    assert.ok(before, 'real seed projected the user prompt')
++    assert.ok(raw.rows.length > 600, 'real seed projected over 600 rows')
++    assert.equal(before.folded, true, 'real emitter folded the old user row')
++    assert.notEqual(before.text, full)
++    assert.ok(mounted.channel.loadOlder() > 0, 'real UI loadOlder restored rows')
++    const after = mounted.channel.rows.find(r => r.id === before.id)
++    assert.equal(after?.seq, 1)
++    assert.equal(after?.text, full)
++    assert.equal(after?.folded, false)
++    assert.equal(after?.restored, true)
++    assert.ok(!after?.text.includes('PRIVATE ATTACHMENT BODY'))
++  } finally {
++    mounted.dispose()
++    raw.releaseContributions()
++    for (const cleanup of cleanups.reverse()) cleanup()
++  }
++}
++
++// A real folded-user batch, separate from the assistant/tool click budget.
++// Timings are diagnostic (median of five), while counts and event traversal
++// are deterministic; no host-dependent wall-clock threshold is relaxed.
++{
++  const count = 10_000
++  const full = 'batch question ' + 'x'.repeat(280)
++  const durable = Array.from({ length: count }, (_, i) => user(i + 1, [text(full)]))
++  let traversed = 0
++  const events: readonly SessionEvent[] = new Proxy(durable, {
++    get(target, prop, receiver) {
++      if (prop === Symbol.iterator) return function* () {
++        for (const event of target) { traversed += 1; yield event }
++      }
++      return Reflect.get(target, prop, receiver)
++    },
++  })
++  const times: number[] = []
++  for (let run = 0; run < 5; run += 1) {
++    const rows = Array.from({ length: count }, (_, i) => row(i + 1, i + 1, full))
++    assert.equal(foldRows(rows, 0), count)
++    traversed = 0
++    const start = process.hrtime.bigint()
++    assert.equal(foldBack(rows, events), count)
++    times.push(Number(process.hrtime.bigint() - start) / 1e6)
++    assert.equal(traversed, count, 'events are traversed exactly once, not once per user row')
++    assert.ok(rows.every(r => r.text === full && r.restored === true && r.folded === false))
++  }
++  times.sort((a, b) => a - b)
++  console.log(`${count} real folded users: median ${times[2]!.toFixed(1)} ms / 5 runs`)
++}
++
++console.log('verify-fold-back-user OK')
++} finally {
++  // Remove only the exact private directory we just created, never a symlink
++  // replacement or a path outside the verified real temporary parent.
++  if (dirname(scratch) !== parent || realpathSync(scratch) !== scratch) throw new Error('refusing unsafe scratch cleanup')
++  rmSync(scratch, { recursive: true })
++}
+diff --git a/scripts/verify-history-chunks.ts b/scripts/verify-history-chunks.ts
+index 3b505f38..696fa346 100644
+--- a/scripts/verify-history-chunks.ts
++++ b/scripts/verify-history-chunks.ts
+@@ -12,7 +12,7 @@
+  */
+ import assert from 'node:assert/strict'
+ import { readFileSync } from 'node:fs'
+-import type { AgentEvent } from '../src/agent/events.js'
++import type { AgentEvent, AgentEventOf } from '../src/agent/events.js'
+ import {
+   CHUNK_CHARS,
+   CHUNK_ROUNDS,
+@@ -26,7 +26,7 @@ import { projectHistorySlice } from '../src/channel/history-restore.js'
+ 
+ const digest = (chunk: HistoryChunk): string => `⏸ rounds ${chunk.fromRound}–${chunk.toRound}`
+ 
+-const prompt = (seq: number, text: string, source: 'user' | 'team-message' = 'user'): AgentEvent => ({
++const prompt = (seq: number, text: string, source: AgentEventOf<'user.message'>['source'] = 'user'): AgentEventOf<'user.message'> => ({
+   type: 'user.message',
+   id: `m${seq}`,
+   anchor: String(seq),
+@@ -150,7 +150,7 @@ assert.ok(hugeChunks.every((chunk, index) => chunk.start === (index === 0 ? 0 :
+ // projects the chunk on sight. No prompt stand-ins and no projected content —
+ // a collapsed chunk must never look like a conversation whose answers are gone.
+ for (const chunk of chunks) {
+-  const rows = placeholderRows(chunk, digest)
++  const rows = placeholderRows(chunk, digest, entries)
+   assert.equal(rows.length, 1, 'an unloaded chunk contributes exactly one row')
+   const row = rows[0]!
+   assert.equal(row.id, chunk.idBase, 'the section line owns idBase')
+@@ -165,12 +165,43 @@ for (const chunk of chunks) {
+ // The bug this replaced: a collapsed chunk must not claim to be user rows.
+ for (const chunk of chunks) {
+   assert.deepEqual(
+-    placeholderRows(chunk, digest).filter(row => row.kind === 'user'),
++    placeholderRows(chunk, digest, entries).filter(row => row.kind === 'user'),
+     [],
+     'no prompt stand-in rows remain in the collapsed form',
+   )
+ }
+ 
++// ── navigation is complete without painting fake prompt rows ─────────────
++const indexed = chunks.flatMap(chunk => placeholderRows(chunk, digest, entries)[0]!.collapsedTurns ?? [])
++const humanRows = projectHistorySlice(entries, 'preview').filter(row => row.kind === 'user' && row.label !== 'team-message')
++assert.deepEqual(indexed.map(turn => turn.seq), humanRows.map(row => row.seq), 'the index covers every real human prompt in record order')
++assert.equal(new Set(indexed.map(turn => turn.id)).size, indexed.length, 'handles are unique across all chunks')
++assert.ok(indexed.every(turn => turn.id < chunks[0]!.idBase), 'virtual handles never collide with real chunk or live rows')
++assert.ok(indexed.every(turn => chunkForRow(chunks, turn.id) === undefined), 'a virtual handle cannot accidentally reveal another chunk')
++for (const chunk of chunks) {
++  const meta = placeholderRows(chunk, digest, entries)[0]!.collapsedTurns ?? []
++  const real = projectHistorySlice(entries.slice(chunk.start, chunk.end), 'preview')
++  for (const turn of meta) {
++    const row = real.find(row => row.kind === 'user' && row.label !== 'team-message' && row.seq === turn.seq)
++    assert.equal(row?.text, turn.text, 'every handle resolves to the exact projected prompt by seq')
++  }
++}
++// Empty inputs and background sources do not create human ticks. Whitespace
++// and image-only human prompts DO, exactly like the shared projector.
++const edgeEntries: AgentEvent[] = [
++  prompt(20_000, ''),
++  prompt(20_001, '   '),
++  { ...prompt(20_002, ''), images: [{ id: 'image', width: 1, height: 1, read: async () => new Uint8Array() }] },
++  prompt(20_003, 'peer', 'team-message'),
++  prompt(20_004, 'goal', 'injected'),
++  prompt(20_005, 'checkpoint', 'compaction'),
++  prompt(20_006, 'command output', 'command-output'),
++]
++const edgeChunk = planChunks(edgeEntries)[0]!
++const edgeIndex = placeholderRows(edgeChunk, digest, edgeEntries)[0]!.collapsedTurns!
++assert.deepEqual(edgeIndex.map(turn => turn.seq), [20_001, 20_002], 'the index uses the projector visibility/source predicate')
++assert.deepEqual(edgeIndex.map(turn => turn.imageCount), [0, 1], 'image-only prompts retain their preview count')
++
+ // ── which chunk owns a row ────────────────────────────────────────────────
+ for (const chunk of chunks) {
+   assert.equal(chunkForRow(chunks, chunk.idBase), chunk, 'a chunk owns its section line')
+diff --git a/scripts/verify-tool-history-window.tsx b/scripts/verify-tool-history-window.tsx
+index d6f9284b..f891b510 100644
+--- a/scripts/verify-tool-history-window.tsx
++++ b/scripts/verify-tool-history-window.tsx
+@@ -14,9 +14,9 @@ import type { ChatRow } from '../src/dsh-adapter/channel.js'
+ import type { DOMElement } from '../src/ink/dom.js'
+ import { settled } from './lib/term-test.mjs'
+ 
+-const [React, { AlternateScreen, Box, render, ScrollBox, Text }, { MessageList }, { Chat }, { QuestionStore }] = await Promise.all([
++const [React, { AlternateScreen, Box, render, ScrollBox, Text }, { MessageList }, { Chat }, { QuestionStore }, { nodeCache }] = await Promise.all([
+   import('react'), import('../src/ui.js'), import('../src/components/MessageList.js'),
+-  import('../src/screens/Chat.js'), import('../src/dsh-adapter/questions.js'),
++  import('../src/screens/Chat.js'), import('../src/dsh-adapter/questions.js'), import('../src/ink/node-cache.js'),
+ ])
+ 
+ class Input extends PassThrough {
+@@ -50,6 +50,8 @@ for (const fullscreen of [true, false]) {
+   let handle: ScrollBoxHandle | null = null
+   let latestFrame: number[] = []
+   let frameCount = 0
++  let seekTarget: DOMElement | undefined
++  let seekPaint: { frame: number; target: DOMElement; y: number; height: number; viewportTop: number; viewportHeight: number; scrollTop: number; yogaTop: number } | undefined
+   let revision = 0
+   let hintRow = 1
+   let forced: number | null = null
+@@ -79,6 +81,17 @@ for (const fullscreen of [true, false]) {
+       latestFrame = [...mounted.keys()]
+       for (const id of latestFrame) painted.add(id)
+       frameCount++
++      const scroll = handle as ScrollBoxHandle | null
++      const target = seekTarget
++      if (scroll !== null && target !== undefined && mounted.get(1) === target) {
++        const rect = nodeCache.get(target)
++        const yogaTop = target.yogaNode?.getComputedTop()
++        if (rect !== undefined && yogaTop !== undefined) {
++          seekPaint = { frame: frameCount, target, y: rect.y, height: rect.height,
++            viewportTop: scroll.getViewportTop(), viewportHeight: scroll.getViewportHeight(),
++            scrollTop: scroll.getScrollTop(), yogaTop }
++        }
++      }
+     },
+   })
+   try {
+@@ -99,8 +112,18 @@ for (const fullscreen of [true, false]) {
+     app.rerender(<Harness />)
+     assert.ok(await settled(() => latestFrame.includes(1)))
+     const first = mounted.get(1)!
++    seekTarget = first
++    const frameBeforeSeek = frameCount
+     handle!.scrollToElement(first)
+     assert.ok(await settled(() => !handle!.isSticky()))
++    // isSticky flips synchronously, before a render can consume the anchor.
++    // Require a new paint with the same target at the actual viewport top.
++    assert.ok(await settled(() => {
++      const sample = seekPaint
++      return sample !== undefined && sample.frame > frameBeforeSeek && sample.frame === frameCount && sample.target === first &&
++        mounted.get(1) === first && latestFrame.includes(1) && sample.height > 0 && sample.viewportHeight > 0 &&
++        Math.abs(sample.y - sample.viewportTop) <= 1 && Math.abs(sample.scrollTop - sample.yogaTop) <= 1
++    }), `seek did not land in a new painted frame: ${JSON.stringify(seekPaint && { ...seekPaint, target: '<target>' })}`)
+     forced = null
+     app.rerender(<Harness />)
+     assert.ok(await settled(() => latestFrame.includes(1) && latestFrame.length < 30))
+diff --git a/src/adapter/ports/channel-view.ts b/src/adapter/ports/channel-view.ts
+index f1daaa5a..f98465a7 100644
+--- a/src/adapter/ports/channel-view.ts
++++ b/src/adapter/ports/channel-view.ts
+@@ -96,6 +96,17 @@ export interface WorkingActivityView {
+   readonly lang: 'zh' | 'en'
+ }
+ 
++/** Navigation-only user prompt behind a collapsed history section. Not a
++ *  transcript row: `id` is a reveal handle, resolved to the real prompt row
++ *  when its section loads. Keeping these on the section preserves the full
++ *  turn rail without projecting old answers or painting prompt stand-ins. */
++export interface CollapsedTurn {
++  readonly id: number
++  readonly seq: number
++  readonly text: string
++  readonly imageCount: number
++}
++
+ /**
+  * One rendered transcript row. The DSH session log is the source of truth:
+  * rows are derived from `session/event` records (and the initial
+@@ -133,6 +144,11 @@ export interface ChatRow {
+    *  (rows may arrive frozen from the session projection), never by the
+    *  projection and never on the shared row objects. */
+   jobGroup?: JobGroupRow
++  /** Present on `subagent` rows that share a run of ≥3 consecutive cards:
++   *  the fan-out fold decoration. Same render-derived contract as
++   *  {@link jobGroup}: written only onto shallow copies in the transcript's
++   *  row pre-pass, never by the projection. */
++  subagentGroup?: SubagentGroupRow
+   /** Event wall-clock time (transcript-mode metadata, assistant rows). */
+   time?: number
+   /** Present on `reasoning` rows once settled: thinking wall-clock duration. */
+@@ -162,6 +178,10 @@ export interface ChatRow {
+    *  this row reaches the viewport, so the flag tells the list which rows are
+    *  load-on-sight and marks the line as a collapsed section, not a message. */
+   collapsed?: boolean
++  /** Rail entries for the human prompts behind this collapsed section. They
++   *  never render as transcript messages; loading replaces the whole section
++   *  (and this metadata) with real rows. */
++  collapsedTurns?: readonly CollapsedTurn[]
+   /** True on rows created by LIVE event handling (not replay/resume/fold
+    *  restore) — the smooth-streaming reveal animates freshly-arrived
+    *  content only; replayed history must paint complete. Set when a live row
+@@ -445,6 +465,34 @@ export interface JobGroupRow {
+   endedAt?: number
+ }
+ 
++/**
++ * Consecutive subagent cards (`⑂` task cards): a settled fan-out of three or
++ * more adjacent cards folds into one header so a dozen parallel workers
++ * cannot bury the conversation. Render-derived, exactly like
++ * {@link JobGroupRow}: written only onto shallow copies in the transcript's
++ * row pre-pass. The fold defaults on and reopens via the header click, a
++ * per-row toggle, or Ctrl+O.
++ */
++export interface SubagentGroupRow {
++  /** Group header row: the only member rendering the summary/fold line. */
++  head: boolean
++  /** Last member: closes the group (kept for symmetry and future rails). */
++  last: boolean
++  /** Members in the run (≥2). */
++  count: number
++  /** Whole group folded into the header line (meaningful on the head). */
++  folded: boolean
++  /** Members still booting / live. */
++  live: number
++  completed: number
++  /** failed + cancelled (both paint in the error color). */
++  failed: number
++  /** Earliest member start. */
++  startedAt: number
++  /** Latest member finish; absent while any member is still live. */
++  endedAt?: number
++}
++
+ /**
+  * Background-job projection for the UI (`/jobs` panel, transcript cards,
+  * status-line chip, completion toasts).
+diff --git a/src/agent/events.ts b/src/agent/events.ts
+index fd7069b0..066383ad 100644
+--- a/src/agent/events.ts
++++ b/src/agent/events.ts
+@@ -435,6 +435,13 @@ export interface AgentEventMeta {
+    * carries its source's wake.
+    */
+   readonly wake?: 'sync' | 'frame' | 'none'
++  /**
++   * `true` for a throwaway projection (an older-history slice painted into
++   * scratch rows): the resulting state is dropped, so context-bar accounting
++   * that only the live state reads is skipped. Without it, revealing a chunk
++   * pays a full token estimate over every result/assistant body in it.
++   */
++  readonly scratch?: boolean
+ }
+ 
+ /** Shared empty batch (translators return it when an input maps to nothing). */
+diff --git a/src/channel/history-restore.ts b/src/channel/history-restore.ts
+index 797c5a05..c910e3df 100644
+--- a/src/channel/history-restore.ts
++++ b/src/channel/history-restore.ts
+@@ -178,7 +178,8 @@ export function projectHistorySlice(events: readonly AgentEvent[], thinkingFold:
+     activity,
+   })
+   try {
+-    projector.apply(events, { replay: true })
++    // Scratch state: skip context-bar accounting (see AgentEventMeta.scratch).
++    projector.apply(events, { replay: true, scratch: true })
+     projector.settleStreaming()
+   } finally {
+     activity.dispose()
+diff --git a/src/channel/projection.ts b/src/channel/projection.ts
+index 78d9a49e..1147d0f6 100644
+--- a/src/channel/projection.ts
++++ b/src/channel/projection.ts
+@@ -464,6 +464,11 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
+   /** Replay paints settled history without the live smooth-reveal animation. */
+   let replaying = false
+ 
++  /** A scratch projection's state is thrown away, so context-bar estimates
++   *  (O(text) per event) are not worth computing. Set by `apply`. */
++  let scratch = false
++  const countTokens = (text: string): number => (scratch ? 0 : estimateTokens(text))
++
+   type Delta = AgentEventOf<'assistant.delta'>['delta']
+   /** Whether one delta advances the first-token/decode boundary. */
+   const isTokenDelta = (delta: Delta): boolean => {
+@@ -734,9 +739,9 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
+     // tool calls in the assistant segment, thinking separately.
+     for (const block of event.blocks) {
+       if (block.type === 'text' && block.text) {
+-        state.contextSegments.assistant += estimateTokens(block.text)
++        state.contextSegments.assistant += countTokens(block.text)
+       } else if (block.type === 'reasoning' && block.text) {
+-        state.contextSegments.thinking += estimateTokens(block.text)
++        state.contextSegments.thinking += countTokens(block.text)
+       }
+     }
+   }
+@@ -765,7 +770,7 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
+       // occupancy total.
+       state.contextSegments = {
+         system: state.contextSegments.system,
+-        prompt: estimateTokens(summary),
++        prompt: countTokens(summary),
+         assistant: 0,
+         thinking: 0,
+         tools: 0,
+@@ -827,7 +832,7 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
+     if (event.source === 'team-message') {
+       if (event.text === '') return
+       appendRow({ id: deps.rowIds.value, kind: 'user', label: 'team-message', text: event.text, ...(event.sender === undefined ? {} : { sender: event.sender }), seq: event.seq })
+-      state.contextSegments.prompt += estimateTokens(textOfBlocks(event.blocks))
++      state.contextSegments.prompt += countTokens(textOfBlocks(event.blocks))
+       deps.rowIds.value += 1
+       return
+     }
+@@ -859,7 +864,7 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
+       state.lastUserText = text || t('transcript-image-message', { count: images.length })
+       // The context estimate counts everything sent to the model: typed
+       // text and the `@`-mention attachment blocks.
+-      state.contextSegments.prompt += estimateTokens(textOfBlocks(event.blocks))
++      state.contextSegments.prompt += countTokens(textOfBlocks(event.blocks))
+       deps.rowIds.value += 1
+     }
+   }
+@@ -916,7 +921,7 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
+     toolCards.set(event.callId, card)
+     appendRow(card)
+     state.activeToolCount += 1
+-    state.contextSegments.assistant += estimateTokens(
++    state.contextSegments.assistant += countTokens(
+       `${event.name}${event.argsJson}`,
+     )
+     updateSpinnerMode()
+@@ -961,7 +966,7 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
+         }
+         deps.rowIds.value += 1
+         appendRow(errorCard)
+-        state.contextSegments.tools += estimateTokens(event.errorText ?? '')
++        state.contextSegments.tools += countTokens(event.errorText ?? '')
+       }
+       return
+     }
+@@ -979,7 +984,7 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
+       card.tool.status = 'error'
+       const errorText = event.errorText ?? ''
+       card.tool.errorText = errorText
+-      state.contextSegments.tools += estimateTokens(errorText)
++      state.contextSegments.tools += countTokens(errorText)
+     } else {
+       card.tool.status = 'ok'
+       const result = event.text
+@@ -994,7 +999,7 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
+         // read content…) wins over the raw text body.
+         card.tool.resultView = event.presentation
+       }
+-      state.contextSegments.tools += estimateTokens(result)
++      state.contextSegments.tools += countTokens(result)
+       settledCardCallId = callId
+     }
+     state.activeToolCount = Math.max(0, state.activeToolCount - 1)
+@@ -1394,7 +1399,7 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
+       case 'system.prompt':
+         // The latest system prompt holds the active instructions (an empty
+         // render clears them); the context bar's system segment tracks it.
+-        state.contextSegments.system = estimateTokens(event.text)
++        state.contextSegments.system = countTokens(event.text)
+         return
+       case 'request.header':
+         // Reasoning effort readout (status line) from the call config.
+@@ -1475,7 +1480,7 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
+         if (event.ok && event.contextReplaced === true) {
+           state.contextSegments = {
+             system: state.contextSegments.system,
+-            prompt: estimateTokens(event.summary ?? ''),
++            prompt: countTokens(event.summary ?? ''),
+             assistant: 0,
+             thinking: 0,
+             tools: 0,
+@@ -1624,10 +1629,12 @@ export function createChannelProjection(state: ProjectionState, deps: ChannelPro
+     // previous snapshot.
+     if (droppedFresh) markChannelReadDirty(state.rows)
+     replaying = true
++    scratch = meta.scratch === true
+     try {
+       for (const event of events) applyEvent(event)
+     } finally {
+       replaying = false
++      scratch = false
+     }
+   }
+ 
+diff --git a/src/channel/selection-record.ts b/src/channel/selection-record.ts
+index eb8fc514..f31c9f61 100644
+--- a/src/channel/selection-record.ts
++++ b/src/channel/selection-record.ts
+@@ -25,18 +25,25 @@ export function replaySelectionAttachment(
+     if ((block as { type?: unknown }).type !== 'text' || typeof text !== 'string') continue
+     const opened = /^<attached-file path="([^"]+)" selection(?: count="(\d+)")?>\n/.exec(text)
+     if (opened === null) continue
+-    let closed = text.slice(opened[0].length)
+-    if (closed.endsWith('</attached-file>')) closed = closed.slice(0, -'</attached-file>'.length)
+-    // The builder writes `body\n</attached-file>` — strip the newline the
+-    // close tag rode on, or every body counts one phantom line.
+-    if (closed.endsWith('\n')) closed = closed.slice(0, -1)
+-    const lines = closed.split('\n').length
+-    // `count` is authoritative when present (the builder always writes it).
+-    // Blocks persisted before it existed fall back to the old tail heuristic,
+-    // which misreads a body whose last line is literally the truncation marker.
++    // `count` is authoritative when present (the builder always writes it),
++    // so current records need no explicit body scan or split.
+     const counted = opened[2] === undefined ? undefined : Number(opened[2])
++    let lines = counted
++    if (lines === undefined) {
++      const start = opened[0].length
++      let end = text.length
++      const close = '</attached-file>'
++      if (end - start >= close.length && text.endsWith(close, end)) end -= close.length
++      // The closing tag's preceding newline is not a body line.
++      if (end > start && text.charCodeAt(end - 1) === 10) end -= 1
++      lines = 1
++      for (let pos = text.indexOf('\n', start); pos !== -1 && pos < end; pos = text.indexOf('\n', pos + 1)) lines += 1
++      // Preserve the legacy heuristic for records predating `count`.
++      const marker = '\n[… truncated]'
++      if (end - start >= marker.length && text.endsWith(marker, end)) lines -= 1
++    }
+     return {
+-      lines: counted ?? (closed.endsWith('\n[… truncated]') ? lines - 1 : lines),
++      lines,
+       // Reverse escapeSnippetAttr so the replayed indicator shows the path
+       // exactly as the live one did (`&` first so entities are not re-baked).
+       path: opened[1]!
+diff --git a/src/channel/transcript.ts b/src/channel/transcript.ts
+index a65ced46..e432455c 100644
+--- a/src/channel/transcript.ts
++++ b/src/channel/transcript.ts
+@@ -11,16 +11,27 @@ export const LOCAL_OUTPUT_LIMIT = 240
+ /**
+  * In-memory transcript window cap. Older rows beyond this count are folded:
+  * their full-text fields (assistant/reasoning text, tool args/results) are
+- * dropped and only the preview/status metadata kept, so a long merge/deploy
+- * turn cannot grow the TUI's RAM without bound. The session log still holds
+- * everything (`/export` reads it, `/resume` replays it); the
++ * dropped and only the preview/status metadata kept. This limits the full
++ * text retained by this pass, not the number of rows or total process memory:
++ * previews, raw session data and indices may still grow. The session log
++ * remains the source of truth (`/export` reads it, `/resume` replays it); the
+  * folded row keeps its kind/id so scrolling and selection stay stable.
+  */
+ export const MAX_ROWS = 600
+ 
+ export function preview(text: string, limit: number): string {
+-  const flat = text.replace(/\s+/g, ' ').trim()
+-  return flat.length <= limit ? flat : `${flat.slice(0, limit)}…`
++  // Read a bounded prefix only. Tool results can be megabytes; flattening the
++  // whole string (one regex pass plus a full-size allocation) just to cut
++  // `limit` characters back out dominated chunk reveal, at ~30 ms per big
++  // result. The window doubles when whitespace swallowed the whole prefix, so
++  // an indented/empty head still finds content instead of returning nothing.
++  let window = Math.min(text.length, Math.max(limit * 4, 256))
++  for (;;) {
++    const flat = text.slice(0, window).replace(/\s+/g, ' ').trim()
++    if (flat.length > limit) return `${flat.slice(0, limit)}…`
++    if (window >= text.length) return flat
++    window = Math.min(text.length, window * 2)
++  }
+ }
+ 
+ /**
+diff --git a/src/components/MessageList.tsx b/src/components/MessageList.tsx
+index a1a5574d..0e9f2d0a 100644
+--- a/src/components/MessageList.tsx
++++ b/src/components/MessageList.tsx
+@@ -2,7 +2,7 @@ import React, { useState } from 'react'
+ import { getLang, subscribeLang, t, type Lang } from '../i18n.js'
+ import { Box, Text, useTerminalSize, type ScrollBoxHandle } from '../ui.js'
+ import type { ClickEvent } from '../ink/events/click-event.js'
+-import type { ChatRow, ToolRow, ToolCallView, ToolResultView, SubagentRow, JobGroupRow, JobRow } from '../dsh-adapter/channel.js'
++import type { ChatRow, ToolRow, ToolCallView, ToolResultView, SubagentRow, JobGroupRow, JobRow, SubagentGroupRow } from '../dsh-adapter/channel.js'
+ import type { TurnUsageSummary } from '../adapter/ports/channel-view.js'
+ import type { JobGroupFoldMode } from '../tuiDisplayPrefs.js'
+ import { normalizeIdePath } from '../dsh-adapter/ide-channel.js'
+@@ -16,8 +16,10 @@ import { liveOutputMaxLines, liveOutputRows } from './messages/liveOutputLines.j
+ import { SubagentMessage } from './Chat/SubagentMessage.js'
+ import { JobCard } from './Chat/JobCard.js'
+ import { JobGroupHeader } from './Chat/JobGroupHeader.js'
++import { SubagentGroupHeader } from './Chat/SubagentGroupHeader.js'
+ import { isMinimalUiMode } from '../minimalUiMode.js'
+ import { noteFrameCause, noteListGeometry } from '../ink/geometry-trace.js'
++import { noteRowWindow } from '../ink/frame-stats.js'
+ import { getTerminalFlushTick } from '../ink/flush-tick.js'
+ import { TurnInterruptedRow } from './TurnInterruptedRow.js'
+ import { TurnUsageRow } from './TurnUsageRow.js'
+@@ -29,7 +31,7 @@ import { stripNarration } from '../utils/narration.js'
+ import { foldLongLines } from '../utils/fold-long-lines.js'
+ import { stringWidth } from '../ink/stringWidth.js'
+ import { truncateToWidth } from '../ink/truncateToWidth.js'
+-import { clipPreview, type TimelineSnapshot, type TimelineTurn } from '../ink/timeline-rail.js'
++import { clipPreview, timelineTargets, type TimelineSnapshot, type TimelineTurn } from '../ink/timeline-rail.js'
+ import type { ToolBackground } from '../tuiDisplayPrefs.js'
+ import { getRevealVersion, revealLengthOf, revealTextOf, scopeRevealKey } from './smoothReveal.js'
+ import { useRevealScope } from './revealScope.js'
+@@ -57,6 +59,16 @@ import { primaryComboString } from '../utils/keymap.js'
+  *  is a viewport, not a printout; load-earlier restores older rows. */
+ const RENDERED_ROW_CAP = 120
+ 
++/** Extra rows one wheel-up gesture at the top edge pages in. The transcript
++ *  stays anchored where the reader is; the newly mounted block sits above the
++ *  old floor until they scroll into it, so a page-in never teleports the
++ *  viewport (or the rail) to the oldest row. */
++const TOP_PAGE_ROWS = 100
++
++/** A wheel-up burst at the top edge must SETTLE for this long before a page
++ *  commits: one mount per gesture, not one per notch. */
++const TOP_PAGE_SETTLE_MS = 180
++
+ /** Threshold of the `auto` jobGroupFold policy: a run of this many (or
+  *  more) FULLY SETTLED jobs folds into its own summary line. Two jobs are
+  *  still a pair worth reading card by card — the group rail alone already
+@@ -65,6 +77,14 @@ const RENDERED_ROW_CAP = 120
+  *  it back. */
+ const JOB_GROUP_FOLD_MIN = 3
+ 
++/** Threshold of the subagent group fold: a fan-out lands as N adjacent `⑂`
++ *  task cards; a run of this many (or more) FULLY SETTLED cards folds into
++ *  its group header. A pair stays card-by-card (the shared header already
++ *  saves their separator lines), and a live worker keeps its card visible —
++ *  work in flight must never be folded away. Ctrl+O and a header click reopen
++ *  the run; clicking again folds it back. */
++const SUBAGENT_GROUP_MIN = 3
++
+ // --- layout virtualization constants -------------------------------------
+ // Offscreen rows render as fixed-height spacers whose heights come from the
+ // previous commit's Yoga layout, so the pure-JS Yoga engine never walks
+@@ -87,6 +107,7 @@ const DEFAULT_HEADER_LINES = 14
+  *  render must not throw (same rule as Chat's stubbed channel APIs). Module
+  *  scope keeps the identities stable so MemoRow's shallow compare and the
+  *  toggle callback's deps never churn. */
++const NO_EXPANDED_CODE_PATHS: ReadonlyMap<number, ReadonlySet<string>> = new Map()
+ const NO_STREAM_VIEW_TOGGLED: ReadonlySet<number> = new Set()
+ const NOOP_TOGGLE_STREAM_VIEW = (_rowId: number): void => {}
+ 
+@@ -200,8 +221,8 @@ export function displaySelectionPath(
+  * degrades to the previous behavior.
+  *
+  * Returns a PARTS VECTOR instead of a joined string: the caller compares
+- * slot-by-slot against the cached vector (all primitives), allocating only
+- * when a row's inputs actually changed. Building a joined string per row
++ * slot-by-slot against the cached vector (primitives plus immutable per-row
++ * disclosure sets), allocating only when a row's inputs actually changed. Building a joined string per row
+  * per render was O(rows) allocation churn on every scroll tick — the GC
+  * share of the long-session scroll profile.
+  *
+@@ -210,7 +231,8 @@ export function displaySelectionPath(
+  * majority) allocates nothing. Callers that retain the vector must copy
+  * (parts.slice()).
+  */
+-const signatureScratch: Array<string | number | boolean> = []
++type SignaturePart = string | number | boolean | ReadonlySet<string>
++const signatureScratch: SignaturePart[] = []
+ 
+ /** Status code for the job-group fingerprint (a hash input only — the values
+  *  just have to be distinct per status). */
+@@ -225,11 +247,25 @@ function jobStatusCode(status: string): number {
+   }
+ }
+ 
++/** Coarse subagent-status code for the run fingerprint (see `subagentsSig`). */
++function subagentStatusCode(status: string): number {
++  switch (status) {
++    case 'starting': return 1
++    case 'running': return 2
++    case 'completed': return 3
++    case 'failed': return 4
++    case 'cancelled': return 5
++    default: return 7
++  }
++}
++
+ function signatureParts(
+   row: ChatRow,
+   columns: number,
+   expanded: boolean,
+   expandedRows: ReadonlySet<number>,
++  expandedCodePaths: ReadonlyMap<number, ReadonlySet<string>>,
++  closedGlobalCodePaths: ReadonlyMap<number, ReadonlySet<string>>,
+   streamViewToggledRows: ReadonlySet<number>,
+   thinkingVisible: boolean,
+   thinkingFold: string,
+@@ -241,7 +277,7 @@ function signatureParts(
+   displayTextLen: number,
+   sessionCwd: string | undefined,
+   fullscreen: boolean,
+-): Array<string | number | boolean> {
++): SignaturePart[] {
+   signatureScratch.length = 0
+   // Universal height inputs: width reflows every row; kind switches height
+   // semantics wholesale; text length drives wrapping. `displayTextLen` is the
+@@ -258,7 +294,7 @@ function signatureParts(
+       // Streaming vs settled swaps renderers; Ctrl+O/per-row expand adds the
+       // metadata row (model only renders expanded — keeps an idle /model
+       // switch from touching settled rows).
+-      signatureScratch.push(row.streaming === true, expanded, expandedRows.has(row.id), expanded ? model : '')
++      signatureScratch.push(row.streaming === true, expanded, expandedRows.has(row.id), expanded ? model : '', expandedCodePaths.get(row.id) ?? '', closedGlobalCodePaths.get(row.id) ?? '')
+       break
+     case 'reasoning':
+       // thinkingFold (preview vs full), its per-row live override, and the
+@@ -303,6 +339,10 @@ function signatureParts(
+         row.subagent?.toolCalls.length ?? 0,
+         row.subagent?.outputLines.length ?? 0,
+         row.subagent?.error?.length ?? 0,
++        // A group head adds a summary; a folded group drops every card body.
++        row.subagentGroup !== undefined,
++        row.subagentGroup?.head === true,
++        row.subagentGroup?.folded === true,
+       )
+       break
+     case 'job': {
+@@ -380,6 +420,9 @@ export function MessageList({
+   rows,
+   expanded,
+   expandedRows,
++  expandedCodePaths = NO_EXPANDED_CODE_PATHS,
++  closedGlobalCodePaths = NO_EXPANDED_CODE_PATHS,
++  onToggleCodePath,
+   selectedId,
+   onToggleRow,
+   streamViewToggledRows = NO_STREAM_VIEW_TOGGLED,
+@@ -404,6 +447,7 @@ export function MessageList({
+   registerRowRef,
+   scrollHandle,
+   forceMountRowId,
++  onSeekReady,
+   newSinceRowId,
+   onUnseenCount,
+   onTimeline,
+@@ -421,6 +465,9 @@ export function MessageList({
+   rows: readonly ChatRow[]
+   expanded: boolean
+   expandedRows: ReadonlySet<number>
++  expandedCodePaths?: ReadonlyMap<number, ReadonlySet<string>>
++  closedGlobalCodePaths?: ReadonlyMap<number, ReadonlySet<string>>
++  onToggleCodePath?: (rowId: number, path: string, forceExpanded: boolean) => void
+   selectedId: number | null
+   onToggleRow: (rowId: number) => void
+   /** 流式 reasoning 行相对 thinkingFold 默认视图的逐行切换。 */
+@@ -484,6 +531,9 @@ export function MessageList({
+   scrollHandle?: ScrollBoxHandle | null
+   /** Row that must be mounted this pass (seek target for scrollToElement). */
+   forceMountRowId?: number | null
++  /** Complete an explicit seek only after mounted-row geometry has settled.
++   *  Supplies the prompt-text offset inside its wrapper (including margin). */
++  onSeekReady?: (rowId: number, textOffset: number) => void
+   /** "Seen up to" anchor for the new-messages pill: rows with id greater
+    *  than this are new. Null when pinned to the bottom (nothing unseen). */
+   newSinceRowId?: number | null
+@@ -543,7 +593,71 @@ export function MessageList({
+   // Reveal memory is per Chat root: a recompose can mount this transcript
+   // under a fresh root, and each root owns its row ids.
+   const revealScope = useRevealScope()
+-  const hiddenCount = rows.length - RENDERED_ROW_CAP
++  /** Rows a top-edge wheel gesture has paged in beyond RENDERED_ROW_CAP.
++   *  Reset when the transcript is replaced (new session / rewind), not when
++   *  rows are appended or prepended in place. */
++  const [topPaged, setTopPaged] = React.useState(0)
++  const transcriptIdentityRef = React.useRef(rows)
++  /**
++   * Window floor a force-mounted seek pinned, keyed on the row it landed on
++   * (null: none).
++   *
++   * The row window is a SUFFIX of `rows`: rows above the floor are outside
++   * the content model entirely (`topPad` starts at zero there, so it cannot
++   * stand in for them). A rail click on an old turn therefore has to give
++   * that turn a floor of its own, and the floor must OUTLIVE the force-mount
++   * release — lowering it back would unmount the row we just landed on and
++   * clamp the viewport to the tail again (the "click did nothing" bug).
++   *
++   * Validity is the LANDED ROW, not the transcript identity: projecting a
++   * chunk splices rows in place but publishes a fresh `rows` reference (the
++   * channel rebuilds its view on every emit), so an identity reset fires
++   * mid-seek and drops the floor back to the 120-row suffix — which is the
++   * "click loads, then the screen snaps to the tail" drift. When the row
++   * itself is gone (new session, rewind, or the chunk got folded back) the
++   * floor no longer means anything and is dropped.
++   */
++  const seekFloorRef = React.useRef<{ floor: number; id: number } | null>(null)
++  /**
++   * A seek owns the viewport until the reader scrolls again.
++   *
++   * Landing on an old row can put a neighbouring chunk's section line on
++   * screen; load-on-sight would then project it ~120ms later, and that
++   * projection evicts the chunk the reader just asked for (the eviction
++   * policy keeps the newest chunk plus the one being loaded) — the landed
++   * row unmounts and the viewport falls back to wherever the position
++   * happens to land. Only wheel/page-key debt proves the reader is browsing,
++   * so that is the sole thing that re-arms projection after a seek.
++   */
++  const seekSettleRef = React.useRef(false)
++  React.useEffect(() => {
++    if (transcriptIdentityRef.current === rows) return
++    transcriptIdentityRef.current = rows
++    setTopPaged(0)
++  }, [rows])
++  const windowRows = showAll ? rows.length : RENDERED_ROW_CAP + topPaged
++  let hiddenCount = Math.max(0, rows.length - windowRows)
++  // A pending seek outside the window must join the content model FIRST:
++  // for an index above the floor `visibleRows.findIndex` misses (the target
++  // is not in the slice) and the force-mount would mount nothing. Keep one
++  // row of context above the target so the landing is not the very first
++  // content row (scrollTop 0 would arm the top-edge pager on every click).
++  if (forceMountRowId !== undefined && forceMountRowId !== null) {
++    const target = rows.findIndex(row => row.id === forceMountRowId)
++    if (target >= 0) {
++      const floor = Math.max(0, target - 1)
++      const held = seekFloorRef.current
++      if (held === null || held.id !== forceMountRowId || floor < held.floor) {
++        seekFloorRef.current = { floor, id: forceMountRowId }
++      }
++      seekSettleRef.current = true
++    }
++  }
++  if (seekFloorRef.current !== null) {
++    const held = seekFloorRef.current
++    if (rows.findIndex(row => row.id === held.id) < 0) seekFloorRef.current = null
++    else if (held.floor < hiddenCount) hiddenCount = held.floor
++  }
+   // The thinking filter runs BEFORE virtualization so window indices line up.
+   //
+   // Fingerprint memo: every scroll tick re-rendered this pipeline even when
+@@ -558,6 +672,9 @@ export function MessageList({
+     rows: readonly ChatRow[]
+     rowsLength: number
+     showAll: boolean
++    /** Window floor (`hiddenCount`): a top-edge page-in mounts older rows
++     *  without touching the row array or showAll. */
++    floor: number
+     thinkingVisible: boolean
+     out: readonly ChatRow[]
+     margins: ReadonlyMap<number, boolean>
+@@ -565,9 +682,17 @@ export function MessageList({
+      * in place, rows identity/length unchanged) changes empty-assistant
+      * filtering below, so the cache must rebuild on any bit change. */
+     streamBits: Uint8Array
++    /** Row-object snapshot. A live projection may swap ONE entry for a fresh
++     *  copy without touching the array identity or its length (re-rendered
++     *  row, patched text); pointer-comparing against this snapshot is the
++     *  only way the cached slice stops aliasing the replaced object. */
++    rowRefs: readonly ChatRow[]
+     /** Job-status/toggle fingerprint (see below): job cards settle IN PLACE,
+      *  and a settling run changes how — and whether — its members render. */
+     jobsSig: number
++    /** Same contract for subagent runs: a worker settling in place — or the
++     *  reader opening a folded run — changes whether its members render. */
++    subagentsSig: number
+     /** Turn-usage row toggle: flipping it adds/removes turn-summary rows
+      *  from the visible window without touching the row array. */
+     turnRowOn: boolean
+@@ -587,6 +712,16 @@ export function MessageList({
+       if (bits[i] !== (rows[i]!.streaming === true ? 1 : 0)) { streamBitsSame = false; break }
+     }
+   }
++  // Entry-replacement fingerprint: same array, same length, one row object
++  // swapped. Pointer compares only (no allocation per tick); the snapshot is
++  // copied once per rebuild.
++  let refsSame = visibleCache !== null && visibleCache.rowRefs.length === rows.length
++  if (refsSame) {
++    const refs = visibleCache!.rowRefs
++    for (let i = 0; i < rows.length; i++) {
++      if (refs[i] !== rows[i]) { refsSame = false; break }
++    }
++  }
+   // Job-group fingerprint: job statuses land IN PLACE (`row.job` is
+   // re-assigned by the projection, the row array never moves) and the expand
+   // toggles live in a Set — none of that shows up in the rows identity or
+@@ -599,15 +734,30 @@ export function MessageList({
+     if (row.kind !== 'job' || row.job === undefined) continue
+     jobsSig = (jobsSig * 33 + row.id + jobStatusCode(row.job.status) + (expandedRows.has(row.id) ? 7 : 0)) | 0
+   }
++  // Subagent-run fingerprint: identical contract to jobsSig, because a
++  // worker settles in place and the group fold lives in `expandedRows` —
++  // neither moves the row array, yet both decide whether the run's members
++  // stay in the visible window. Without this the click that opens a folded
++  // run reads the cached slice (still folded) until something else changes.
++  let subagentsSig = expanded ? 1 : 0
++  for (let i = 0; i < rows.length; i++) {
++    const row = rows[i]!
++    if (row.kind !== 'subagent' || row.subagent === undefined) continue
++    subagentsSig = (subagentsSig * 33 + row.id + subagentStatusCode(row.subagent.status) +
++      (row.subagent.completedAt === undefined ? 0 : 11) + (expandedRows.has(row.id) ? 7 : 0)) | 0
++  }
+   if (
+     visibleCache === null ||
+     visibleCache.rows !== rows ||
+     visibleCache.rowsLength !== rows.length ||
+     visibleCache.showAll !== (showAll || hiddenCount <= 0) ||
++    visibleCache.floor !== hiddenCount ||
+     visibleCache.thinkingVisible !== thinkingVisible ||
+     visibleCache.jobsSig !== jobsSig ||
++    visibleCache.subagentsSig !== subagentsSig ||
+     visibleCache.turnRowOn !== turnUsageRow ||
+-    !streamBitsSame
++    !streamBitsSame ||
++    !refsSame
+   ) {
+     const sliced = showAll || hiddenCount <= 0
+       ? rows
+@@ -753,6 +903,66 @@ export function MessageList({
+       }
+       i = end
+     }
++    // --- consecutive-subagent groups -------------------------------------
++    // A fan-out lands as N adjacent `⑂` task cards. A run of ≥2 shares a
++    // header (and drops the blank line between cards, exactly like job
++    // groups); once every member has settled, a run of SUBAGENT_GROUP_MIN
++    // folds into that header. Live workers keep the run open — a subagent
++    // still running must never disappear into a summary. Same gestures as
++    // every other fold: header click, per-row toggle, or Ctrl+O.
++    for (let i = 0; i < out.length; i++) {
++      const head = out[i]!
++      if (head.kind !== 'subagent' || head.subagent === undefined) continue
++      let end = i
++      while (end + 1 < out.length) {
++        const next = out[end + 1]!
++        if (next.kind !== 'subagent' || next.subagent === undefined) break
++        end++
++      }
++      const count = end - i + 1
++      if (count < 2) {
++        i = end
++        continue
++      }
++      let live = 0
++      let completed = 0
++      let failed = 0
++      let startedAt = Number.POSITIVE_INFINITY
++      let endedAt: number | undefined
++      for (let k = i; k <= end; k++) {
++        const sub = out[k]!.subagent!
++        if (sub.status === 'starting' || sub.status === 'running') live++
++        else if (sub.status === 'completed') completed++
++        else if (sub.status === 'failed' || sub.status === 'cancelled') failed++
++        startedAt = Math.min(startedAt, sub.startedAt)
++        if (sub.completedAt !== undefined) endedAt = Math.max(endedAt ?? sub.completedAt, sub.completedAt)
++      }
++      // A live member means the run is not over: no duration to freeze.
++      if (live > 0) endedAt = undefined
++      const folded = count >= SUBAGENT_GROUP_MIN && live === 0 &&
++        !expanded && !expandedRows.has(head.id)
++      for (let k = i; k <= end; k++) {
++        // Copy-on-write, for the same frozen-row reason as job groups.
++        out[k] = {
++          ...(out[k]!),
++          subagentGroup: {
++            head: k === i,
++            last: k === end,
++            count,
++            folded,
++            live,
++            completed,
++            failed,
++            startedAt,
++            ...(endedAt === undefined ? {} : { endedAt }),
++          },
++        }
++      }
++      if (folded) {
++        for (let k = i + 1; k <= end; k++) foldedMembers.add(out[k]!.id)
++      }
++      i = end
++    }
+     const visibleOut = foldedMembers.size === 0 ? out : out.filter(row => !foldedMembers.has(row.id))
+     // Every rendered block gets a 1-row top margin except the first. Pre-pass
+     // over the FULL list so a windowed row keeps the exact spacing it would
+@@ -762,7 +972,8 @@ export function MessageList({
+     {
+       let prev: ChatRow['kind'] | undefined
+       for (const row of visibleOut) {
+-        const member = row.jobGroup !== undefined && !row.jobGroup.head
++        const member = (row.jobGroup !== undefined && !row.jobGroup.head) ||
++          (row.subagentGroup !== undefined && !row.subagentGroup.head)
+         margins.set(row.id, prev !== undefined && !member)
+         prev = row.kind
+       }
+@@ -773,11 +984,14 @@ export function MessageList({
+       rows,
+       rowsLength: rows.length,
+       showAll: showAll || hiddenCount <= 0,
++      floor: hiddenCount,
+       thinkingVisible,
+       out: visibleOut,
+       margins,
+       streamBits,
++      rowRefs: rows.slice(),
+       jobsSig,
++      subagentsSig,
+       turnRowOn: turnUsageRow,
+     }
+     visGenRef.current++
+@@ -904,7 +1118,7 @@ export function MessageList({
+   // every scroll tick) allocates nothing. A joined string per row per
+   // render was O(rows) garbage per tick (3200-row session ⇒ several MB/s
+   // into minor GC; the GC share of the scroll profile).
+-  const sigRef = React.useRef(new Map<number, Array<string | number | boolean>>())
++  const sigRef = React.useRef(new Map<number, SignaturePart[]>())
+   let growingStreamNeedsMeasure = false
+   {
+     const sigs = sigRef.current
+@@ -921,6 +1135,8 @@ export function MessageList({
+         columns,
+         expanded,
+         expandedRows,
++        expandedCodePaths,
++        closedGlobalCodePaths,
+         streamViewToggledRows,
+         thinkingVisible,
+         thinkingFold,
+@@ -978,15 +1194,74 @@ export function MessageList({
+   React.useEffect(() => {
+     if (!scrollHandle) return
+     const tick = (): void =>{
+-      autoLoadArmedRef.current = true
++      // Wheel/page-key gestures are the only scroll mutations that carry
++      // pending debt (scrollBy accumulates it; seeks, sticky re-pins and
++      // anchor holds never do), so debt is the signal that the reader — not
++      // a rail jump — is browsing history. Releasing the seek settle here
++      // also keeps a failed seek from disabling projection forever: the
++      // reader's next scroll is exactly the gesture that should project.
++      if (seekSettleRef.current && scrollHandle.getPendingDelta() !== 0) seekSettleRef.current = false
++      if (!seekSettleRef.current) autoLoadArmedRef.current = true
+       setScrollTick(t => t + 1)
+     }
+     return scrollHandle.subscribe(tick)
+   }, [scrollHandle])
+ 
+-  // Cached rail/header preview per user row (see the timeline block for why
+-  // the length guard exists alongside the id key).
+-  const previewCacheRef = React.useRef(new Map<number, { len: number; imageCount: number; lang: Lang; preview: string }>())
++  /** Wheel-up at the very top pages in the next TOP_PAGE_ROWS once the wheel
++   *  stops. An UP-NOTCH at scrollTop 0 (negative pending delta) is the only
++   *  thing that ARMS the clock: a programmatic `scrollTo(0)`, a sticky
++   *  re-pin or a rail seek land at 0 with no wheel debt and never page. The
++   *  renderer's drain then reports again at 0 with the debt consumed — that
++   *  mutation must not cancel the armed clock, it IS "the gesture
++   *  completed". The debounce supplies the rest: one page after the last
++   *  notch, never one page per notch in the middle of a flick. */
++  const topPageTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
++  React.useEffect(() => {
++    if (!scrollHandle || showAll || hiddenCount <= 0) return
++    const cancel = (): void => {
++      if (topPageTimerRef.current === null) return
++      clearTimeout(topPageTimerRef.current)
++      topPageTimerRef.current = null
++    }
++    const arm = (): void => {
++      cancel()
++      topPageTimerRef.current = setTimeout(() => {
++        topPageTimerRef.current = null
++        setTopPaged(n => n + TOP_PAGE_ROWS)
++      }, TOP_PAGE_SETTLE_MS)
++    }
++    const onScroll = (): void => {
++      if (scrollHandle.getScrollTop() > 0) {
++        cancel()
++        return
++      }
++      const debt = scrollHandle.getPendingDelta()
++      if (debt > 0) {
++        cancel()
++        return
++      }
++      if (debt < 0) {
++        // A notch landed at the top edge: (re)start the settle clock so a
++        // flick commits one page after its LAST notch.
++        arm()
++        return
++      }
++      // debt === 0 at the top: the renderer drained the up-notch (the drain
++      // notifies again) or a programmatic landing reported in. Keep a clock
++      // the gesture already armed — that drain IS "the gesture completed";
++      // with no gesture armed this stays a no-op, so `scrollTo(0)` from a
++      // seek, a sticky re-pin or the rail never pages.
++    }
++    const unsubscribe = scrollHandle.subscribe(onScroll)
++    return () => {
++      unsubscribe()
++      cancel()
++    }
++  }, [scrollHandle, showAll, hiddenCount])
++
++  // Cache by target and exact prompt text, not just length: another session
++  // may reuse the same numeric ids and equally long but different prompts.
++  const previewCacheRef = React.useRef(new Map<number, { text: string; imageCount: number; lang: Lang; preview: string }>())
+ 
+   const heightOf = (row: ChatRow): number =>
+     heightsRef.current.get(row.id) ?? DEFAULT_ROW_HEIGHT
+@@ -1017,15 +1292,33 @@ export function MessageList({
+   const sticky = scrollHandle?.isSticky() ?? true
+   const base = baseRef.current ?? DEFAULT_HEADER_LINES
+   const prevAnchor = anchorRef.current
++  // The stored window index is only a HINT: a top-edge page-in, `showAll`,
++  // a fold pass or load-earlier all shift the prefix above the anchor without
++  // moving it on screen. Looking up the stale index anchored a different row
++  // (or, after the prefix grew past it, missed entirely) — that is the
++  // "load all messages jumps to the top" bug. Resolve by row id, then map
++  // back to the current window index.
++  let anchorIndex = -1
++  if (prevAnchor !== null) {
++    if (visibleRows[prevAnchor.index]?.id === prevAnchor.id) anchorIndex = prevAnchor.index
++    else anchorIndex = visibleRows.findIndex(row => row.id === prevAnchor.id)
++  }
++  // `scrollTop === 0` is the one position where no row's top can be <=
++  // scrollTop (the header occupies the top). A page-in above the floor still
++  // must keep the row under the header where it is, so the exception applies
++  // — but ONLY when the anchor row's window index shifted, i.e. content
++  // appeared or vanished ABOVE it. Header growth at Home keeps the index and
++  // must leave the header pinned at the top, not scroll it away.
++  const anchorOwnsTop = prevAnchor !== null && (
++    prevAnchor.top <= prevAnchor.scrollTop ||
++    (prevAnchor.scrollTop === 0 && anchorIndex >= 0 && anchorIndex !== prevAnchor.index)
++  )
+   let anchorCorrection = 0
+   if (
+-    scrollHandle && prevAnchor !== null && prevAnchor.top <= prevAnchor.scrollTop &&
++    scrollHandle && prevAnchor !== null && anchorIndex >= 0 && anchorOwnsTop &&
+     !sticky && pending === 0 && scrollTopRaw === prevAnchor.scrollTop
+   ) {
+-    const anchored = visibleRows[prevAnchor.index]
+-    if (anchored !== undefined && anchored.id === prevAnchor.id) {
+-      anchorCorrection = prevAnchor.top - (base + (offsets[prevAnchor.index] ?? 0))
+-    }
++    anchorCorrection = prevAnchor.top - (base + (offsets[anchorIndex] ?? 0))
+   }
+   const scrollTop = Math.max(0, scrollTopRaw - anchorCorrection)
+ 
+@@ -1203,8 +1496,17 @@ export function MessageList({
+   if (forceMountRowId !== undefined && forceMountRowId !== null) {
+     const idx = visibleRows.findIndex(row => row.id === forceMountRowId)
+     if (idx !== -1) {
+-      start = Math.min(start, idx)
+-      end = Math.max(end, idx + 1)
++      // Bounded band around the target, never [target, tail]: the sticky
++      // tail walk above and a plain `end = len` mount every row in between,
++      // which is what turned a far rail click into a 187-row commit (and
++      // then the next frame tightened back to the tail, unmounting the row
++      // before the renderer read its top). The seek anchor only needs the
++      // target at the viewport top: rows ABOVE it are `topPad` and rows
++      // BELOW it are `bottomPad`, both pure spacers, so the landing stays
++      // exact without mounting a single one of them.
++      const band = Math.max(1, Math.min(viewport, termRows) + OVERSCAN_LINES)
++      start = Math.max(0, idx - 1)
++      end = Math.max(Math.min(visibleRows.length, idx + band), idx + 1)
+     }
+   }
+   // The failure footnote is row content, not a seek request. Pinning its
+@@ -1214,6 +1516,9 @@ export function MessageList({
+   const topPad = offsets[start] ?? 0
+   const mountedBottom = end < visibleRows.length ? offsets[end] : total
+   const bottomPad = total - mountedBottom
++  // Same numbers, second consumer: the opt-in frame stats line reports the
++  // mount window that produced a slow frame (DSH_TUI_FRAME_STATS=1).
++  noteRowWindow(end - start, visibleRows.length)
+   noteListGeometry({
+     start,
+     end,
+@@ -1274,10 +1579,6 @@ export function MessageList({
+   // would make ▼ repeat itself forever (the stuck-▼ bug). Reported
+   // post-commit, only when the signature changes.
+   let timelineTurns: TimelineTurn[] = []
+-  let activeTurnIndex: number | null = null
+-  let pinnedTurnIndex: number | null = null
+-  let upTurnIndex: number | null = null
+-  let downTurnIndex: number | null = null
+   const timelineMemoRef = React.useRef<{ key: string; turns: TimelineTurn[] } | null>(null)
+   {
+     // Split into (a) a GEOMETRY-memoized turns list and (b) a per-frame
+@@ -1297,81 +1598,62 @@ export function MessageList({
+     if (memo === null || memo.key !== memoKey) {
+       const previewCache = previewCacheRef.current
+       if (previewCache.size > 2000) previewCache.clear()
+-      // Measured tops for turns INSIDE the fold window (user rows are never
+-      // filtered by the thinking toggle, so a user row absent from
+-      // visibleRows is exactly a folded one).
++      // Include collapsed section tops as navigation proxies: after a jump
++      // to an old chunk, an unloaded section may be BELOW the viewport, not
++      // necessarily in the older fold-window prefix.
+       const measuredTops = new Map<number, number>()
+       for (let i = 0; i < visibleRows.length; i++) {
+         const row = visibleRows[i]!
+-        if (!isTurnRow(row)) continue
++        if (!isTurnRow(row) && row.collapsed !== true) continue
+         measuredTops.set(row.id, base + offsets[i]! + (margins.get(row.id) === true ? 1 : 0))
+       }
+       // Walk ALL rows (not the fold window): the rail must cover the whole
+       // conversation — a tool-heavy session packs 300 rows into a handful
+       // of turns, and window-only turns made the rail show "2-3 nodes".
+-      // Folded turns carry folded:true + top:-1; their tops are unknown
+-      // until revealed (they are all ABOVE the viewport, so active/down
+-      // over measured turns is unaffected; ▲ may name a folded turn — its
+-      // click goes through the reveal path, not scrollTo).
++      // Unprojected turns come from their section's navigation metadata,
++      // not fake user rows. Their summary top is only a navigation proxy:
++      // ticks must still reveal the exact prompt before seeking it.
+       const turns: TimelineTurn[] = []
+-      for (const row of rows) {
+-        if (!isTurnRow(row)) continue
+-        let cached = previewCache.get(row.id)
+-        const imageCount = row.images?.length ?? 0
+-        if (cached === undefined || cached.len !== row.text.length || cached.imageCount !== imageCount || cached.lang !== lang) {
++      const previewOf = (id: number, text: string, imageCount: number): string => {
++        let cached = previewCache.get(id)
++        if (cached === undefined || cached.text !== text || cached.imageCount !== imageCount || cached.lang !== lang) {
+           cached = {
+-            len: row.text.length,
++            text,
+             imageCount,
+             lang,
+-            preview: row.text === '' && imageCount > 0
++            preview: text === '' && imageCount > 0
+               ? t('transcript-image-message', { count: imageCount })
+-              : clipPreview(row.text),
++              : clipPreview(text),
+           }
+-          previewCache.set(row.id, cached)
++          previewCache.set(id, cached)
+         }
++        return cached.preview
++      }
++      for (const row of rows) {
+         const textTop = measuredTops.get(row.id)
+-        if (textTop !== undefined) {
+-          turns.push({ id: row.id, top: textTop, preview: cached.preview })
+-        } else {
+-          turns.push({ id: row.id, top: -1, preview: cached.preview, folded: true })
++        if (row.collapsed === true) {
++          for (const turn of row.collapsedTurns ?? []) {
++            turns.push({ id: turn.id, top: textTop ?? -1, preview: previewOf(turn.id, turn.text, turn.imageCount), folded: true })
++          }
++        } else if (isTurnRow(row)) {
++          turns.push({
++            id: row.id,
++            top: textTop ?? -1,
++            preview: previewOf(row.id, row.text, row.images?.length ?? 0),
++            ...(textTop === undefined ? { folded: true } : {}),
++          })
+         }
+       }
+       timelineMemoRef.current = { key: memoKey, turns }
+     }
+     timelineTurns = timelineMemoRef.current!.turns
+-    // (b) per-frame target scan — pure integer comparisons over the
+-    // memoized list; viewTop is projected (scrollTop + pending) so
+-    // boundary crossings register during wheel bursts, not one drain
+-    // frame late. downId additionally requires top ≤ maxScroll: the
+-    // renderer clamps scrollTop there, so a turn past it could never own
+-    // the top row, and naming it would make ▼ repeat itself forever.
+-    const viewTop = scrollTop + pending
+-    const maxScroll = Math.max(0, (scrollHandle?.getScrollHeight() ?? 0) - viewport)
+-    for (let i = 0; i < timelineTurns.length; i++) {
+-      const t = timelineTurns[i]!
+-      if (t.folded === true) {
+-        // Above the fold ⇒ strictly above the viewport: a legal ▲ target.
+-        upTurnIndex = i
+-        continue
+-      }
+-      if (t.top <= viewTop) activeTurnIndex = i
+-      if (t.top < viewTop) upTurnIndex = i
+-      if (downTurnIndex === null && t.top > viewTop && t.top <= maxScroll) {
+-        downTurnIndex = i
+-      }
+-    }
+-    if (timelineTurns.length > 0 && activeTurnIndex === null) activeTurnIndex = 0
+-    if (activeTurnIndex !== null) {
+-      const active = timelineTurns[activeTurnIndex]!
+-      if (active.folded === true || active.top < viewTop) pinnedTurnIndex = activeTurnIndex
+-    }
+   }
++  // (b) Per-frame navigation scan. Known summary proxies participate in
++  // geometry but still require reveal-and-seek; unknown folded prefixes do not
++  // override a measured active turn. Pending scroll is included during bursts.
+   const timeline: TimelineSnapshot = {
+     turns: timelineTurns,
+-    activeId: activeTurnIndex === null ? null : timelineTurns[activeTurnIndex]!.id,
+-    pinnedId: pinnedTurnIndex === null ? null : timelineTurns[pinnedTurnIndex]!.id,
+-    upId: upTurnIndex === null ? null : timelineTurns[upTurnIndex]!.id,
+-    downId: downTurnIndex === null ? null : timelineTurns[downTurnIndex]!.id,
++    ...timelineTargets(timelineTurns, scrollTop + pending, Math.max(0, (scrollHandle?.getScrollHeight() ?? 0) - viewport)),
+   }
+   const lastTimelineReportRef = React.useRef<TimelineSnapshot | null>(null)
+   React.useEffect(() => {
+@@ -1408,6 +1690,8 @@ export function MessageList({
+   // mounted coverage so burst scrolls never show blank spacer.
+   React.useLayoutEffect(() => {
+     let changed = false
++    const seekTop = forceMountRowId == null ? undefined : localRefs.current.get(forceMountRowId)?.yogaNode?.getComputedTop()
++    let seekPrefixChanged = false
+     // Mounted ⇒ painted: record rows eligible for window skipping.
+     const paintedOnce = paintedOnceRef.current
+     for (const id of localRefs.current.keys()) {
+@@ -1420,6 +1704,7 @@ export function MessageList({
+           const oldest = heightsRef.current.keys().next().value
+           if (oldest !== undefined) heightsRef.current.delete(oldest)
+         }
++        if (seekTop === undefined || (el.yogaNode?.getComputedTop() ?? 0) <= seekTop) seekPrefixChanged = true
+         heightsRef.current.set(id, h)
+         heightsVersionRef.current++
+         changed = true
+@@ -1434,6 +1719,7 @@ export function MessageList({
+       if (baseRef.current !== measured) {
+         baseRef.current = measured
+         changed = true
++        seekPrefixChanged = true
+       }
+     }
+     if (scrollHandle) {
+@@ -1480,8 +1766,8 @@ export function MessageList({
+       const anchorBase = baseRef.current ?? base
+       let anchoredTop = scrollHandle.getScrollTop()
+       if (
+-        prevAnchor !== null && prevAnchor.top <= prevAnchor.scrollTop &&
+-        visibleRows[prevAnchor.index]?.id === prevAnchor.id &&
++        prevAnchor !== null && anchorIndex >= 0 && anchorOwnsTop &&
++        visibleRows[anchorIndex]?.id === prevAnchor.id &&
+         !scrollHandle.isSticky() && scrollHandle.getPendingDelta() === 0 &&
+         anchoredTop === prevAnchor.scrollTop
+       ) {
+@@ -1517,7 +1803,7 @@ export function MessageList({
+     // render-time offset estimate can be stale by the time the reader lands on
+     // a band of digest rows, and expanding a chunk above the fold looks like
+     // nothing happened.
+-    if (autoLoadArmedRef.current) {
++    if (autoLoadArmedRef.current && !seekSettleRef.current) {
+       const viewTop = scrollHandle?.getScrollTop()
+       if (!sticky && viewTop !== undefined && onRevealCollapsed !== undefined) {
+         const middle = viewTop + viewport / 2
+@@ -1530,6 +1816,10 @@ export function MessageList({
+           const top = yoga?.getComputedTop()
+           const height = yoga?.getComputedHeight()
+           if (top === undefined || height === undefined) continue
++          // Overscan mounts rows outside the viewport too. Only a digest the
++          // reader can actually see should trigger projection, not a nearby
++          // hidden section after a rail seek.
++          if (top + height <= viewTop || top >= viewTop + viewport) continue
+           const distance = Math.abs(top + height / 2 - middle)
+           if (distance >= bestDistance) continue
+           bestDistance = distance
+@@ -1550,6 +1840,12 @@ export function MessageList({
+         setMeasureTick(t => t + 1)
+       }, 0)
+     }
++    // A streaming tail below the destination must not starve a historical
++    // seek. Only the destination/prefix geometry can move its text top.
++    const seekGeometrySettled = !changed || (seekTop !== undefined && !seekPrefixChanged)
++    if (seekGeometrySettled && (measureTimerRef.current === null || (!seekPrefixChanged && growingStreamNeedsMeasure)) && forceMountRowId != null) {
++      if (localRefs.current.has(forceMountRowId)) onSeekReady?.(forceMountRowId, margins.get(forceMountRowId) === true ? 1 : 0)
++    }
+     // History-paint continuation (main-screen open): more never-painted
+     // batches remain — schedule the next slice on the macrotask queue so
+     // pending input events (wheel, keys) drain between batches and the app
+@@ -1632,6 +1928,7 @@ export function MessageList({
+           const subagent = row.kind === 'subagent' ? row.subagent : undefined
+           const job = row.kind === 'job' ? row.job : undefined
+           const jobGroup = row.kind === 'job' ? row.jobGroup : undefined
++          const subagentGroup = row.kind === 'subagent' ? row.subagentGroup : undefined
+           const revealVersion = smoothStreaming && row.kind === 'tool' && row.fresh === true &&
+             row.tool?.status === 'running' && row.tool.resultView === undefined
+             ? getRevealVersion()
+@@ -1674,12 +1971,16 @@ export function MessageList({
+               marginTopOnTurn={marginTopOnTurn}
+               isSelected={selectedId === row.id}
+               isExpanded={expandedRows.has(row.id)}
++              expandedCodePaths={expandedCodePaths.get(row.id)}
++              closedGlobalCodePaths={closedGlobalCodePaths.get(row.id)}
++              onToggleCodePath={onToggleCodePath}
+               expanded={expanded}
+               model={model}
+               diffLayout={diffLayout}
+               thinkingFold={thinkingFold}
+               toolBackground={toolBackground}
+               foldTerminalCommand={foldTerminalCommand}
++              restoredRow={row.restored === true}
+               smoothStreaming={smoothStreaming}
+               fresh={row.fresh === true}
+               revealVersion={revealVersion}
+@@ -1706,6 +2007,9 @@ export function MessageList({
+               subagent={subagent}
+               job={job}
+               jobGroup={jobGroup}
++              subagentGroup={subagentGroup}
++              collapsedDigest={row.collapsed === true}
++              onRevealCollapsed={onRevealCollapsed}
+               onToggleRow={onToggleRow}
+               onToggleStreamView={onToggleStreamView}
+               streamViewToggled={streamViewToggledRows.has(row.id)}
+@@ -1760,6 +2064,9 @@ type MemoRowProps = {
+   marginTopOnTurn: boolean
+   isSelected: boolean
+   isExpanded: boolean
++  expandedCodePaths: ReadonlySet<string> | undefined
++  closedGlobalCodePaths: ReadonlySet<string> | undefined
++  onToggleCodePath: ((rowId: number, path: string, forceExpanded: boolean) => void) | undefined
+   expanded: boolean
+   model: string
+   /** Edit/Write diff presentation preference (forwarded to tool cards). */
+@@ -1774,6 +2081,12 @@ type MemoRowProps = {
+   toolBackground: ToolBackground
+   /** Terminal-card header folding (forwarded to tool cards). */
+   foldTerminalCommand: boolean
++  /** Row restored from the session log (a revealed history chunk or a
++   *  window-cap restore). Historical rows read as a DIGEST by default: their
++   *  multi-line commands fold even when `foldTerminalCommand` is off, because
++   *  a revealed chunk mounts whole and 50 rounds of pasted scripts is exactly
++   *  the cheap content the default view should not lay out. */
++  restoredRow: boolean
+   /** Working-activity preset name; drives the subagent card's running glyph. */
+   activityFrames: string | undefined
+   background: 'messageActionsBackground' | undefined
+@@ -1814,6 +2127,14 @@ type MemoRowProps = {
+   job: JobRow | undefined
+   /** Group decoration for a run of consecutive job cards (see JobGroupRow). */
+   jobGroup: JobGroupRow | undefined
++  /** Group decoration for a run of consecutive subagent cards (see
++   *  SubagentGroupRow): the fan-out header and its fold state. */
++  subagentGroup: SubagentGroupRow | undefined
++  /** True on a collapsed history chunk's digest line: the line is then the
++   *  load control for that chunk (see the 'notice' case). */
++  collapsedDigest: boolean
++  /** Project the chunk owning a digest row without leaving the reading spot. */
++  onRevealCollapsed: ((rowId: number) => void) | undefined
+   onToggleRow: (rowId: number) => void
+   /** 流式 reasoning 行在三行预览/全文间切换；落定行用 onToggleRow。 */
+   onToggleStreamView: (rowId: number) => void
+@@ -1831,11 +2152,12 @@ type MemoRowProps = {
+ 
+ /** Load-earlier / show-previous divider row with a mouse hover tint — the
+  *  clickability is otherwise invisible (audit C-04). */
+-function ClickableDivider({ title, onClick }: { title: string; onClick?: () => void }): React.ReactNode {
++function ClickableDivider({ title, onClick, innerRef }: { title: string; onClick?: () => void; innerRef?: (el: DOMElement | null) => void }): React.ReactNode {
+   const [hovered, setHovered] = useState(false)
+   return (
+     <Box
+       marginTop={1}
++      ref={innerRef}
+       onClick={onClick}
+       onMouseEnter={() => setHovered(true)}
+       onMouseLeave={() => setHovered(false)}
+@@ -1865,6 +2187,9 @@ function TranscriptRow({
+   marginTopOnTurn,
+   isSelected,
+   isExpanded,
++  expandedCodePaths,
++  closedGlobalCodePaths,
++  onToggleCodePath,
+   expanded,
+   model,
+   diffLayout,
+@@ -1874,6 +2199,7 @@ function TranscriptRow({
+   thinkingFold,
+   toolBackground,
+   foldTerminalCommand,
++  restoredRow,
+   activityFrames,
+   background,
+   toolCallId,
+@@ -1897,6 +2223,9 @@ function TranscriptRow({
+   subagent,
+   job,
+   jobGroup,
++  subagentGroup,
++  collapsedDigest,
++  onRevealCollapsed,
+   onToggleRow,
+   onToggleStreamView,
+   streamViewToggled,
+@@ -1924,6 +2253,13 @@ function TranscriptRow({
+     if (event.cellIsBlank) return
+     onToggleRow(rowId)
+   }, [onToggleRow, rowId])
++  const codeOnClick = React.useCallback((path: string, event: ClickEvent): void => {
++    if (event.cellIsBlank) return
++    // A long-line-folded assistant has a clickable ancestor; this gesture
++    // belongs to the fence, not that row. Drags never dispatch a click.
++    event.stopImmediatePropagation()
++    onToggleCodePath?.(rowId, path, expanded || isExpanded)
++  }, [onToggleCodePath, rowId, expanded, isExpanded])
+   // 当前回合仍展开的 reasoning 行：点击在三行预览/全文间切换。它反转
+   // thinkingFold 的默认值，回合落定后语义自动回到 foldOnClick。
+   const streamViewOnClick = React.useCallback((event: ClickEvent): void => {
+@@ -1935,6 +2271,10 @@ function TranscriptRow({
+   const toggleJobGroup = React.useCallback((): void => {
+     onToggleRow(rowId)
+   }, [onToggleRow, rowId])
++  // 子代理组：组头行折叠/展开整组，与任务组同一套手势。
++  const toggleSubagentGroup = React.useCallback((): void => {
++    onToggleRow(rowId)
++  }, [onToggleRow, rowId])
+   // 子代理卡：点击打开详情场景（不是折叠）。
+   const openSubagent = React.useCallback(() => {
+     if (subagent !== undefined) onOpenSubagent?.(subagent.agentId)
+@@ -1948,23 +2288,25 @@ function TranscriptRow({
+   // frame. Ctrl+O (global) AND a row click (per-row, the same `expandedRows`
+   // gesture message-selection mode uses) both paint the raw text again.
+   // Reasoning rows are deliberately excluded: their preview is already a fixed
+-  // three-row ticker. Tool cards fold inside their own header/body
+-  // (AssistantToolUseMessage), whose text never rides this prop.
++  // three-row ticker. Tool cards fold inside their own header/body. Streaming
++  // assistant text skips this outer line fold; StreamingMarkdown still has a
++  // separate unstable-suffix limit that must be addressed independently.
+   // `lang` is a dependency because the fold marker is localized: a row that
+   // re-renders unchanged after /lang must not keep the previous language.
+   const lang = getLang()
+-  const foldable = kind !== 'reasoning' && kind !== 'tool'
++  const foldable = kind !== 'reasoning' && kind !== 'tool' && !(kind === 'assistant' && streaming)
+   const folded = React.useMemo(
+     () => (foldable ? foldLongLines(text) : { text, hiddenChars: 0, foldedLines: 0 }),
+     [foldable, text, lang],
+   )
+   const displayText = expanded || isExpanded ? text : folded.text
+-  // Mouse toggle: only a row that ACTUALLY hides something is clickable (an
+-  // ordinary message stays inert so plain clicks and drag-selection keep
+-  // working there). A streaming row is clickable too — the same contract the
+-  // tool card has while running: the click paints the full ARRIVED text, and
+-  // the reveal keeps growing it.
++  // Only a row that actually hides a long line gets the row-level toggle.
++  // Assistant streaming rows are excluded from the line fold above.
+   const foldClickable = foldable && folded.hiddenChars > 0
++  // Historical rows (restored from the log: a revealed chunk, a window-cap
++  // restore) read as digests until the reader opens them — Ctrl+O or the
++  // card's own click. Live rows keep the reader's configured presentation.
++  const compactHistory = restoredRow && !isExpanded && !expanded
+ 
+   switch (kind) {
+     case 'user':
+@@ -2044,6 +2386,12 @@ function TranscriptRow({
+             marginTopOnTurn={marginTopOnTurn}
+             isSelected={isSelected}
+             isExpanded={isExpanded}
++            // Ctrl+O / row expansion temporarily exposes all fences; clicks
++            // otherwise change only this row's structural token path.
++            foldedCode={!expanded && !isExpanded}
++            expandedCodePaths={expandedCodePaths}
++            closedGlobalCodePaths={closedGlobalCodePaths}
++            onToggleCodePath={onToggleCodePath === undefined ? undefined : codeOnClick}
+           />
+           {images !== undefined && <TranscriptImages images={images} onPreview={onPreviewImage} suppressGraphics={suppressImageGraphics} />}
+         </Box>
+@@ -2115,7 +2463,11 @@ function TranscriptRow({
+             smoothReveal={smoothStreaming}
+             fresh={fresh}
+             revealVersion={revealVersion}
+-            foldTerminalCommand={foldTerminalCommand}
++            foldTerminalCommand={foldTerminalCommand || compactHistory}
++            // Restored rows read as one-line digests: the chunk reveal mounts
++            // the whole block at once, and the row click (below) is the
++            // expand gesture for the full body.
++            digestLines={compactHistory ? 1 : undefined}
+             onClick={foldOnClick}
+             onOpenFile={onOpenFile}
+             images={images}
+@@ -2128,6 +2480,20 @@ function TranscriptRow({
+       )
+     }
+     case 'notice':
++      // A collapsed history chunk's digest line IS the load control for that
++      // chunk: the click projects the chunk in place (the same backend call a
++      // rail tick and load-on-sight make), so reading old history never needs
++      // scrolling to the top for the "load earlier" pager first. The hover
++      // tint is the only affordance a one-line divider can carry.
++      if (collapsedDigest && onRevealCollapsed !== undefined) {
++        return (
++          <ClickableDivider
++            title={` ${displayText} `}
++            innerRef={ref}
++            onClick={() => onRevealCollapsed(rowId)}
++          />
++        )
++      }
+       return (
+         <Box marginTop={1} ref={ref} onClick={foldClickable ? foldOnClick : undefined}>
+           <Divider title={` ${displayText} `} />
+@@ -2189,20 +2555,31 @@ function TranscriptRow({
+           )}
+         </Box>
+       )
+-    case 'subagent':
++    case 'subagent': {
+       if (!subagent) return null
++      const groupHead = subagentGroup !== undefined && subagentGroup.head
+       return (
+-        <Box flexDirection="column" ref={ref}>
+-          <SubagentMessage
+-            subagent={subagent}
+-            marginTopOnTurn={marginTopOnTurn}
+-            activityFrames={activityFrames}
+-            isExpanded={isExpanded}
+-            onClick={openSubagent}
+-            onOpenView={onOpenSubagentView === undefined ? undefined : () => onOpenSubagentView(subagent.agentId, rowId)}
+-          />
++        <Box
++          flexDirection="column"
++          // The head's block margin moves UP to the group: the summary line
++          // is what separates the run from what precedes it.
++          marginTop={groupHead && marginTopOnTurn ? 1 : 0}
++          ref={ref}
++        >
++          {groupHead && <SubagentGroupHeader group={subagentGroup} onToggle={toggleSubagentGroup} />}
++          {groupHead && subagentGroup.folded ? null : (
++            <SubagentMessage
++              subagent={subagent}
++              marginTopOnTurn={groupHead ? false : marginTopOnTurn}
++              activityFrames={activityFrames}
++              isExpanded={isExpanded}
++              onClick={openSubagent}
++              onOpenView={onOpenSubagentView === undefined ? undefined : () => onOpenSubagentView(subagent.agentId, rowId)}
++            />
++          )}
+         </Box>
+       )
++    }
+     case 'job': {
+       if (!job) return null
+       // A grouped run renders as ONE block: the head row carries the summary
+diff --git a/src/dsh-adapter/backend/history-chunks.ts b/src/dsh-adapter/backend/history-chunks.ts
+index 53f6fa1d..10406f14 100644
+--- a/src/dsh-adapter/backend/history-chunks.ts
++++ b/src/dsh-adapter/backend/history-chunks.ts
+@@ -4,8 +4,9 @@
+  *
+  * The replay cost of a long session is the per-event fold over hundreds of MB
+  * of message and tool text (measured on an 89k-event / 447 MB record: 1,766 ms
+- * to 27,907 rows), never the row count — rendering is already bounded by
+- * `MAX_ROWS` / `RENDERED_ROW_CAP`, and dropping the rows saved 34 ms. So the
++ * to 27,907 rows), never the row count — the default rendered row window is
++ * bounded by `RENDERED_ROW_CAP`, and dropping the rows saved 34 ms. `MAX_ROWS`
++ * folds older text; it does not cap the number of row objects. So the
+  * record is cut into round-aligned chunks and only the NEWEST chunk is
+  * projected for the first paint. Every older chunk contributes exactly ONE
+  * digest row (kind `notice`, `collapsed: true`: a plain text report, no tool
+@@ -25,12 +26,15 @@
+  * localized digest text.
+  */
+ 
+-import type { ChatRow } from '../../adapter/ports/channel-view.js'
++import type { ChatRow, CollapsedTurn } from '../../adapter/ports/channel-view.js'
+ import type { AgentEvent } from '../../agent/events.js'
+ 
+ /** Rounds in the newest chunk: small on purpose. It is the only chunk
+- *  projected before the transcript opens, so its size is the open latency. */
+-export const OPEN_ROUNDS = 10
++ *  projected before the transcript opens, so its size is the open latency.
++ *  Two rounds is the reading default — the reader lands on the newest
++ *  exchange. Every older turn is one rail tick / digest row away and loads
++ *  its own chunk on click (`revealRow`), so opening less loses nothing. */
++export const OPEN_ROUNDS = 2
+ 
+ /** Characters in the newest chunk: same reason, for text-heavy rounds. */
+ export const OPEN_CHARS = 200_000
+@@ -97,7 +101,7 @@ function textChars(event: AgentEvent): number {
+  *  message does, whatever its source — a human prompt, a goal continuation
+  *  (`injected`) or a compaction boundary. Cutting at the invisible ones keeps
+  *  a long goal-driven run from collapsing into one huge chunk, at no cost to
+- *  the transcript: a collapsed chunk paints only its digest and its prompts. */
++ *  the transcript: a collapsed chunk paints only its digest. */
+ function startsRound(event: AgentEvent): boolean {
+   return event.type === 'user.message'
+ }
+@@ -211,6 +215,21 @@ export function chunkForRow(chunks: readonly HistoryChunk[], rowId: number): His
+ export function placeholderRows(
+   chunk: HistoryChunk,
+   digest: (chunk: HistoryChunk) => string,
++  entries: readonly AgentEvent[],
+ ): ChatRow[] {
+-  return [{ id: chunk.idBase, kind: 'notice', text: digest(chunk), restored: true, collapsed: true }]
++  const collapsedTurns: CollapsedTurn[] = []
++  // A separate namespace below EVERY chunk row, not guessed projected ids:
++  // tool cards and hidden inputs make an event offset differ from a row offset.
++  // The global entry index makes handles unique across chunks; loading can
++  // resolve them by durable seq, even if a stale tick is clicked after loading.
++  const oldestIdBase = chunk.idBase - chunk.index * ID_STRIDE
++  for (let index = chunk.start; index < chunk.end; index += 1) {
++    const event = entries[index]!
++    if (event.type !== 'user.message' || event.source !== 'user') continue
++    const imageCount = event.images?.length ?? 0
++    // Match the shared projector's visible human-prompt predicate exactly.
++    if (event.text === '' && imageCount === 0) continue
++    collapsedTurns.push({ id: oldestIdBase - index - 1, seq: event.seq, text: event.text, imageCount })
++  }
++  return [{ id: chunk.idBase, kind: 'notice', text: digest(chunk), restored: true, collapsed: true, collapsedTurns }]
+ }
+diff --git a/src/dsh-adapter/channel.ts b/src/dsh-adapter/channel.ts
+index c6301266..6572c431 100644
+--- a/src/dsh-adapter/channel.ts
++++ b/src/dsh-adapter/channel.ts
+@@ -71,5 +71,5 @@ export function createChannel(
+ export type { ChannelLaunchOptions } from './channel/state.js'
+ export { expandMentions } from './channel/mentions.js'
+ export { sessionCwdMatches } from './channel/paths.js'
+-export type { AgentViewDispatchResult, AgentViewRow, AgentViewStatus, BackgroundResult, BackendModeOption, BackendChannelOption, Channel, ChannelGoal, ChannelState, ChatRow, ComposerImageRef, ComposerSubmission, CredentialStatus, EffortOption, ExternalCommandOutcome, JobControl, JobGroupRow, JobRow, LoadedContext, LoadedContextEntry, LoadedContextFile, LoadedContextSkill, LoadedContextTool, MentionAttachments, MentionExpansion, MentionFs, NotificationItem, PendingMessage, PermissionPresetAvailability, PermissionPresetCurrent, PermissionPresetOption, PermissionPresetSnapshot, PresetOption, ResumeResult, SkillInfo, StagedImageHandle, StagedImageInput, SubagentControl, SubagentRow, TodoPanelItem, TokenBucket, TokenUsage, ToolCallView, ToolFileDiff, ToolResultView, ToolRow, ToolViewPresenter, TranscriptImage } from './channel/types.js'
++export type { AgentViewDispatchResult, AgentViewRow, AgentViewStatus, BackgroundResult, BackendModeOption, BackendChannelOption, Channel, ChannelGoal, ChannelState, ChatRow, ComposerImageRef, ComposerSubmission, CredentialStatus, EffortOption, ExternalCommandOutcome, JobControl, JobGroupRow, SubagentGroupRow, JobRow, LoadedContext, LoadedContextEntry, LoadedContextFile, LoadedContextSkill, LoadedContextTool, MentionAttachments, MentionExpansion, MentionFs, NotificationItem, PendingMessage, PermissionPresetAvailability, PermissionPresetCurrent, PermissionPresetOption, PermissionPresetSnapshot, PresetOption, ResumeResult, SkillInfo, StagedImageHandle, StagedImageInput, SubagentControl, SubagentRow, TodoPanelItem, TokenBucket, TokenUsage, ToolCallView, ToolFileDiff, ToolResultView, ToolRow, ToolViewPresenter, TranscriptImage } from './channel/types.js'
+ export { emptyTokenUsage } from './channel/usage.js'
+diff --git a/src/dsh-adapter/channel/extensions.ts b/src/dsh-adapter/channel/extensions.ts
+index 02174b1d..27e51693 100644
+--- a/src/dsh-adapter/channel/extensions.ts
++++ b/src/dsh-adapter/channel/extensions.ts
+@@ -379,12 +379,24 @@ export function attachDshExtensions(
+ 
+   // The bound session's translated record, cut into chunks by the seed replay
+   // (see `replaySessionSeed`): the newest chunk is projected for the first
+-  // paint, every older one is represented by its digest row plus its prompt
+-  // rows until "load earlier" projects it in place.
++  // paint, every older one has one digest row and navigation-only prompt
++  // metadata until a reveal projects it in place.
+   let seedChunks: readonly HistoryChunk[] | undefined
+   let seedEntries: readonly AgentEvent[] = []
+   const loadedChunks = new Set<number>()
+   const placeholderCounts = new Map<number, number>()
++  /** Rows a projected chunk currently occupies (its digest line included),
++   *  so folding it back replaces exactly its own slice. */
++  const chunkSpans = new Map<number, number>()
++  /** Reveal recency per projected chunk: the LRU key for eviction. */
++  const chunkTouched = new Map<number, number>()
++  let touchSeq = 0
++  /** Projected chunks kept resident. Beyond this the least recently revealed
++   *  one folds back to its digest line; scrolling onto it reloads on sight. */
++  const MAX_LOADED_CHUNKS = 6
++  // Keep aliases until the next seed/clear: a tick already painted before an
++  // on-sight load must still seek its exact prompt, not a colliding row offset.
++  const turnTargets = new Map<number, { readonly chunk: HistoryChunk; readonly seq: number }>()
+   /**
+    * Presenting a settled result's card costs real time on a long record
+    * (`presentResultView` over 16k results is ~730 ms of a 1.8 s titan
+@@ -434,10 +446,57 @@ export function attachDshExtensions(
+     state.rows.splice(at, placeholderCounts.get(chunk.index) ?? 1, ...rows)
+     loadedChunks.add(chunk.index)
+     placeholderCounts.delete(chunk.index)
++    chunkSpans.set(chunk.index, rows.length)
++    chunkTouched.set(chunk.index, ++touchSeq)
+     markChannelReadDirty(state.rows)
+     return rows.length
+   }
+ 
++  /** Put one projected chunk back behind its digest line. Rows are only a
++   *  cache: the durable log still holds the chunk, and scrolling back onto the
++   *  digest re-projects it on sight (MessageList's load-on-sight → revealRow),
++   *  so nothing the reader can see is lost. */
++  const foldChunkBack = (chunk: HistoryChunk): void => {
++    const at = state.rows.findIndex(row => row.id === chunk.idBase)
++    if (at < 0) return
++    const rows = placeholderRows(chunk, collapsed => chunkDigest(collapsed, false), seedEntries)
++    for (const turn of rows[0]!.collapsedTurns!) turnTargets.set(turn.id, { chunk, seq: turn.seq })
++    state.rows.splice(at, chunkSpans.get(chunk.index) ?? 1, ...rows)
++    placeholderCounts.set(chunk.index, rows.length)
++    chunkSpans.delete(chunk.index)
++    chunkTouched.delete(chunk.index)
++    loadedChunks.delete(chunk.index)
++    markChannelReadDirty(state.rows)
++  }
++
++  /** Keep the projected-chunk window bounded. Every reveal used to leave its
++   *  chunk permanently spliced into the row array, so a reader who clicked
++   *  through rail ticks grew the transcript without limit: row count is the
++   *  O(rows) term of every frame's geometry pass, which is why a long-running
++   *  TUI got slower the more of the conversation it had loaded. The newest
++   *  chunk (the live tail) is never evicted, and neither is the chunk the
++   *  caller just asked for. */
++  const evictStaleChunks = (keep: HistoryChunk): void => {
++    if (seedChunks === undefined) return
++    const newest = seedChunks[seedChunks.length - 1]
++    while (loadedChunks.size > MAX_LOADED_CHUNKS) {
++      let victim: HistoryChunk | undefined
++      let victimTouch = Number.POSITIVE_INFINITY
++      for (const chunk of seedChunks) {
++        if (!loadedChunks.has(chunk.index)) continue
++        if (chunk.index === keep.index) continue
++        if (newest !== undefined && chunk.index === newest.index) continue
++        const touched = chunkTouched.get(chunk.index) ?? 0
++        if (touched < victimTouch) {
++          victimTouch = touched
++          victim = chunk
++        }
++      }
++      if (victim === undefined) return
++      foldChunkBack(victim)
++    }
++  }
++
+   /**
+    * Load the next older chunk in place, replacing its placeholder rows —
+    * "load earlier" for a chunked seed. Returns the rows that materialized so
+@@ -448,7 +507,9 @@ export function attachDshExtensions(
+     for (let index = seedChunks.length - 1; index >= 0; index -= 1) {
+       const chunk = seedChunks[index]!
+       if (loadedChunks.has(chunk.index)) continue
+-      return materializeChunk(chunk)
++      const loaded = materializeChunk(chunk)
++      if (loaded > 0) evictStaleChunks(chunk)
++      return loaded
+     }
+     return 0
+   }
+@@ -458,22 +519,26 @@ export function attachDshExtensions(
+    * transcript calls when a collapsed section line scrolls into view (and what
+    * a timeline tick on such a turn calls): only that one chunk is projected,
+    * never the rest of the history — expanding all of it is what made a reveal
+-   * crawl on a titan record. Returns the id of the digest line that the loaded
+-   * chunk now owns (it survives materialization: `idBase` is the chunk's first
+-   * row either way), so a caller can keep the reader anchored; 0 = nothing to
+-   * reveal (a live row, an already loaded chunk, a stale plan).
++   * crawl on a titan record. Returns the exact prompt row for a navigation
++   * handle, or the surviving digest id for an on-sight section reveal;
++   * 0 = nothing to reveal (a live row, an already loaded real row, a stale plan).
+    */
+   const revealChunkRow = (rowId: number): number => {
+     if (seedChunks === undefined) return 0
+-    const chunk = chunkForRow(seedChunks, rowId)
+-    if (chunk === undefined || loadedChunks.has(chunk.index)) return 0
+-    const loaded = materializeChunk(chunk)
+-    if (loaded === 0) return 0
+-    // The reader is already looking at this line: without the emit the splice
+-    // lands in `state.rows` but no view commit follows, so the digest line
+-    // stays painted until the next wheel tick — the reveal looked like a no-op.
+-    state.emit()
+-    return chunk.idBase
++    const target = turnTargets.get(rowId)
++    const chunk = target?.chunk ?? chunkForRow(seedChunks, rowId)
++    if (chunk === undefined) return 0
++    if (!loadedChunks.has(chunk.index)) {
++      if (materializeChunk(chunk) === 0) return 0
++      evictStaleChunks(chunk)
++      // The splice must publish before the force-mount/seek, without waiting
++      // for another input (also used by load-on-sight).
++      state.emit()
++    } else if (target === undefined) return 0
++    if (target === undefined) return chunk.idBase
++    // Event offsets are not projected row offsets. Resolve the exact human
++    // prompt after projection, not the section heading or the first prompt.
++    return state.rows.find(row => row.kind === 'user' && row.label !== 'team-message' && row.seq === target.seq)?.id ?? 0
+   }
+ 
+   const dshLocal = createLocalActions({
+@@ -514,6 +579,14 @@ export function attachDshExtensions(
+     // The DSH workspace may be remote: no local-disk stand-in for `fs`.
+     localFs: false,
+     dropRows: () => {
++      seedChunks = undefined
++      seedEntries = []
++      loadedChunks.clear()
++      placeholderCounts.clear()
++      chunkSpans.clear()
++      chunkTouched.clear()
++      turnTargets.clear()
++      presentDeferredResults = entries => entries
+       subagentProjection.dropRows()
+       jobProjection.dropRows()
+     },
+@@ -658,8 +731,8 @@ export function attachDshExtensions(
+     // record: 1,766 ms for 27,907 rows). Dropping the rows does not help — the
+     // cost is the per-event fold over ~335 MB of message and tool text — so
+     // the pass itself is what has to shrink. The record is cut into turn-
+-    // aligned chunks (history-chunks.ts); every older chunk keeps a digest row
+-    // and its prompt rows, and "load earlier" projects it in place.
++    // aligned chunks (history-chunks.ts); every older chunk keeps one digest
++    // row with navigation-only prompt metadata, and loads in place on demand.
+     markBoot('seed-enter')
+     const entries = dshNative().translateReplay(events, { present: false })
+     markBoot('translate-done')
+@@ -667,6 +740,9 @@ export function attachDshExtensions(
+     seedChunks = planChunks(entries)
+     loadedChunks.clear()
+     placeholderCounts.clear()
++    chunkSpans.clear()
++    chunkTouched.clear()
++    turnTargets.clear()
+     // What a deferred card payload needs: the call's name and arguments (its
+     // presenter input) and the raw result event. Raw events outlive the seed
+     // in the caller anyway; these two indexes only hold references to them.
+@@ -714,7 +790,8 @@ export function attachDshExtensions(
+     state.rows.length = 0
+     for (const chunk of seedChunks) {
+       if (chunk.index === newest.index) continue
+-      const rows = placeholderRows(chunk, collapsed => chunkDigest(collapsed, false))
++      const rows = placeholderRows(chunk, collapsed => chunkDigest(collapsed, false), entries)
++      for (const turn of rows[0]!.collapsedTurns!) turnTargets.set(turn.id, { chunk, seq: turn.seq })
+       placeholderCounts.set(chunk.index, rows.length)
+       state.rows.push(...rows)
+     }
+diff --git a/src/dsh-adapter/channel/transcript.ts b/src/dsh-adapter/channel/transcript.ts
+index d3352513..826ea644 100644
+--- a/src/dsh-adapter/channel/transcript.ts
++++ b/src/dsh-adapter/channel/transcript.ts
+@@ -1,5 +1,6 @@
+ import { type SessionEvent } from '@deepseek-ai/dsh-session'
+ import { toolResultPayload } from '../compat/messages.js'
++import { withoutTeammateReminder } from '../compat/agent-team-0.2.0.js'
+ import { t } from '../../i18n.js'
+ import type { ChatRow, ToolResultView, ToolViewPresenter } from './types.js'
+ import { markChannelReadDirty } from '../../adapter/channel/read-view.js'
+@@ -9,6 +10,8 @@ import { ARGS_PREVIEW_LIMIT, LOCAL_OUTPUT_LIMIT, MAX_ROWS, preview, previewInden
+ // re-exported here for the existing importers.
+ export { ARGS_PREVIEW_LIMIT, LOCAL_OUTPUT_LIMIT, MAX_ROWS, preview, previewIndented, RESULT_PREVIEW_LIMIT, trimLocalRows }
+ 
++const ROW_TEXT_PREVIEW_LIMIT = 200
++
+ /**
+  * Fold the oldest rows beyond the transcript window cap: drop each row's
+  * full-text fields (assistant/reasoning text, tool args/results) and keep
+@@ -69,7 +72,7 @@ export function foldRows(
+     } else if (row.text.length > 0) {
+       // Keep a short preview so the transcript reads naturally; the full
+       // text lives in the session log and is restored by loadOlder().
+-      row.text = preview(row.text, 200)
++      row.text = preview(row.text, ROW_TEXT_PREVIEW_LIMIT)
+     }
+     markChannelReadDirty(row)
+     markChannelReadDirty(rows)
+@@ -101,6 +104,7 @@ export function foldBack(rows: ChatRow[], events: readonly SessionEvent[], views
+   // click, budgeted at ≤50 ms. Every lookup below is a map hit or a binary
+   // search, so the cost is O(events + folded × log messages): 43.6 ms for the
+   // same input.
++  const usersBySeq = new Map<number, SessionEvent<'user/message'>>()
+   const callsBySeq = new Map<number, SessionEvent<'tool/call'>>()
+   // tool results are matched by callId, not seq, because the result event
+   // seq differs from the call event seq that anchored the row.
+@@ -114,7 +118,12 @@ export function foldBack(rows: ChatRow[], events: readonly SessionEvent[], views
+   let ordered = true
+   let lastSeq = -Infinity
+   for (const event of events) {
+-    if (event.seq < firstFoldedSeq) continue
++    // User rows may be out of seq order, unlike the existing bounded
++    // assistant/tool window. Keep the first user event at each seq.
++    if (event.seq < firstFoldedSeq) {
++      if (event.type === 'user/message' && !usersBySeq.has(event.seq)) usersBySeq.set(event.seq, event)
++      continue
++    }
+     if (event.type === 'tool/call') {
+       // Only a call can answer a tool row, and the first one at a seq wins —
+       // the same filters the per-row scan applied before this change.
+@@ -125,6 +134,8 @@ export function foldBack(rows: ChatRow[], events: readonly SessionEvent[], views
+       if (event.seq < lastSeq) ordered = false
+       lastSeq = event.seq
+       messages.push(event)
++    } else if (event.type === 'user/message' && !usersBySeq.has(event.seq)) {
++      usersBySeq.set(event.seq, event)
+     }
+   }
+   // A stable sort keeps array order among equal seqs, which is the event the
+@@ -145,6 +156,32 @@ export function foldBack(rows: ChatRow[], events: readonly SessionEvent[], views
+   for (const row of folded) {
+     const rowSeq = row.seq
+     if (rowSeq === undefined) continue
++    if (row.kind === 'user') {
++      const event = usersBySeq.get(rowSeq)
++      // Team/other sources have different projection rules. Never guess.
++      if (event === undefined || row.label === 'team-message') continue
++      const data = event.data as SessionEvent<'user/message'>['data'] | null | undefined
++      if (data?.source?.kind !== 'user' || !Array.isArray(data.content)) continue
++      if (data.content.some(block => block === null || typeof block !== 'object' || (block.type === 'text' && typeof block.text !== 'string'))) continue
++      const firstText = (content: SessionEvent<'user/message'>['data']['content']): string =>
++        content.find(block => block.type === 'text')?.text.trim() ?? ''
++      // The translator strips a legacy teammate identity block only on its
++      // first human prompt. The fold window cannot establish that state, so
++      // accept only the unique candidate consistent with the existing preview.
++      const original = firstText(data.content)
++      const stripped = withoutTeammateReminder(data)
++      const alternate = stripped === data ? original : firstText(stripped.content)
++      const originalMatches = preview(original, ROW_TEXT_PREVIEW_LIMIT) === row.text
++      const alternateMatches = alternate === original ? originalMatches : preview(alternate, ROW_TEXT_PREVIEW_LIMIT) === row.text
++      if (alternate !== original && originalMatches === alternateMatches) continue
++      if (!originalMatches && !alternateMatches) continue
++      row.text = originalMatches ? original : alternate
++      row.folded = false
++      row.restored = true
++      markChannelReadDirty(row)
++      restored += 1
++      continue
++    }
+     if (row.kind === 'tool' && row.tool !== undefined) {
+       // The tool row is anchored on its tool/call seq; its result text comes
+       // from the matching tool/result event.
+@@ -179,15 +216,10 @@ export function foldBack(rows: ChatRow[], events: readonly SessionEvent[], views
+   return restored
+ }
+ 
+-/** Rebuild a folded row's full text from its source session event. */
++/** Rebuild assistant/reasoning/tool content. User rows must go through
++ * foldBack's source and preview checks rather than this unverified helper. */
+ export function restoreRowFromEvent(row: ChatRow, event: SessionEvent): void {
+   switch (row.kind) {
+-    case 'user': {
+-      if (event.type !== 'user/message') break
+-      const text = event.data.content.map(block => block.type === 'text' ? block.text : '').join('').trim()
+-      if (text) row.text = text
+-      break
+-    }
+     case 'assistant': {
+       if (event.type !== 'assistant/message') break
+       const text = event.data.message.content.map(block => block.type === 'text' ? block.text : '').join('').trim()
+diff --git a/src/dsh-adapter/channel/types.ts b/src/dsh-adapter/channel/types.ts
+index 1c558443..10a3c619 100644
+--- a/src/dsh-adapter/channel/types.ts
++++ b/src/dsh-adapter/channel/types.ts
+@@ -1,6 +1,6 @@
+ import type { ChannelUi } from '../../adapter/ports/channel-ui.js'
+-import type { AttachedContext, RawTrajEvent, ChatRow, ToolRow, ToolCallView, ToolFileDiff, ToolResultView, SubagentRow, JobGroupRow, JobRow, TokenUsage, TokenBucket, CostTokenBuckets, SessionCostByModel, SubagentCostEntry, NotificationItem, ChannelGoal, TodoPanelItem, LoadedContext, LoadedContextEntry, LoadedContextFile, LoadedContextSkill, LoadedContextTool, PendingMessage, SubagentControl, SubagentTranscriptView, JobControl, StagedImageInput, StagedImageAdjustment, StagedImageHandle, ComposerImageRef, ComposerSubmission, ExternalCommandOutcome, TranscriptImage, ResumeResult, EffortOption, PermissionPresetSnapshot, PermissionPresetAvailability, PermissionPresetOption, PermissionPresetCurrent, PresetOption, SkillInfo, CredentialStatus, AgentViewRow, AgentViewStatus, AgentViewDispatchResult, BackgroundResult, BackendModeOption, BackendChannelOption, TrajectorySource } from '../../adapter/ports/channel-view.js'
+-export type { AttachedContext, ChatRow, ToolRow, ToolCallView, ToolFileDiff, ToolResultView, SubagentRow, JobGroupRow, JobRow, TokenUsage, TokenBucket, CostTokenBuckets, SessionCostByModel, SubagentCostEntry, NotificationItem, ChannelGoal, TodoPanelItem, LoadedContext, LoadedContextEntry, LoadedContextFile, LoadedContextSkill, LoadedContextTool, PendingMessage, SubagentControl, SubagentTranscriptView, JobControl, StagedImageInput, StagedImageAdjustment, StagedImageHandle, ComposerImageRef, ComposerSubmission, ExternalCommandOutcome, TranscriptImage, ResumeResult, EffortOption, PermissionPresetSnapshot, PermissionPresetAvailability, PermissionPresetOption, PermissionPresetCurrent, PresetOption, SkillInfo, CredentialStatus, AgentViewRow, AgentViewStatus, AgentViewDispatchResult, BackgroundResult, BackendModeOption, BackendChannelOption, TrajectorySource } from '../../adapter/ports/channel-view.js'
++import type { AttachedContext, RawTrajEvent, ChatRow, ToolRow, ToolCallView, ToolFileDiff, ToolResultView, SubagentRow, JobGroupRow, SubagentGroupRow, JobRow, TokenUsage, TokenBucket, CostTokenBuckets, SessionCostByModel, SubagentCostEntry, NotificationItem, ChannelGoal, TodoPanelItem, LoadedContext, LoadedContextEntry, LoadedContextFile, LoadedContextSkill, LoadedContextTool, PendingMessage, SubagentControl, SubagentTranscriptView, JobControl, StagedImageInput, StagedImageAdjustment, StagedImageHandle, ComposerImageRef, ComposerSubmission, ExternalCommandOutcome, TranscriptImage, ResumeResult, EffortOption, PermissionPresetSnapshot, PermissionPresetAvailability, PermissionPresetOption, PermissionPresetCurrent, PresetOption, SkillInfo, CredentialStatus, AgentViewRow, AgentViewStatus, AgentViewDispatchResult, BackgroundResult, BackendModeOption, BackendChannelOption, TrajectorySource } from '../../adapter/ports/channel-view.js'
++export type { AttachedContext, ChatRow, ToolRow, ToolCallView, ToolFileDiff, ToolResultView, SubagentRow, JobGroupRow, SubagentGroupRow, JobRow, TokenUsage, TokenBucket, CostTokenBuckets, SessionCostByModel, SubagentCostEntry, NotificationItem, ChannelGoal, TodoPanelItem, LoadedContext, LoadedContextEntry, LoadedContextFile, LoadedContextSkill, LoadedContextTool, PendingMessage, SubagentControl, SubagentTranscriptView, JobControl, StagedImageInput, StagedImageAdjustment, StagedImageHandle, ComposerImageRef, ComposerSubmission, ExternalCommandOutcome, TranscriptImage, ResumeResult, EffortOption, PermissionPresetSnapshot, PermissionPresetAvailability, PermissionPresetOption, PermissionPresetCurrent, PresetOption, SkillInfo, CredentialStatus, AgentViewRow, AgentViewStatus, AgentViewDispatchResult, BackgroundResult, BackendModeOption, BackendChannelOption, TrajectorySource } from '../../adapter/ports/channel-view.js'
+ import { type AgentStatus } from '@deepseek-ai/dsh-agent'
+ import type { LlmModelInfo, LlmProviderInfo } from '@deepseek-ai/dsh-llm'
+ import {
+diff --git a/src/dsh-adapter/plugin.ts b/src/dsh-adapter/plugin.ts
+index 6a9e488e..5e56bcec 100644
+--- a/src/dsh-adapter/plugin.ts
++++ b/src/dsh-adapter/plugin.ts
+@@ -116,6 +116,7 @@ import { cursorMove, DISABLE_KITTY_KEYBOARD, DISABLE_MODIFY_OTHER_KEYS, DISABLE_
+ import { DBP, DFE, DISABLE_MOUSE_TRACKING, ESU, EXIT_ALT_SCREEN, SHOW_CURSOR } from '../ink/termio/dec.js'
+ import { CLEAR_ITERM2_PROGRESS, CLEAR_TAB_STATUS, supportsTabStatus, wrapForMultiplexer } from '../ink/termio/osc.js'
+ import { addProcessErrorAbsorber, fatalReasonForExit, registerProcessGuardFatalSink } from '../ink/update-overflow-guard.js'
++import { frameStatsEnabled, noteFrameStats } from '../ink/frame-stats.js'
+ import { CHANNEL_UI_LIFETIME_ENDED } from '../adapter/channel/ui.js'
+ import { markBoot } from '../utils/bootTrace.js'
+ import type { EntrySlot } from './entry-slot.js'
+@@ -3202,6 +3203,11 @@ export async function apply(ctx: Context, runtimeConfig: RuntimeConfig<Config>,
+     exitOnCtrlC: false,
+     terminalImages: bootedTerminalImages,
+     ...(awaitsFirstFrame ? { onFrame: () => { frameFlushed() } } : {}),
++    // Opt-in frame/memory statistics (DSH_TUI_FRAME_STATS=1): one stderr line
++    // every ~2 s. Diagnostics only — the reported stress is "flicking through
++    // history repeatedly kills the process", which a single gesture
++    // measurement cannot answer.
++    ...(frameStatsEnabled() ? { onFrame: noteFrameStats } : {}),
+   })
+   markBoot('render-done')
+   const isRecompose = lastBootedFullscreen !== undefined
+diff --git a/src/screens/Chat.tsx b/src/screens/Chat.tsx
+index aa576c95..edd79cfe 100644
+--- a/src/screens/Chat.tsx
++++ b/src/screens/Chat.tsx
+@@ -739,6 +739,12 @@ export function Chat({
+   const [expandedRows, setExpandedRows] = React.useState<ReadonlySet<number>>(
+     () => new Set(),
+   )
++  // Kept above MessageList so virtual unmount and history chunk eviction do
++  // not lose individual fence disclosures. A session reset clears row ids.
++  const [expandedCodePaths, setExpandedCodePaths] = React.useState<ReadonlyMap<number, ReadonlySet<string>>>(() => new Map())
++  // Temporary exceptions while Ctrl+O exposes all blocks; the normal
++  // per-block state is restored when transcript mode is closed.
++  const [closedGlobalCodePaths, setClosedGlobalCodePaths] = React.useState<ReadonlyMap<number, ReadonlySet<string>>>(() => new Map())
+   /** 流式 reasoning 行相对 thinkingFold 默认值的用户切换。与
+    *  expandedRows 分开：preview 默认三行、full 默认全文，点击在两者间
+    *  翻转；落定后自动回到普通行的折叠语义。 */
+@@ -1757,7 +1763,7 @@ export function Chat({
+   const lastAgentIdRef = React.useRef<string | undefined>(undefined)
+   const lastResetScopeRef = React.useRef<string | undefined>(revealScope)
+   React.useEffect(() => {
+-    const id = channel.agentId
++    const id = JSON.stringify([channel.agentId, channel.sessionId])
+     if (lastAgentIdRef.current === undefined) {
+       lastAgentIdRef.current = id
+       return
+@@ -1776,6 +1782,8 @@ export function Chat({
+     if (sameKeyspace) resetRevealSession(revealScope)
+     setExpanded(false)
+     setExpandedRows(new Set())
++    setExpandedCodePaths(new Map())
++    setClosedGlobalCodePaths(new Map())
+     setSelectedId(null)
+     setSelectionActive(false)
+     setShowAllMessages(false)
+@@ -1786,7 +1794,7 @@ export function Chat({
+     setSearchCurrent(0)
+     setBtwOverlayOpen(false)
+     repaintTranscript()
+-  }, [channel.agentId]) // eslint-disable-line react-hooks/exhaustive-deps
++  }, [channel.agentId, channel.sessionId]) // eslint-disable-line react-hooks/exhaustive-deps
+   /** The session attached when the agent view opened; a close on a
+    *  DIFFERENT session means a switch happened inside the view, and the
+    *  transcript repaint cannot be skipped. */
+@@ -3366,6 +3374,8 @@ export function Chat({
+           // top, then clear native scrollback and repaint the whale homepage.
+           setExpanded(false)
+           setExpandedRows(new Set())
++          setExpandedCodePaths(new Map())
++          setClosedGlobalCodePaths(new Map())
+           setStreamViewToggledRows(new Set())
+           setSelectedId(null)
+           setSelectionActive(false)
+@@ -3392,6 +3402,8 @@ export function Chat({
+         // without their reveal.
+         resetRevealSession(revealScope)
+         setExpandedRows(new Set())
++        setExpandedCodePaths(new Map())
++        setClosedGlobalCodePaths(new Map())
+         setStreamViewToggledRows(new Set())
+         setSelectedId(null)
+         setSelectionActive(false)
+@@ -4533,15 +4545,36 @@ export function Chat({
+     return q ? historyEntries.filter(e => e.text.toLowerCase().includes(q)) : historyEntries
+   }, [historyEntries, historyQuery])
+ 
+-  // Double-Esc rewind: the user's own messages, newest first (the list shows
+-  // selectable user turns; steering side-questions are excluded). Computed
+-  // per render while the picker is open — `channel.rows` is a live in-place
+-  // array (see selectableRows).
+-  const rewindRows = overlay.kind === 'rewind'
+-    ? channel.rows
+-      .filter(row => row.kind === 'user' && row.label === undefined)
+-      .reverse()
+-    : NO_ROWS
++  /**
++   * The user's own messages, newest first (the list shows selectable user
++   * turns; steering side-questions are excluded). A chunked seed keeps every
++   * older chunk collapsed: its prompts live in the placeholder's
++   * `collapsedTurns` (durable seq + text), and rewinding to one needs only
++   * that seq, so they are listed like projected rows without loading the
++   * chunk — the picker must reach the whole conversation, not just the two
++   * rounds the first paint opened.
++   */
++  const collectRewindRows = (rows: readonly ChatRow[]): ChatRow[] => {
++    const candidates: ChatRow[] = []
++    for (const row of rows) {
++      if (row.collapsedTurns !== undefined) {
++        for (const turn of row.collapsedTurns) {
++          candidates.push({
++            id: turn.id,
++            kind: 'user',
++            text: turn.text || t('transcript-image-message', { count: turn.imageCount }),
++            seq: turn.seq,
++          })
++        }
++        continue
++      }
++      if (row.kind === 'user' && row.label === undefined) candidates.push(row)
++    }
++    return candidates.reverse()
++  }
++  // Computed per render while the picker is open — `channel.rows` is a live
++  // in-place array (see selectableRows).
++  const rewindRows = overlay.kind === 'rewind' ? collectRewindRows(channel.rows) : NO_ROWS
+   /** Open the rewind picker (from PromptInput's double-Esc on an empty input). */
+   const openRewind = () => {
+     if ((channel.backendCapabilities as Channel['backendCapabilities'] | undefined)?.rewind === false) {
+@@ -4550,9 +4583,7 @@ export function Chat({
+     }
+     // The overlay is not 'rewind' yet this render, so rewindRows is empty —
+     // scan directly instead of reading the gated list.
+-    const candidates = channel.rows
+-      .filter(row => row.kind === 'user' && row.label === undefined)
+-      .reverse()
++    const candidates = collectRewindRows(channel.rows)
+     if (candidates.length === 0) {
+       channel.notify(t('rewind-none'))
+       return
+@@ -4764,35 +4795,76 @@ export function Chat({
+   // an unmounted one is force-mounted first, then sought by the completion
+   // effect below once its ref lands.
+   const [forceMountRowId, setForceMountRowId] = React.useState<number | null>(null)
++  // A seek is in flight (synchronous anchor or deferred force-mount). The
++  // key router treats "still at the bottom" as End/Enter being a no-op, but
++  // a click that just started a seek up the transcript must not swallow a
++  // same-batch End: remember the intent until the seek lands or is canceled.
++  const pendingSeekRef = React.useRef(false)
+   const seekRow = (rowId: number): void => {
+     const el = rowRefsRef.current.get(rowId)
+     if (el) {
+-      handle?.scrollToElement(el)
++      pendingSeekRef.current = true
++      handle?.scrollToElement(el, 0, true, true)
+       return
+     }
++    pendingSeekRef.current = true
+     setForceMountRowId(rowId)
+   }
++  // A deferred seek (the row was unmounted, so the completion effect scrolls
++  // once its ref lands) must not outlive an explicit "go to the bottom". Both
++  // land in the same parsed input batch when the reader clicks an old rail
++  // tick and presses End immediately: the click queued the force-mount, and
++  // without this the effect would re-anchor *after* scrollToBottom and pull
++  // the viewport back up off the tail.
++  const cancelPendingSeek = React.useCallback((): void => {
++    pendingSeekRef.current = false
++    setForceMountRowId(null)
++  }, [])
++  const cancelPendingSeekOnScroll = React.useCallback((): void => {
++    if (pendingSeekRef.current) cancelPendingSeek()
++  }, [cancelPendingSeek])
++  /**
++   * Rail jump for a turn that already has a measured top: the coordinate
++   * scroll moves the viewport in the same frame (the row may be unmounted),
++   * then `seekRow` re-seats it on the prompt's TEXT top with a held anchor.
++   * Under a live tail the captured coordinate is one row stale, and the
++   * coordinate-only jump leaves the pinned header naming the previous turn.
++   */
++  const jumpToTurnRow = (rowId: number): void => {
++    const turn = timeline?.turns.find(t => t.id === rowId)
++    if (turn !== undefined && turn.top >= 0) handle?.scrollTo(turn.top)
++    seekRow(rowId)
++  }
++
+   /**
+-   * Reveal-and-seek for a row folded behind the recent-rows window (the
+-   * rail's tick for an old turn, the doc's revealAndSeekRow): expand the
+-   * fold first, then the ordinary seek takes over — the completion effect
+-   * below force-mounts the row and scrollToElement lands it once its ref
+-   * (and Yoga top) exist. The fold toggle is idempotent, so calling this
+-   * for an already-revealed row is harmless.
++   * Reveal-and-seek for a row the backend collapsed (an old chunk's digest
++   * row, a folded tick): load the region that owns it, then seek the loaded
++   * row. No fold/expansion state is latched — the completion effect below
++   * force-mounts exactly the one row the seek needs, and `revealRow` is
++   * idempotent for an already-loaded row.
+    */
++  // Stable identity: every transcript row shallow-compares its props, so an
++  // inline arrow here would re-render the whole window on each Chat render.
++  const revealCollapsedRow = React.useCallback((rowId: number): void => {
++    channel.revealRow(rowId)
++  }, [channel])
+   const revealAndSeekRow = (rowId: number): void => {
+     // A backend that collapses history loads only the region holding the row
+     // (DSH: the one chunk, never the whole record) and reports the id of the
+     // loaded twin — a collapsed row's id need not survive loading.
+     const revealed = channel.revealRow(rowId)
+-    if (!showAllMessages) setShowAllMessages(true)
++    // Do NOT latch showAll here: showAll disables MessageList's row cap for the
++    // REST of the session, so repeated reveals can make later layouts much
++    // larger. This is a risky path, not a confirmed cause of every reported
++    // crash. seekRow requests the destination row without changing showAll.
+     seekRow(revealed === 0 ? rowId : revealed)
+   }
+   React.useLayoutEffect(() => {
+     if (forceMountRowId === null) return
+     const el = rowRefsRef.current.get(forceMountRowId)
+     if (el) {
+-      handle?.scrollToElement(el)
++      handle?.scrollToElement(el, 0, true, true)
++      pendingSeekRef.current = false
+       // Clear deferred to a macrotask: clearing here would let React's
+       // synchronous re-render narrow the virtualization window and unmount
+       // the row BEFORE the renderer's deferred pass reads its Yoga top
+@@ -4856,6 +4928,12 @@ export function Chat({
+   // useCallback: these feed MessageList → MemoRow's shallow compare; fresh
+   // closures each render would defeat every row's memo.
+   const toggleRowExpanded = React.useCallback((rowId: number) => {
++    setClosedGlobalCodePaths(previous => {
++      if (!previous.has(rowId)) return previous
++      const next = new Map(previous)
++      next.delete(rowId)
++      return next
++    })
+     setExpandedRows((previous) => {
+       const next = new Set(previous)
+       if (next.has(rowId)) next.delete(rowId)
+@@ -4863,6 +4941,18 @@ export function Chat({
+       return next
+     })
+   }, [])
++  const toggleCodePath = React.useCallback((rowId: number, path: string, forceExpanded: boolean) => {
++    const update = forceExpanded ? setClosedGlobalCodePaths : setExpandedCodePaths
++    update(previous => {
++      const next = new Map(previous)
++      const paths = new Set(previous.get(rowId))
++      if (paths.has(path)) paths.delete(path)
++      else paths.add(path)
++      if (paths.size === 0) next.delete(rowId)
++      else next.set(rowId, paths)
++      return next
++    })
++  }, [])
+   const toggleStreamView = React.useCallback((rowId: number) => {
+     setStreamViewToggledRows((previous) => {
+       const next = new Set(previous)
+@@ -5053,6 +5143,8 @@ export function Chat({
+       // contract) — so paging back home clears the new-messages pill too.
+       const viewport = handle?.getViewportHeight() ?? 0
+       const page = viewport > 1 ? viewport - 1 : 12
++      // A deferred rail seek must not override this newer scroll intent.
++      cancelPendingSeek()
+       handle?.scrollBy(key.pageUp ? -page : page)
+       event.stopImmediatePropagation()
+       return
+@@ -5070,7 +5162,13 @@ export function Chat({
+     if (questionSnapshot !== null) {
+       // Only transcript navigation belongs here. The mounted questionnaire
+       // owns fold/expand keys, including when it interrupts another screen.
+-      if (questionMinimized && !isSticky && (isPlainReturnInput(input, key) || key.end)) {
++      // End at the apparent bottom still cancels an unmounted pending seek;
++      // Enter at the bottom keeps its existing no-op behavior.
++      if (
++        questionMinimized &&
++        ((!isSticky && isPlainReturnInput(input, key)) || (key.end && (!isSticky || pendingSeekRef.current)))
++      ) {
++        cancelPendingSeek()
+         handle?.scrollToBottom()
+         event.stopImmediatePropagation()
+       }
+@@ -5897,6 +5995,7 @@ export function Chat({
+       // transcript search instead of slash-command completion after Help
+       // closes.
+       setExpanded(previous => !previous)
++      setClosedGlobalCodePaths(new Map())
+       // The toggle rewrites every thinking row's layout at once. The
+       // ordinary scroll-based diff pushes rows into terminal scrollback on
+       // each expand and nothing removes them on collapse — rapid toggling
+@@ -5987,12 +6086,14 @@ export function Chat({
+       // Enter while scrolled up returns to the bottom: the
+       // affordance now exists whenever the view is off the bottom, not
+       // only with unseen rows).
++      cancelPendingSeek()
+       handle?.scrollToBottom()
+-    } else if (key.end && !isSticky) {
++    } else if (key.end && (!isSticky || pendingSeekRef.current)) {
+       // End = jump to bottom, less/vim semantics. Global on the chat
+       // screen (search/history overlays consume their own End first —
+       // cursor-to-line-end there). At the bottom already: no-op, so the
+       // key stays harmless in muscle memory.
++      cancelPendingSeek()
+       handle?.scrollToBottom()
+       event.stopImmediatePropagation()
+     } else if (extensionShortcuts !== undefined && extensionShortcuts.dispatch(input, key)) {
+@@ -7178,8 +7279,10 @@ export function Chat({
+             // compares against — and the header would flip to the previous
+             // turn immediately after the click.
+             const turn = timeline.turns.find(t => t.id === anchorUserRowId)
+-            if (turn) handle?.scrollTo(turn.top)
+-            else if (anchorUserRowId !== null) seekRow(anchorUserRowId)
++            if (turn) {
++              cancelPendingSeek()
++              handle?.scrollTo(turn.top)
++            } else if (anchorUserRowId !== null) seekRow(anchorUserRowId)
+             else handle?.scrollToBottom()
+           }}
+         />
+@@ -7192,7 +7295,7 @@ export function Chat({
+           and cards keep the content column). No explicit width: cross-axis
+           stretch with the margin yields exactly content+margin. */}
+       <Box flexDirection="row" flexGrow={1} flexShrink={1} marginRight={sidePanel.split ? 0 : -pageInsetX}>
+-        <ScrollBox ref={setHandle} flexDirection="column" flexGrow={1} flexShrink={1} stickyScroll>
++        <ScrollBox ref={setHandle} onScrollByIntent={cancelPendingSeekOnScroll} flexDirection="column" flexGrow={1} flexShrink={1} stickyScroll>
+         <LogoHeader
+           key={logoNonce}
+           model={channel.modelDisplay ?? channel.model}
+@@ -7235,6 +7338,9 @@ export function Chat({
+           failureHint={t('traj-hint-failure', { key: primaryComboString('trajectory') })}
+           expanded={expanded}
+           expandedRows={expandedRows}
++          expandedCodePaths={expandedCodePaths}
++          closedGlobalCodePaths={closedGlobalCodePaths}
++          onToggleCodePath={toggleCodePath}
+           selectedId={selectionActive ? selectedId : null}
+           onToggleRow={toggleRowExpanded}
+           streamViewToggledRows={streamViewToggledRows}
+@@ -7254,7 +7360,7 @@ export function Chat({
+           fullscreen={fullscreen}
+           onToggleAll={() =>{  setShowAllMessages(previous => !previous) }}
+           onLoadOlder={() => channel.loadOlder()}
+-          onRevealCollapsed={(rowId) => { channel.revealRow(rowId) }}
++          onRevealCollapsed={revealCollapsedRow}
+           registerRowRef={registerRowRef}
+           scrollHandle={handle}
+           forceMountRowId={forceMountRowId}
+@@ -7281,18 +7387,17 @@ export function Chat({
+           const gutter = normalizeScrollGutter(channel.scrollGutter)
+           if (gutter === 'hidden') return null
+           if (gutter === 'scrollbar') {
+-            return <ScrollbarGutter handle={handle} terminalWidth={chatColumns} />
++            return <ScrollbarGutter handle={handle} terminalWidth={chatColumns} onScrollToIntent={cancelPendingSeekOnScroll} />
+           }
+           return (
+             <TimelineRail
+               handle={handle}
+               turns={timeline.turns}
+               activeId={timeline.activeId}
+-              upId={timeline.upId}
+-              downId={timeline.downId}
+               terminalWidth={chatColumns}
+               hoverEnabled={!promptSelectionActive}
+               onRevealTurn={revealAndSeekRow}
++              onJumpTurn={jumpToTurnRow}
+             />
+           )
+         })()}
+@@ -7305,7 +7410,10 @@ export function Chat({
+         {showPill && (
+           <NewMessagesPill
+             count={unseenCount}
+-            onClick={() => handle?.scrollToBottom()}
++            onClick={() => {
++              cancelPendingSeek()
++              handle?.scrollToBottom()
++            }}
+           />
+         )}
+         {channel.working &&
