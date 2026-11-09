@@ -115,6 +115,34 @@ const GATES = [
   'verify:session-reset',
   'verify:channel-ui',
   'verify:history-chunks',
+  'verify:fold-back-user',
+  'verify:markdown-lazy-highlight',
+  'verify:syntax-lazy-highlight',
+  'verify:chat-seek-paging',
+  'verify:chat-pending-wheel',
+  'verify:scroll-anchor-overscroll',
+  'verify:file-target-no-separator',
+  'verify:file-target-linear',
+  'verify:file-target-slash-performance',
+  'verify:markdown-filelink-ansi',
+  'verify:settled-thinking-summary',
+  'verify:leading-thinking-lines',
+  'verify:thinking-ticker-tail',
+  'verify:thinking-ticker-render',
+  'verify:settled-thinking-cells',
+  'verify:settled-thinking-component',
+  'verify:settled-thinking-chat',
+  'verify:thinking-virtualization',
+  'verify:subagent-settled-no-scan',
+  'verify:subagent-group-fold',
+  'verify:selection-attachment-bounded',
+  'verify:history-prose-default',
+  'verify:folded-code-summary',
+  'verify:long-prose-ansi',
+  'verify:code-fence-chat',
+  'verify:code-fence-lru',
+  'verify:chunked-rail',
+  'verify:rail-window-seek',
   'verify:adapter-detection',
   'verify:adapter-replay-harness',
   'verify:adapter-channel-conformance',
@@ -159,10 +187,18 @@ const FRONT = [
   'verify:approval-visibility',
 ]
 
-// Gates that must not share the machine with other gates. Empty today: every
-// gate passes under full parallel load. Add a gate here, with the reason,
-// rather than raising a timeout inside it.
-const SERIAL = []
+// Keep timing/allocation probes and the frame-sensitive Chat test isolated
+// from sibling gates; do not hide contention by increasing their thresholds.
+const SERIAL = [
+  'verify:chat-pending-wheel',
+  'verify:file-target-no-separator',
+  'verify:file-target-slash-performance',
+  'verify:settled-thinking-summary',
+  'verify:thinking-ticker-render',
+  'verify:settled-thinking-chat',
+  'verify:thinking-virtualization',
+  'verify:subagent-settled-no-scan',
+]
 
 const root = new URL('..', import.meta.url)
 const scripts = JSON.parse(readFileSync(new URL('package.json', root), 'utf8')).scripts ?? {}

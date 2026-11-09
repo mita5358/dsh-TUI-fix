@@ -657,7 +657,8 @@ In inline mode, the terminal emulator owns native scrollback and selection.
   panel); elsewhere scrolls the message list (±3 lines per notch). Never scrolls the
   transcript behind an open overlay. Moves the cursor in the trajectory scene (±3 rows per
   notch on the timeline, ±1 in hotspot; scrolls the detail while expanded). Walks the
-  focused row in /settings.
+  focused row in /settings. With the pointer over the right-edge timeline, the wheel only
+  steps its index window (±3 ticks per notch) and never scrolls the transcript.
 - **Drag** — Select text and copy on release, keeping the selection; a "Copied N characters"
   notice pops up. A new selection replaces the retained one. With
   `dsh-tui.scrollGutter: scrollbar`, the right-edge scrollbar is a drag
@@ -671,7 +672,10 @@ In inline mode, the terminal emulator owns native scrollback and selection.
 - **Single-click a message row** — Plain text rows (user/assistant) do nothing — the
   transcript is a reading surface, selection is the mouse's job there.
 - **Single-click a tool card / thinking / compact summary** — Expand / collapse (header
-  brightens on hover; trailing blank cells do not trigger).
+  brightens on hover; trailing blank cells do not trigger). Expanding rewraps a
+  tool header or arguments that were cut to the terminal width; while expanded the
+  header no longer opens the file menu (collapse restores it; the body's path row
+  still opens the file).
 - **Single-click a subagent card** — Open that subagent's detail scene (status glyph
   brightens on hover).
 - **Single-click the input box** — Place the text caret at the click (multi-line, wrapped
@@ -720,8 +724,15 @@ In inline mode, the terminal emulator owns native scrollback and selection.
   cancelling stays on keyboard Esc.
 - **Single-click a help-menu command row** — Fill `/name ` into the prompt and close the
   help (the Tab completion's mouse equivalent).
+- **Click the timeline's ▲/▼ arrows** — Step the index window up / down one row; the
+  arrow dims and becomes inert at the top / bottom of the index.
 - **Click a timeline-rail tick** — Jump to that turn — the rail covers every turn (folded
-  ones included); a folded tick reveals its turn first, then scrolls it into place.
+  ones included); a folded tick reveals its turn first, then scrolls it into place. On a
+  long DSH session, where older history is collapsed into per-chunk report lines, a tick
+  inside a collapsed chunk projects only that chunk (not the whole history) before the jump.
+  Browsing the index never jumps turns or scrolls the transcript; once the window leaves the
+  active turn, ━━ can be absent from the visible ticks, and a real transcript scroll or a
+  tick click returns the window to following the active turn.
 - **Keyboard selection extension** — With a selection, `Shift+←/→/↑/↓/Home/End` extends /
   shrinks it (wraps across lines).
 

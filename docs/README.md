@@ -33,6 +33,7 @@ The root README lists what ships; the details live here. Chinese files have no s
 | 文档 / Doc | 中文 | English | 讲什么 / What it covers |
 | --- | --- | --- | --- |
 | 架构与限制 / Architecture & limitations | [architecture.md](architecture.md) | [architecture.en.md](architecture.en.md) | 运行链路、性能、安全边界与已知限制。 |
+| 分块打开长会话 / Chunked history open | [dynamic-history-loading.md](dynamic-history-loading.md) | [dynamic-history-loading.en.md](dynamic-history-loading.en.md) | 长会话分块投影打开、首帧预算、seek 与最近块的卸载。 |
 | 会话挂载运行时 / Session mount runtime | [session-mount-runtime.md](session-mount-runtime.md) | [session-mount-runtime.en.md](session-mount-runtime.en.md) | 多 TUI 占用规则与本机账本。 |
 | 首次引导的账号与模型接入 / Onboarding provider setup | [onboarding-provider-setup.md](onboarding-provider-setup.md) | [onboarding-provider-setup.en.md](onboarding-provider-setup.en.md) | 引导第一步如何登录账号、写入凭据并选出默认模型。 |
 | 独立宿主设计 / Standalone host design | [standalone-host-design.md](standalone-host-design.md) | — | 本包自持入口与组装根、DSH 进程内加载的方案与决策。 |

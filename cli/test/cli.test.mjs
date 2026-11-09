@@ -22,7 +22,7 @@ after(() => rm(sandbox, { recursive: true, force: true, maxRetries: 3 }))
 
 async function run(args, input = '', env = {}) {
   const child = spawn(process.execPath, [launcher, ...args], {
-    cwd: root, env: { ...process.env, DSH_TUI_CLI_DSH_BIN: fixture, DSH_HOME: join(sandbox, 'home'), HOME: sandbox, USERPROFILE: sandbox, ...env }, stdio: ['pipe', 'pipe', 'pipe'],
+    cwd: root, env: { ...process.env, NODE_NO_WARNINGS: '1', DSH_TUI_CLI_DSH_BIN: fixture, DSH_HOME: join(sandbox, 'home'), HOME: sandbox, USERPROFILE: sandbox, ...env }, stdio: ['pipe', 'pipe', 'pipe'],
   })
   child.stdin.on('error', () => {})
   child.stdin.end(input)

@@ -12,7 +12,19 @@ const input = await new Promise((resolve, reject) => {
   process.stdin.on('error', reject)
 })
 
-const reports = JSON.parse(input)
+let reports
+const lines = input.split(/\r?\n/u)
+for (let index = 0; index < lines.length; index++) {
+  const candidate = lines[index]?.trim()
+  if (candidate !== '[' && candidate !== '{') continue
+  try {
+    reports = JSON.parse(lines.slice(index).join('\n'))
+    break
+  } catch {
+    // npm's prepare lifecycle may print arbitrary lines before the JSON report.
+  }
+}
+if (reports === undefined) throw new Error('npm pack did not return a JSON file list')
 // npm 10 emits an array while npm 11 emits an object keyed by package name.
 const report = Array.isArray(reports) ? reports[0] : Object.values(reports)[0]
 if (report === undefined || !Array.isArray(report.files)) {

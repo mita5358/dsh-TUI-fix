@@ -116,9 +116,12 @@ const GROUPS = {
     ["verify-streaming-markdown-spacing", ['node', '--import', 'tsx/esm', 'scripts/verify-streaming-markdown-spacing.tsx']],
     ['verify-text-measure-cache', ['node', '--import', 'tsx/esm', 'scripts/verify-text-measure-cache.ts']],
     ['verify-text-wrap-geometry', ['node', '--import', 'tsx/esm', 'scripts/verify-text-wrap-geometry.tsx']],
+    ['verify-wrap-ansi-incremental', ['node', 'scripts/verify-wrap-ansi-incremental.mjs']],
     ['verify-wrap-exact-fill', ['node', '--import', 'tsx/esm', 'scripts/verify-wrap-exact-fill.tsx']],
     ['verify-component-wrap-exact-fill', ['node', '--import', 'tsx/esm', 'scripts/verify-component-wrap-exact-fill.tsx']],
     ['verify-streaming-markdown-blocks', ['node', '--import', 'tsx/esm', 'scripts/verify-streaming-markdown-blocks.tsx']],
+    ['verify-streaming-suffix-identity', ['node', 'scripts/verify-streaming-suffix-identity.mjs']],
+    ['verify-streaming-tail-boundary', ['node', 'scripts/verify-streaming-tail-boundary.mjs']],
 // Markdown token 覆盖：真实 lexer 产出的 token 类型必须与白名单完全一致
 // （marked 升级带来新类型即失败）；任务列表 [x]/[ ] 在各种列表形态下的位置。
     ['verify-markdown-token-coverage', ['node', '--import', 'tsx/esm', 'scripts/verify-markdown-token-coverage.ts']],
@@ -237,6 +240,9 @@ const GROUPS = {
 // 曾以 120ms/卡片持续驱动 React commit，N 张相位错开合成 ~30ms
 // 均匀帧 cadence。
     ["verify-subagent-settle", ['node', '--import', 'tsx/esm', 'scripts/verify-subagent-settle.tsx']],
+// 连续子代理卡成组：已落定的 fan-out 默认折叠成一行摘要，点击/Ctrl+O 展开
+// 整组并可再收回；组内有 running 成员时保持展开（在跑的工作不许被收起）。
+    ["verify-subagent-group-fold", ['node', '--import', 'tsx/esm', 'scripts/verify-subagent-group-fold.tsx']],
 // 子代理流投影批处理：chunk 风暴的 snapshot+行投影必须按 16ms 帧
 // 对齐合并（token 率 100-300/s 下的全量深拷贝热路径），且生命周期
 // 事件（tool/call、subagent/end）保持同步立即可见。
@@ -312,6 +318,11 @@ const GROUPS = {
 // 时间线 rail 回归：rail 覆盖全部轮次（含折叠轮），高亮锚定视口顶、
 // ▲/▼ 目标不越过 maxScroll。
     ["verify-timeline-rail", ['node', '--import', 'tsx/esm', 'scripts/verify-timeline-rail.tsx']],
+// 时间线 rail 索引窗口独立滚动回归：▲/▼ 与「指针在 rail 上」的滚轮只翻
+// tick 索引窗口，不跳轮次、不滚动转录；到顶/到底三角变暗 no-op；窗口翻走
+// 后 ━━ 可不在窗口内，真实转录滚动/点 tick 才回自动跟随。
+    ["verify-rail-index-scroll", ['node', '--import', 'tsx/esm', 'scripts/verify-rail-index-scroll.tsx']],
+    ['verify-rail-probe-guards', ['node', 'scripts/verify-rail-probe-guards.mjs']],
 // 时间线 rail 视口高度落定回归：底部 chrome 悬停展开/收回与终端行 resize
 // 改变转录视口高度时（无滚动通知、不翻转 sticky），rail 几何必须跟随；
 // 通知语义（仅高度变化触发）经渲染器→React 回调计数探针断言。
@@ -498,6 +509,9 @@ const GROUPS = {
 // 悬停窥视（窗口钉头部）/移开重折叠、点击 chip 固定展开、点击 ▾ 前缀
 // 再折叠、Esc 展开不清空、Enter/输入全文提交——鼠标走真实 SGR 事件。
     ["repro-paste-fold", ['node', '--import', 'tsx/esm', 'scripts/repro-paste-fold.tsx']],
+    ['verify-input-fold-threshold', ['node', 'scripts/verify-input-fold-threshold.mjs']],
+    ['verify-input-grapheme-lazy', ['node', 'scripts/verify-input-grapheme-lazy.mjs']],
+    ['verify-input-bound-images', ['node', 'scripts/verify-input-bound-images.mjs']],
 // 图片附件回归：剪贴板位图占位符与图片文件 @ 引用进附件库（#152）。
     ["verify-clipboard-image", ['node', '--import', 'tsx/esm', 'scripts/verify-clipboard-image.ts']],
 // 拖选复制端到端回归（用户报告：全屏下拖选"只能复制一个字符，只有
@@ -1572,6 +1586,13 @@ const GROUPS = {
 // 与正文都出折叠标记且裁掉的尾巴不在屏上；Ctrl+O 逃生门恢复原文；
 // reasoning 行不折叠（自带三行预览）。
     ["verify-long-line-fold", ['node', '--import', 'tsx/esm', 'scripts/verify-long-line-fold.tsx']],
+// 静默省略号可展开回归（用户反馈：只有 hover tooltip 的截断点不出去）：工具卡
+// 头部被宽度截断的标题/无标题卡的 480 字符参数，在窄终端点一下换行画全、再点
+// 收起；详情页转录的落定思考摘要同样可点开；冷 verbose 与点击展开逐字节一致。
+    ["verify-ellipsis-expand", ['node', '--import', 'tsx/esm', 'scripts/verify-ellipsis-expand.tsx']],
+// 历史分块摘要行即加载控件：点摘要行把该块投影到原位（工具 digest 行），
+// 普通 notice 分隔行（compact 摘要，无 collapsed 标志）必须保持惰性。
+    ["verify-digest-click", ['node', '--import', 'tsx/esm', 'scripts/verify-digest-click.tsx']],
 // btw 面板：侧栏（空态、Markdown、Enter 提交/Esc 保草稿/Tab 切焦点/n 新话题/s 发到聊天）、
 // 未读 badge、28/40 列；真实 Chat 的 /btw 在面板启用时进侧栏，未启用时用浮层（Esc 中止）。
     ["verify-btw-panel", ['node', '--import', 'tsx/esm', 'scripts/verify-btw-panel.tsx']],

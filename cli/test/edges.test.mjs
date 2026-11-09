@@ -123,7 +123,7 @@ test('direct CLI entry runs through a symlinked parent path', async () => {
   const linkedRoot = join(temp, 'linked-root')
   await symlink(root, linkedRoot, process.platform === 'win32' ? 'junction' : 'dir')
   const result = spawnSync(process.execPath, [join(linkedRoot, 'cli/entry.mjs'), '--help'], {
-    cwd: root, encoding: 'utf8', timeout: 10000,
+    cwd: root, encoding: 'utf8', timeout: 10000, env: { ...process.env, NODE_NO_WARNINGS: '1' },
   })
   assert.equal(result.status, 0, result.stdout + result.stderr)
   assert.match(result.stdout, /dst run/u)

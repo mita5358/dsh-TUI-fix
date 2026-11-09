@@ -584,6 +584,11 @@ An empty session shows the whale logo area at the top (scrolls away with the con
 - Expand: **click the line** (tool card: click the card) to unfold, click again to fold; keyboard `Ctrl+O`.
 - Thinking lines don't fold.
 
+**History digests and run grouping**
+
+- Restored-from-log tool cards read as a one-line digest by default: tool name + the start of its arguments + `…` + an expand hint; click the card or press `Ctrl+O` for the full arguments and result. A settled thinking block likewise keeps one line (duration + opening fragment + expand hint).
+- **A run of consecutive subagent cards** (≥3, all settled) folds into a single `子代理 ×N` header: click it to open the whole run, click again to fold; `Ctrl+O` opens and folds it too. While any member is still running the run stays open — in-flight work is never hidden behind a summary.
+
 ### 5.2 Bottom status bar (three rows under the input)
 
 **Row 1 — context segment bar** (`/settings → statusBar.contextBar`, default on)
@@ -675,7 +680,7 @@ Common items below, full list on the /settings screen. Most topics (**Appearance
 **effortDefault**: when the model lacks that level, choose the nearest lower offered tier or the model default and show a notice. On DSH, priority is settings user layer > the last `/effort`
 (effort.json, the level the last session ran) > cordis `effort` (deployment default) > model default. Claude/Codex apply edits through their own controls and backend preferences; Auto at startup and resumed sessions preserve the selection, while explicitly choosing Auto resets the model default.
 
-**scrollGutter**: the scrollbar track can be dragged directly; `Shift`/`Alt`/`Ctrl`+drag is still text selection.
+**scrollGutter**: the scrollbar track can be dragged directly; `Shift`/`Alt`/`Ctrl`+drag is still text selection. On the timeline, the ▲/▼ arrows and the wheel while the pointer is over the rail only step the index window — they never jump turns or scroll the transcript; the arrows dim at the top/bottom.
 
 **pageMargin**: custom `NxM` = `N` columns left/right, `M` rows top/bottom (cap 8x4); only `N` means 1 row top/bottom.
 

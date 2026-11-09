@@ -61,7 +61,7 @@ Resuming a DSH session preserves its recorded reasoning effort (or its live sele
 - **Account sign-in** — the standard profile offers pi-ai OAuth for ChatGPT/Codex, Claude, and Grok (plus OpenAI direct and Meta Muse when available), and Host-owned DeepSeek browser sign-in as `deepseek-account` on DSH 0.2.0-rc.1+. Use `/provider` or `/auth` without another plugin.
   A profile-only update from a global TUI patch that already mounts `dsh-tui-auth` can still start the official loopback callback listener on demand; fixed-port SSH forwarding still requires the global package to be aligned.
 - **Extensions** — browser interaction, computer use and more.
-- **Built for long sessions** — event-driven projection, virtualization, bounded caches. Opening a DSH session with tens of thousands of rows projects only its newest chunk; older history folds into one text-only report line per chunk plus one prompt line per turn, and clicking a folded turn on the timeline projects just that chunk.
+- **Built for long sessions** — event-driven projection, virtualization, bounded caches. Opening a DSH session with tens of thousands of rows projects only its newest chunk; older history folds into one text-only report line per chunk and expands on sight. The timeline retains every human turn and its preview from lightweight metadata; clicking an unloaded turn projects only its chunk and seeks that exact prompt. [Loading architecture](docs/dynamic-history-loading.en.md).
 
 Keys and commands: [Interaction and commands](docs/interaction.en.md). Everything else: [documentation index](docs/README.md).
 
@@ -414,6 +414,8 @@ the dashboard alone does not acknowledge every child. Task status stays failed.
 ## Keybindings & Mouse
 
 `Enter` send · `Tab` complete · `Ctrl+Enter` interrupt and send · `Alt+Up` recall the last message · `Esc` closes local layers before interrupting a running turn, double-`Esc` rewinds on empty idle input · `Ctrl+B` side panel · `Ctrl+O` details · `Ctrl+R` history (`↑`/`↓` and `Ctrl+R` are scoped to the current project) · `Ctrl+V` paste · `Ctrl+Shift+E` fullscreen draft editor · `?` shortcuts · `←` open the session manager (DSH backgrounds the current session first).
+Settled reasoning is shown as a short first-nonblank-line preview with an ellipsis; click its row to expand or collapse it, or use `Ctrl+O` for details. The preview is bounded and may omit unusually long or unsafe leading content. Older history that has not yet been restored may still contain only a partial body.
+
 In both the launchpad and chat, `Ctrl+U` deletes from the caret to the current line start, preserving text to the right and whole image chips. It edits only the focused input.
 
 In the launchpad input, `Shift+Enter` (or `Option+Enter`) opens chat and inserts a newline at the caret, keeping the draft and staged images unsent. Continue typing there, then press `Enter` to send.

@@ -4,12 +4,10 @@ import { test, after } from 'node:test'
 import { mkdtemp, mkdir, copyFile, cp, writeFile, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
-import { createRequire } from 'node:module'
+import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import { c as createTar, x as extractTar } from 'tar'
 
-const require = createRequire(import.meta.url)
 const root = fileURLToPath(new URL('../../', import.meta.url))
 const temporary = await mkdtemp(join(tmpdir(), 'dst-package-'))
 after(() => rm(temporary, { recursive: true, force: true, maxRetries: 3 }))
@@ -28,7 +26,7 @@ test('standalone extracts and runs the same CLI without initializing its TUI pro
   await mkdir(standalone)
   await createTar({ gzip: true, cwd: source, file: join(standalone, 'runtime.tar.gz') }, ['node_modules'])
   await copyFile(join(root, 'standalone/cacheGuard.cjs'), join(standalone, 'cacheGuard.cjs'))
-  const entry = (await readFile(join(root, 'standalone/entry.mjs'), 'utf8')).replace("from 'tar'", `from '${pathToFileURL(require.resolve('tar')).href}'`)
+  const entry = (await readFile(join(root, 'standalone/entry.mjs'), 'utf8')).replace("from 'tar'", `from '${import.meta.resolve('tar')}'`)
   await writeFile(join(standalone, 'entry.mjs'), entry)
   const home = join(temporary, 'standalone-home')
   const env = { ...process.env, DSH_HOME: home, DSH_TUI_STANDALONE_CACHE: join(temporary, 'cache'), DSH_TUI_CLI_NODE: process.execPath }
