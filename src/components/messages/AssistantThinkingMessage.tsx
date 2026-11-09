@@ -1,6 +1,6 @@
 import React from 'react'
 import chalk from 'chalk'
-import { Box, Text } from '../../ui.js'
+import { Box, Text, useTerminalSize } from '../../ui.js'
 import { t } from '../../i18n.js'
 import { StreamingMarkdown } from '../StreamingMarkdown.js'
 import { formatDuration, formatTokens } from '../../terminal-utils/format.js'
@@ -14,6 +14,8 @@ import { interpolateColor } from '../Spinner/spinnerUtils.js'
 import { isMinimalUiMode } from '../../minimalUiMode.js'
 import type { ClickEvent } from '../../ink/events/click-event.js'
 import { primaryComboString } from '../../utils/keymap.js'
+import { fitThinkingRow, settledThinkingHead } from './settledThinkingSummary.js'
+import { thinkingTickerTail } from './thinkingTicker.js'
 
 /** Preview body rows — a FIXED row count (kimicode-style constant-height
  *  ticker). Ink's truncate slices the whole string across newlines as one
@@ -55,12 +57,12 @@ type Props = {
 }
 
 /**
- * Thinking block: settled rows fold to `⚓ Thinking` plus the localized
- * ctrl+o expand hint (hint-expand-ctrl-o);
- * streaming rows switch between a three-line preview and the full reasoning
- * text on click. The live leading mark is a rotating braille spinner
- * (`⠋⠙⠹…`, Kimi Code style), settling back to the static anchor (`⚓`). When
- * the channel records the reasoning duration, the label carries it
+ * Thinking block: settled rows fold to a bounded, sanitized first-nonblank-line
+ * preview with localized expansion hints; streaming rows switch between a
+ * three-line preview and the full reasoning text on click. The live leading
+ * mark is a rotating braille spinner (`⠋⠙⠹…`, Kimi Code style), settling
+ * back to the static anchor (`⚓`). When the channel records the reasoning
+ * duration, the label carries it
  * (`⚓ Thinking · 12s …`) — dsh-tui's take on making thinking time visible in
  * the transcript.
  */
@@ -142,9 +144,7 @@ export function AssistantThinkingMessage({
     // from the start (leading ellipsis) so the newest tokens — which grow
     // at the line's end — stay visible while the line is longer than the
     // width.
-    const lines = tickerText.split('\n')
-    const visible = lines.slice(-PREVIEW_ROWS)
-    const clipped = lines.length > visible.length
+    const { lines: visible, clipped } = thinkingTickerTail(tickerText, PREVIEW_ROWS)
     // Pad with single spaces — an empty-string Text renders with zero
     // height in ink, so '' padding would not hold the row open.
     const rows = Array.from(
@@ -197,7 +197,15 @@ export function AssistantThinkingMessage({
         onClick={onClick}
         {...hoverProps}
       >
-        {header}
+        {streaming ? header : (
+          <SettledThinkingHeader
+            thinking={thinking}
+            label={`${t('thinking-label')}${duration}`}
+            marker={minimalUi ? '*' : THINKING_SETTLED_MARKER}
+            hovered={hovered}
+            clickable={onClick !== undefined}
+          />
+        )}
       </Box>
     )
   }
@@ -219,6 +227,38 @@ export function AssistantThinkingMessage({
           cost at O(new content) instead of re-laying out the whole block. */}
         <StreamingMarkdown dimColor>{thinking}</StreamingMarkdown>
       </Box>
+    </Box>
+  )
+}
+
+/** Mounted only for settled, folded text, never for a live preview. */
+function SettledThinkingHeader({ thinking, label, marker, hovered, clickable }: {
+  thinking: string
+  label: string
+  marker: string
+  hovered: boolean
+  clickable: boolean
+}): React.ReactNode {
+  const { columns } = useTerminalSize()
+  const preview = React.useMemo(() => settledThinkingHead(thinking), [thinking])
+  const key = primaryComboString('transcript')
+  // Configurable bindings can currently contain control characters. Omit an
+  // unsafe hint instead of emitting control sequences or inventing a binding.
+  const safeKey = key.length > 0 && key.length <= 128 && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/u.test(key)
+  const row = fitThinkingRow({
+    marker,
+    label,
+    preview,
+    ctrlHint: safeKey ? t('hint-expand-ctrl-o', { key }) : '',
+    clickHint: clickable ? t('code-fence-folded-expand') : '',
+    // Chat's timeline/scrollbar gutter can occupy two cells. Context already
+    // accounts for page margins and side panels; this reserve is conservative
+    // when the gutter is hidden or bleeds into a page margin.
+    width: Math.max(0, columns - 2),
+  })
+  return (
+    <Box height={1} overflow="hidden">
+      <Text italic dimColor={!hovered} color={hovered ? 'text' : undefined}>{row}</Text>
     </Box>
   )
 }

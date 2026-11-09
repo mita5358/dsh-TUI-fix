@@ -704,7 +704,21 @@ export function SubagentDetailScene({
                         )
                       }
                       if (row.kind === 'thinking') {
-                        return <ThinkingLeafRow key={`think-${row.key}`} thinking={row.text} marginTopOnTurn={margin} verbose={thinkingOpen} />
+                        // Per-leaf click, same state as tool leaves: a settled
+                        // thinking summary is a silent ellipsis otherwise (the
+                        // global Enter/Ctrl+O toggle is not discoverable from
+                        // the row). `thinkingOpen` still expands every leaf.
+                        const open = thinkingOpen || expandedLeaf === row.key
+                        return (
+                          <ThinkingLeafRow
+                            key={`think-${row.key}`}
+                            thinking={row.text}
+                            marginTopOnTurn={margin}
+                            verbose={open}
+                            isSelected={expandedLeaf === row.key}
+                            onClick={() => setExpandedLeaf(prev => prev === row.key ? null : row.key)}
+                          />
+                        )
                       }
                       if (row.kind === 'thinking-unavailable') {
                         return (

@@ -90,6 +90,10 @@ type Props = {
    *  (`tool.liveOutput`: 8 instead of 5; the whole retained tail when
    *  verbose/expanded). */
   fullscreen?: boolean
+  /** Collapsed body budget for a restored history row (1): the card reads as
+   *  a digest and the row click expands it. Undefined keeps the live card's
+   *  three-line (text) / eight-line (diff) budget. */
+  digestLines?: number
 }
 
 /** Tool display names localize through the `tool-name-*` dictionary family
@@ -420,7 +424,7 @@ function foldHintParts(hiddenLines: number, hiddenChars: number): string {
  *  A lines-only fold keeps the historical shared hint (lines-folded-expand)
  *  byte-identical; a fold that also (or only) clipped CHARACTERS inside long
  *  lines uses the combined indicator so the hidden volume stays honest. */
-function capLines(lines: BodyLine[], max: number, verbose: boolean, hiddenChars: number): BodyLine[] {
+function capLines(lines: BodyLine[], max: number, verbose: boolean, hiddenChars: number, click = false): BodyLine[] {
   if (verbose || lines.length <= max) return lines
   if (lines.length - max === 1) return lines
   const hiddenLines = lines.length - max
@@ -429,9 +433,13 @@ function capLines(lines: BodyLine[], max: number, verbose: boolean, hiddenChars:
   // clipped characters of the sliced-away rows included — so "how much is
   // hidden" answers in one place. A lines-only fold keeps the historical
   // shared hint byte-identical.
+  // A digest row (restored history) is itself the click target, so its hint
+  // names the click as well as the keyboard path.
+  const linesKey = click ? 'lines-folded-expand-click' : 'lines-folded-expand'
+  const charsKey = click ? 'tool-card-lines-hidden-click' : 'tool-card-lines-hidden'
   const hint = hiddenChars > 0
-    ? { ...dim(t('tool-card-lines-hidden', { parts: foldHintParts(hiddenLines, hiddenChars), key: primaryComboString('transcript') })), revealOnHover: true }
-    : { ...dim(t('lines-folded-expand', { n: hiddenLines, key: primaryComboString('transcript') })), revealOnHover: true }
+    ? { ...dim(t(charsKey, { parts: foldHintParts(hiddenLines, hiddenChars), key: primaryComboString('transcript') })), revealOnHover: true }
+    : { ...dim(t(linesKey, { n: hiddenLines, key: primaryComboString('transcript') })), revealOnHover: true }
   return [...lines.slice(0, max), hint]
 }
 
@@ -549,10 +557,15 @@ function toolCardMetaTooltip(tool: ToolRow, isRunning: boolean, isError: boolean
   return parts.join(' · ')
 }
 
-function HeaderTitle({ name, title, isTerminal, folded, displayArgs, argsLanguage, nameColor, filePath, onOpenFile, metaTooltip, headerTextBudget }: {
+function HeaderTitle({ name, title, isTerminal, folded, full, displayArgs, argsLanguage, nameColor, filePath, onOpenFile, metaTooltip, headerTextBudget }: {
   name: string
   title: string | undefined
   isTerminal: boolean
+  /** Row is expanded (verbose): the non-terminal one-line title WRAPS
+   *  instead of truncate-end, so a header cut by layout width shows its
+   *  whole text — and the click that expands it is the only affordance,
+   *  since that cut carries no visible marker. */
+  full: boolean
   /** Terminal-card fold result (multi-line title, folding on, not verbose). */
   folded: FoldedTitle | undefined
   displayArgs: string
@@ -608,11 +621,17 @@ function HeaderTitle({ name, title, isTerminal, folded, displayArgs, argsLanguag
           <Text bold color={nameColor} wrap="truncate-end">{name}</Text>
         </Box>
         {displayArgs !== '' && (
-          <Box flexWrap="nowrap" {...headerTooltip}>
-            <Text>(</Text>
-            <SyntaxText text={clipHeaderArgs(displayArgs)} sourceText={displayArgs} language={argsLanguage} />
-            <Text>)</Text>
-          </Box>
+          full ? (
+            <Box flexShrink={1}>
+              <Text dimColor wrap="wrap">{`(${displayArgs})`}</Text>
+            </Box>
+          ) : (
+            <Box flexWrap="nowrap" {...headerTooltip}>
+              <Text>(</Text>
+              <SyntaxText text={clipHeaderArgs(displayArgs)} sourceText={displayArgs} language={argsLanguage} />
+              <Text>)</Text>
+            </Box>
+          )
         )}
       </>
     )
@@ -651,10 +670,33 @@ function HeaderTitle({ name, title, isTerminal, folded, displayArgs, argsLanguag
   // clickable. The click stops propagation so the row's fold toggle does
   // not fire. indexOf keeps the split exact even for paths with regex
   // metacharacters.
-  if (onOpenFile !== undefined && filePath !== undefined && filePath !== '' && trimmed.includes(filePath)) {
+  // A title cut by layout width is the one header state with no visible
+  // affordance of its own: the whole point of this card is that a click
+  // reveals what the `…` hid. So a truncated title's path segment must NOT
+  // swallow the click into the file menu (the body's `path` rows still open
+  // the file); only a fully visible title keeps the old path click.
+  const widthCut = !isTerminal && stringWidth(trimmed) > headerTextBudget
+  if (onOpenFile !== undefined && filePath !== undefined && filePath !== '' && trimmed.includes(filePath)
+    && !widthCut) {
     const at = trimmed.indexOf(filePath)
     const before = trimmed.slice(0, at)
     const after = trimmed.slice(at + filePath.length)
+    if (full) {
+      // Expanded: stack the segments instead of sharing one row, so the long
+      // path wraps on its own lines. A row cannot do this — `after`
+      // (`(1 - 100)`) would float beside the wrapped path box. The path is
+      // deliberately NOT clickable here: the whole card is one fold toggle
+      // while expanded, and a click on the only line that revealed the
+      // hidden tail must collapse it again, not open a file menu. File
+      // opening stays one collapse-click away (and in the body's path lines).
+      return (
+        <Box flexDirection="column" flexShrink={1} {...headerTooltip}>
+          {before.trim() !== '' && <Text bold color={nameColor}>{before.trimEnd()}</Text>}
+          <Text underline wrap="wrap">{filePath}</Text>
+          {after.trim() !== '' && <Text color="text" wrap="wrap">{after.trimStart()}</Text>}
+        </Box>
+      )
+    }
     return (
       <Box flexWrap="nowrap" {...headerTooltip}>
         <Text bold color={nameColor} wrap="truncate-end">{before}</Text>
@@ -681,8 +723,8 @@ function HeaderTitle({ name, title, isTerminal, folded, displayArgs, argsLanguag
   const head = cut === -1 ? trimmed : trimmed.slice(0, cut)
   const tail = cut === -1 ? '' : trimmed.slice(cut)
   return (
-    <Box flexWrap="nowrap" {...headerTooltip}>
-      <Text bold color={nameColor} wrap="truncate-end">
+    <Box flexWrap="nowrap" flexShrink={full ? 1 : undefined} {...headerTooltip}>
+      <Text bold color={nameColor} wrap={full ? 'wrap' : 'truncate-end'}>
         {head}
         <Text bold={false} color="text">{tail}</Text>
       </Text>
@@ -713,6 +755,7 @@ export function AssistantToolUseMessage({
   revealVersion,
   sourceFolded = false,
   fullscreen = false,
+  digestLines,
 }: Props): React.ReactNode {
   // MessageList owns the single production subscription and passes a version
   // prop only to active reveal rows. Standalone consumers keep the fallback
@@ -849,7 +892,9 @@ export function AssistantToolUseMessage({
       body = [dim(t('tool-running-elapsed', { duration: formatDuration(Math.max(0, Date.now() - (tool.startedAt ?? Date.now()))) }))]
     }
   }
-  const cap = view?.card === 'diff' ? DIFF_BODY_MAX_LINES : TEXT_BODY_MAX_LINES
+  // Restored history rows read as a one-line digest (the whole block below is
+  // mounted at once during a chunk reveal); a click shows the full body.
+  const cap = digestLines ?? (view?.card === 'diff' ? DIFF_BODY_MAX_LINES : TEXT_BODY_MAX_LINES)
   // 展开态（点击/verbose）的 SendMessage 卡不截断——raw 层就是「全量」。
   const bodyUncapped = verbose || sendMessageRawOpen
   // Long-line clip before anything downstream reads the body: the syntax
@@ -859,7 +904,7 @@ export function AssistantToolUseMessage({
   const bodyLines = foldedBody.lines
   const bodySource = bodyLines.map(line => line.text).join('\n')
   const argsLanguage = jsonArgsLanguage(displayArgs)
-  const capped = capLines(bodyLines, cap, bodyUncapped, foldedBody.hiddenChars)
+  const capped = capLines(bodyLines, cap, bodyUncapped, foldedBody.hiddenChars, digestLines !== undefined)
   // Verbose bodies walk a bounded window (see VERBOSE_BODY_WINDOW): the tail
   // stays in the retained source, and the card says what it is showing.
   const lines = verbose && capped.length > VERBOSE_BODY_WINDOW
@@ -979,7 +1024,7 @@ export function AssistantToolUseMessage({
             isError={isError}
             toolName={tool.name}
           />
-          <HeaderTitle name={name} title={headerTitle} isTerminal={headerIsTerminal} folded={foldedHeader} displayArgs={displayArgs} argsLanguage={argsLanguage} nameColor={toolNameColor(tool.name, view?.category ?? tool.callView?.category)} filePath={filePath} onOpenFile={onOpenFile} metaTooltip={() => toolCardMetaTooltip(tool, isRunning, isError)} headerTextBudget={headerTextBudget} />
+          <HeaderTitle name={name} title={headerTitle} isTerminal={headerIsTerminal} folded={foldedHeader} full={verbose} displayArgs={displayArgs} argsLanguage={argsLanguage} nameColor={toolNameColor(tool.name, view?.category ?? tool.callView?.category)} filePath={filePath} onOpenFile={onOpenFile} metaTooltip={() => toolCardMetaTooltip(tool, isRunning, isError)} headerTextBudget={headerTextBudget} />
           {!isRunning && (
             <Box flexWrap="nowrap">
               <Text dimColor={!hovered}>{elapsedText}</Text>

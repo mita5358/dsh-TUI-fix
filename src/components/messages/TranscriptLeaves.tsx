@@ -158,6 +158,7 @@ export function ToolLeafRow({
   suppressImageGraphics,
   sourceFolded,
   fullscreen,
+  digestLines,
 }: {
   tool: ToolRow
   marginTopOnTurn: boolean
@@ -180,6 +181,8 @@ export function ToolLeafRow({
   sourceFolded?: boolean
   /** Fullscreen layout (more live output lines on a running card). */
   fullscreen?: boolean
+  /** Restored history row: the collapsed body reads as one line. */
+  digestLines?: number
 }): React.ReactNode {
   return (
     <>
@@ -200,6 +203,7 @@ export function ToolLeafRow({
         onOpenFile={onOpenFile}
         sourceFolded={sourceFolded}
         fullscreen={fullscreen}
+        digestLines={digestLines}
       />
       {images !== undefined && <TranscriptImages images={images} indent={4} onPreview={onPreviewImage} suppressGraphics={suppressImageGraphics} />}
     </>
@@ -212,11 +216,19 @@ export function AssistantTextLeafRow({
   marginTopOnTurn,
   isSelected = false,
   isExpanded = false,
+  foldedCode = false,
+  expandedCodePaths,
+  closedGlobalCodePaths,
+  onToggleCodePath,
 }: {
   text: string
   marginTopOnTurn: boolean
   isSelected?: boolean
   isExpanded?: boolean
+  foldedCode?: boolean
+  expandedCodePaths?: ReadonlySet<string>
+  closedGlobalCodePaths?: ReadonlySet<string>
+  onToggleCodePath?: (path: string, event: ClickEvent) => void
 }): React.ReactNode {
   return (
     <AssistantTextMessage
@@ -224,6 +236,10 @@ export function AssistantTextLeafRow({
       marginTopOnTurn={marginTopOnTurn}
       isSelected={isSelected}
       isExpanded={isExpanded}
+      foldedCode={foldedCode}
+      expandedCodePaths={expandedCodePaths}
+      closedGlobalCodePaths={closedGlobalCodePaths}
+      onToggleCodePath={onToggleCodePath}
     />
   )
 }

@@ -2,6 +2,7 @@ import React from 'react'
 import { Box, NoSelect, Text } from '../../ui.js'
 import { BLACK_CIRCLE } from '../../terminal-utils/figures.js'
 import { Markdown } from '../Markdown.js'
+import type { ClickEvent } from '../../ink/events/click-event.js'
 
 type Props = {
   text: string
@@ -11,6 +12,11 @@ type Props = {
   isSelected?: boolean
   /** Row expanded on its own (persistent hover-grey background). */
   isExpanded?: boolean
+  /** Fold fenced code to one-row digests (settled historical rows). */
+  foldedCode?: boolean
+  expandedCodePaths?: ReadonlySet<string>
+  closedGlobalCodePaths?: ReadonlySet<string>
+  onToggleCodePath?: (path: string, event: ClickEvent) => void
 }
 
 /**
@@ -25,6 +31,10 @@ export function AssistantTextMessage({
   marginTopOnTurn,
   isSelected = false,
   isExpanded = false,
+  foldedCode = false,
+  expandedCodePaths,
+  closedGlobalCodePaths,
+  onToggleCodePath,
 }: Props): React.ReactNode {
   return (
     <Box
@@ -46,7 +56,7 @@ export function AssistantTextMessage({
           <Text color={isSelected ? 'suggestion' : 'text'}>{BLACK_CIRCLE}</Text>
         </NoSelect>
         <Box flexDirection="column">
-          <Markdown>{text}</Markdown>
+          <Markdown foldedCode={foldedCode} expandedCodePaths={expandedCodePaths} closedGlobalCodePaths={closedGlobalCodePaths} onToggleCodePath={onToggleCodePath}>{text}</Markdown>
         </Box>
       </Box>
     </Box>

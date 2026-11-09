@@ -182,8 +182,17 @@ check('步骤落定后 full 正文仍保持展开', bodyLines(ls) >= 10, `body=$
 reasoningRow.thinkingOpen = false
 channel.version += 1
 for (const listener of listeners) listener()
-await waitFor(() => bodyLines(lines()) === 0)
-check('turn 结束后 full 正文折叠', bodyLines(lines()) === 0, `body=${bodyLines(lines())}`)
+// Folded settled blocks are no longer "header only": the contract is ONE
+// summary row carrying the opening fragment, an ellipsis and the expand
+// hint (docs/delivery/EVIDENCE.md §11). So the single line that still
+// contains 推理第 must be that digest row, not a leftover body line.
+await waitFor(() => bodyLines(lines()) === 1)
+const folded = lines().filter(line => line.includes('推理第'))
+check(
+  'turn 结束后折叠成一行摘要',
+  folded.length === 1 && folded[0].includes('…') && folded[0].includes('展开'),
+  `folded=${folded.length}`,
+)
 
 await inst.unmount()
 console.log(failed === 0 ? '\nALL PASS' : `\n${failed} 项失败`)

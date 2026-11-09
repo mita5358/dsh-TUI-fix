@@ -80,8 +80,10 @@ export function SubagentMessage({ subagent, marginTopOnTurn, activityFrames, onC
   const [hovered, setHovered] = React.useState(false)
   const clickable = onClick !== undefined
   const elapsed = subagent.completedAt ? subagent.durationMs : Date.now() - subagent.startedAt
-  const lastRunning = [...subagent.toolCalls].reverse().find(tool => tool.status === 'running')
-  const previousDone = lastRunning
+  // Settled cards never paint the waterfall or current/previous tool. Avoid
+  // copying the entire call history just to discard that information.
+  const lastRunning = settled ? undefined : [...subagent.toolCalls].reverse().find(tool => tool.status === 'running')
+  const previousDone = settled ? undefined : lastRunning
     ? subagent.toolCalls[subagent.toolCalls.indexOf(lastRunning) - 1]
     : subagent.toolCalls[subagent.toolCalls.length - 1]
   const preset = React.useMemo(() => resolvePreset(activityFrames), [activityFrames])
